@@ -7,8 +7,9 @@ import {
   canonicalToolArgs,
   deriveCanonicalMessageId,
   imageMediaFingerprint,
-  rememberCanonicalBaseId,
-  reuseCanonicalBaseId,
+  matchCanonicalHint,
+  recordCanonicalHint,
+  type CanonicalBaseHint,
 } from "./identity.js";
 import type { ConversationIdentity } from "./util.js";
 import { hashId } from "./util.js";
@@ -225,17 +226,21 @@ function reasoningText(item: ResponseInputItem): string {
 }
 
 export interface ResponsesToCoreOptions {
-  /** Prior turn's projected CoreMessage array (e.g. session.lastMessages).
-   *  Used purely as a positional hint to reuse canonical base ids when all
-   *  seed fields match verbatim — never alters output. */
-  prevMsgs?: readonly CoreMessage[];
+  /** Prior turn's lightweight canonical-base-id hints. Used purely as a
+   *  positional hint to reuse canonical base ids when all seed fields match
+   *  verbatim — never alters output. */
+  prevHints?: readonly (CanonicalBaseHint | undefined)[];
+  /** Optional output array populated with this turn's canonical-base-id hints
+   *  (no wire sidecars retained). */
+  nextHints?: (CanonicalBaseHint | undefined)[];
 }
 
 export function responsesToCore(
   body: ResponsesRequestBody,
   opts?: ResponsesToCoreOptions,
 ): ResponsesProjection {
-  const prevMsgs = opts?.prevMsgs;
+  const prevHints = opts?.prevHints;
+  const nextHints = opts?.nextHints;
   const msgs: BiliMessage[] = [];
   const systemParts: string[] = [];
   const preamble: ResponseInputItem[] = [];
@@ -289,33 +294,35 @@ export function responsesToCore(
         // same bytes ⇒ same id in every future pass.
         const text = reasoningText(item);
         const rid = text.length > 0 ? text : canonicalOpaqueSeed(item);
+        const slotIndex = msgs.length;
         const base =
           text.length > 0
-            ? (reuseCanonicalBaseId(
-                prevMsgs?.[msgs.length],
+            ? (matchCanonicalHint(
+                prevHints,
+                slotIndex,
                 "assistant",
                 "reasoning",
                 text,
               ) ?? deriveCanonicalMessageId("assistant", "reasoning", text))
             : deriveCanonicalMessageId("assistant", "reasoning", rid);
         coreId = clusters.next(base);
-        const reasoningMsg: BiliMessage = {
-          id: coreId,
-          role: "assistant",
-          contentType: "reasoning",
-          text: rid,
-          rawResponsesItem: item,
-        };
         if (text.length > 0) {
-          rememberCanonicalBaseId(
-            reasoningMsg,
+          recordCanonicalHint(
+            nextHints,
+            slotIndex,
             "assistant",
             "reasoning",
             text,
             base,
           );
         }
-        msgs.push(reasoningMsg);
+        msgs.push({
+          id: coreId,
+          role: "assistant",
+          contentType: "reasoning",
+          text: rid,
+          rawResponsesItem: item,
+        });
         break;
       }
       case "message": {
@@ -388,27 +395,29 @@ export function responsesToCore(
                 typeof part.text === "string" &&
                 part.text.length > 0
               ) {
+                const slotIndex = msgs.length;
                 const base =
-                  reuseCanonicalBaseId(
-                    prevMsgs?.[msgs.length],
+                  matchCanonicalHint(
+                    prevHints,
+                    slotIndex,
                     "user",
                     "text",
                     part.text,
                   ) ?? deriveCanonicalMessageId("user", "text", part.text);
-                const splitTextMsg: BiliMessage = {
-                  id: clusters.next(base),
-                  role: "user",
-                  contentType: "text",
-                  text: part.text,
-                };
-                rememberCanonicalBaseId(
-                  splitTextMsg,
+                recordCanonicalHint(
+                  nextHints,
+                  slotIndex,
                   "user",
                   "text",
                   part.text,
                   base,
                 );
-                msgs.push(splitTextMsg);
+                msgs.push({
+                  id: clusters.next(base),
+                  role: "user",
+                  contentType: "text",
+                  text: part.text,
+                });
               } else if (
                 part.type === "input_image" &&
                 typeof part.image_url === "string"
@@ -504,10 +513,12 @@ export function responsesToCore(
                   })
                   .join(",") || undefined
               : undefined;
+            const slotIndex = msgs.length;
             const base =
               mediaFingerprint === undefined
-                ? (reuseCanonicalBaseId(
-                    prevMsgs?.[msgs.length],
+                ? (matchCanonicalHint(
+                    prevHints,
+                    slotIndex,
                     role,
                     "text",
                     displayText,
@@ -525,7 +536,17 @@ export function responsesToCore(
               : undefined;
             const image =
               typeof imageUrl === "string" ? parseDataUrl(imageUrl) : undefined;
-            const textMsg: BiliMessage = {
+            if (mediaFingerprint === undefined) {
+              recordCanonicalHint(
+                nextHints,
+                slotIndex,
+                role,
+                "text",
+                displayText,
+                base,
+              );
+            }
+            msgs.push({
               id: coreId,
               role,
               contentType: "text",
@@ -534,11 +555,7 @@ export function responsesToCore(
               ...(image
                 ? { imageMediaType: image.mediaType, imageBase64: image.base64 }
                 : {}),
-            };
-            if (mediaFingerprint === undefined) {
-              rememberCanonicalBaseId(textMsg, role, "text", displayText, base);
-            }
-            msgs.push(textMsg);
+            });
           }
         }
         break;
@@ -549,9 +566,11 @@ export function responsesToCore(
         // normalization as the other codecs); the wire call_id stays on the
         // toolCallId FIELD (pairing) but is out of the seed.
         const rawArgs = call.arguments ?? "";
+        const slotIndex = msgs.length;
         const base =
-          reuseCanonicalBaseId(
-            prevMsgs?.[msgs.length],
+          matchCanonicalHint(
+            prevHints,
+            slotIndex,
             "assistant",
             "tool-call",
             rawArgs,
@@ -564,7 +583,16 @@ export function responsesToCore(
             { toolName: call.name },
           );
         coreId = clusters.next(base);
-        const callMsg: BiliMessage = {
+        recordCanonicalHint(
+          nextHints,
+          slotIndex,
+          "assistant",
+          "tool-call",
+          rawArgs,
+          base,
+          call.name,
+        );
+        msgs.push({
           id: coreId,
           role: "assistant",
           contentType: "tool-call",
@@ -572,16 +600,7 @@ export function responsesToCore(
           toolCallId: call.call_id,
           text: rawArgs,
           rawResponsesItem: item,
-        };
-        rememberCanonicalBaseId(
-          callMsg,
-          "assistant",
-          "tool-call",
-          rawArgs,
-          base,
-          call.name,
-        );
-        msgs.push(callMsg);
+        });
         toolNames.set(call.call_id, call.name);
         break;
       }
@@ -592,9 +611,11 @@ export function responsesToCore(
           ? output.output
           : JSON.stringify(output.output);
         const name = toolNames.get(output.call_id);
+        const slotIndex = msgs.length;
         const base = isStringOut
-          ? (reuseCanonicalBaseId(
-              prevMsgs?.[msgs.length],
+          ? (matchCanonicalHint(
+              prevHints,
+              slotIndex,
               "tool",
               "tool-result",
               text,
@@ -607,7 +628,18 @@ export function responsesToCore(
               toolName: name,
             });
         coreId = clusters.next(base);
-        const outMsg: BiliMessage = {
+        if (isStringOut) {
+          recordCanonicalHint(
+            nextHints,
+            slotIndex,
+            "tool",
+            "tool-result",
+            text,
+            base,
+            name,
+          );
+        }
+        msgs.push({
           id: coreId,
           role: "tool",
           contentType: "tool-result",
@@ -615,11 +647,7 @@ export function responsesToCore(
           text,
           ...(name ? { toolName: name } : {}),
           rawResponsesItem: item,
-        };
-        if (isStringOut) {
-          rememberCanonicalBaseId(outMsg, "tool", "tool-result", text, base, name);
-        }
-        msgs.push(outMsg);
+        });
         break;
       }
       case "computer_call":
@@ -655,9 +683,11 @@ export function responsesToCore(
         customToolCallIds.add(callId);
         const argText = ctc.input ?? ctc.arguments ?? "";
         const ctcName = ctc.name ?? "custom";
+        const slotIndex = msgs.length;
         const base =
-          reuseCanonicalBaseId(
-            prevMsgs?.[msgs.length],
+          matchCanonicalHint(
+            prevHints,
+            slotIndex,
             "assistant",
             "tool-call",
             argText,
@@ -667,7 +697,16 @@ export function responsesToCore(
             toolName: ctcName,
           });
         coreId = clusters.next(base);
-        const ctcMsg: BiliMessage = {
+        recordCanonicalHint(
+          nextHints,
+          slotIndex,
+          "assistant",
+          "tool-call",
+          argText,
+          base,
+          ctcName,
+        );
+        msgs.push({
           id: coreId,
           role: "assistant",
           contentType: "tool-call",
@@ -675,16 +714,7 @@ export function responsesToCore(
           toolCallId: callId,
           text: argText,
           rawResponsesItem: item,
-        };
-        rememberCanonicalBaseId(
-          ctcMsg,
-          "assistant",
-          "tool-call",
-          argText,
-          base,
-          ctcName,
-        );
-        msgs.push(ctcMsg);
+        });
         toolNames.set(callId, ctcName);
         break;
       }
@@ -698,9 +728,11 @@ export function responsesToCore(
             ? ctco.output
             : JSON.stringify(ctco.output ?? "");
         const name = toolNames.get(callId);
+        const slotIndex = msgs.length;
         const base = isStringOut
-          ? (reuseCanonicalBaseId(
-              prevMsgs?.[msgs.length],
+          ? (matchCanonicalHint(
+              prevHints,
+              slotIndex,
               "tool",
               "tool-result",
               outText,
@@ -713,18 +745,10 @@ export function responsesToCore(
               toolName: name,
             });
         coreId = clusters.next(base);
-        const ctcoMsg: BiliMessage = {
-          id: coreId,
-          role: "tool",
-          contentType: "tool-result",
-          toolCallId: callId,
-          text: outText,
-          ...(name ? { toolName: name } : {}),
-          rawResponsesItem: item,
-        };
         if (isStringOut) {
-          rememberCanonicalBaseId(
-            ctcoMsg,
+          recordCanonicalHint(
+            nextHints,
+            slotIndex,
             "tool",
             "tool-result",
             outText,
@@ -732,7 +756,15 @@ export function responsesToCore(
             name,
           );
         }
-        msgs.push(ctcoMsg);
+        msgs.push({
+          id: coreId,
+          role: "tool",
+          contentType: "tool-result",
+          toolCallId: callId,
+          text: outText,
+          ...(name ? { toolName: name } : {}),
+          rawResponsesItem: item,
+        });
         break;
       }
       default:

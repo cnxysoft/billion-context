@@ -101,7 +101,7 @@ export function deriveCanonicalMessageId(
   return "h_" + hashId(seed);
 }
 
-interface CanonicalBaseCacheEntry {
+export interface CanonicalBaseHint {
   role: string;
   contentType: string;
   toolName: string;
@@ -109,42 +109,45 @@ interface CanonicalBaseCacheEntry {
   baseId: string;
 }
 
-const canonicalBaseCache = new WeakMap<object, CanonicalBaseCacheEntry>();
+const MAX_HINT_TEXT_LEN = 32_768;
 
-/** Record the canonical base id (pre-ClusterCounter) for a freshly constructed
- *  non-media CoreMessage so full-resend follow-up turns can verify exact seed
- *  field equality against the prior turn's message object and reuse its base
- *  id without re-running canonicalToolArgs or SHA-256. */
-export function rememberCanonicalBaseId(
-  msg: object,
+/** Record a lightweight canonical-base-id hint at slot `index` (without holding
+ *  wire sidecars) so full-resend follow-up turns can verify exact seed field
+ *  equality and reuse the base id without re-running canonicalToolArgs or
+ *  SHA-256. Skips huge payloads (>32 KiB) and test-salted calls. */
+export function recordCanonicalHint(
+  hints: (CanonicalBaseHint | undefined)[] | undefined,
+  index: number,
   role: string,
   contentType: string,
   rawText: string,
   baseId: string,
   toolName?: string,
 ): void {
-  if (idSalt !== null) return;
-  canonicalBaseCache.set(msg, {
+  if (hints === undefined || idSalt !== null) return;
+  if (rawText.length > MAX_HINT_TEXT_LEN) return;
+  hints[index] = {
     role,
     contentType,
     toolName: toolName ?? "",
     rawText,
     baseId,
-  });
+  };
 }
 
-/** Reuse the cached canonical base id from `prevMsg` when every hash-seed input
- *  matches verbatim (role, contentType, toolName, rawText) and no test salt is
- *  active. Returns null on any mismatch or absence. */
-export function reuseCanonicalBaseId(
-  prevMsg: object | undefined,
+/** Reuse the cached canonical base id from `prevHints[index]` when every
+ *  hash-seed input matches verbatim (role, contentType, toolName, rawText)
+ *  and no test salt is active. Returns null on any mismatch or absence. */
+export function matchCanonicalHint(
+  prevHints: readonly (CanonicalBaseHint | undefined)[] | undefined,
+  index: number,
   role: string,
   contentType: string,
   rawText: string,
   toolName?: string,
 ): string | null {
-  if (idSalt !== null || prevMsg === undefined) return null;
-  const cached = canonicalBaseCache.get(prevMsg);
+  if (prevHints === undefined || idSalt !== null) return null;
+  const cached = prevHints[index];
   if (
     cached !== undefined &&
     cached.role === role &&
