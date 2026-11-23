@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { openSqliteDatabase } from "../src/storage/driver.ts";
-import { describeMessageContent, identityOfStoredContent, splitMediaContent } from "../src/storage/identity.ts";
+import { describeCoreMessage, describeMessageContent, identityOfStoredContent, splitMediaContent } from "../src/storage/identity.ts";
 import { migrateSchema } from "../src/storage/schema.ts";
 import { rmrf } from "./tmp-rm.ts";
 
@@ -43,7 +43,18 @@ test("planned message content agrees with the stored identity on plain and media
             ...split, role: row.role, contentType: row.contentType,
             identity: identityOfStoredContent(split.content),
         });
+        assert.deepEqual(describeCoreMessage(row, raw), describeMessageContent(raw));
     }
+    const noPosition = { role: "user", content: "plain" };
+    assert.deepEqual(describeCoreMessage(noPosition, JSON.stringify(noPosition)), describeMessageContent(JSON.stringify(noPosition)));
+    const withTs = { ...message, ts: 1700000000000 };
+    const withoutTsRaw = JSON.stringify(message);
+    assert.deepEqual(describeCoreMessage(withTs, withoutTsRaw, { stripTs: true }), describeMessageContent(withoutTsRaw));
+    const withTsRaw = JSON.stringify(withTs);
+    assert.deepEqual(describeCoreMessage(withTs, withTsRaw), describeMessageContent(withTsRaw));
+    const customToJson = { ...message, toJSON: () => ({ role: "user", content: "from-toJSON", id: "x" }) };
+    const customRaw = JSON.stringify(customToJson);
+    assert.deepEqual(describeCoreMessage(customToJson, customRaw), describeMessageContent(customRaw));
 });
 
 test("v8 identity migration can finish with a JSON-null content row", () => {

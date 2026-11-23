@@ -1085,6 +1085,7 @@ export class UnifiedStore {
         const ok = this.db.transaction((): boolean => {
             let messages: MessageRow[];
             let watermark: number | null;
+            let fullExistingRows: { seq: number; msg_id: string; identity: string; retired_at: number | null }[] | undefined;
             if (delta) {
                 const probe = this.probeIngestBoundary(s.sessionId, delta.trustedSeq);
                 if (!probe || probe.msgId !== delta.boundaryMsgId || probe.contentHash !== delta.boundaryHash) {
@@ -1132,6 +1133,7 @@ export class UnifiedStore {
                 const full = this.remapPlanToAbsolute(input, opts?.completeLog !== true);
                 messages = full.messages;
                 watermark = full.watermark;
+                fullExistingRows = full.existingRows;
                 // #3285: authoritative-set discipline for messages — same as
                 // blocks / refs / dead_refs / ccr_entries below, but ONLY when
                 // completeLog says the plan IS the whole log (the raw tail).
@@ -1160,9 +1162,9 @@ export class UnifiedStore {
                     for (const m of messages) {
                         incomingIds.add(`${m.msgId}\u0000${m.identity ?? identityOfStoredContent(m.content)}`);
                     }
-                    const staleRows = this.db
+                    const staleRows = fullExistingRows ?? (this.db
                         .prepare("SELECT seq, msg_id, identity, retired_at FROM messages WHERE session_id = ?")
-                        .all(s.sessionId) as { seq: number; msg_id: string; identity: string; retired_at: number | null }[];
+                        .all(s.sessionId) as { seq: number; msg_id: string; identity: string; retired_at: number | null }[]);
                     let reactivate: ReturnType<SqliteDatabase["prepare"]> | undefined;
                     let retire: ReturnType<SqliteDatabase["prepare"]> | undefined;
                     let selectMedia: ReturnType<SqliteDatabase["prepare"]> | undefined;
@@ -1174,6 +1176,7 @@ export class UnifiedStore {
                             if (row.retired_at !== null) {
                                 reactivate ??= this.db.prepare("UPDATE messages SET retired_at = NULL WHERE session_id = ? AND seq = ?");
                                 reactivate.run(s.sessionId, row.seq);
+                                row.retired_at = null;
                             }
                             continue;
                         }
@@ -1205,7 +1208,9 @@ export class UnifiedStore {
                         // row entirely.
                         if (row.retired_at !== null) continue;
                         retire ??= this.db.prepare("UPDATE messages SET retired_at = ? WHERE session_id = ? AND seq = ? AND retired_at IS NULL");
-                        retire.run(Date.now(), s.sessionId, row.seq);
+                        const retiredAt = Date.now();
+                        retire.run(retiredAt, s.sessionId, row.seq);
+                        row.retired_at = retiredAt;
                         selectMedia ??= this.db.prepare("SELECT media_hash FROM message_media WHERE session_id = ? AND seq = ?");
                         const retiredMedia = selectMedia.all(s.sessionId, row.seq) as { media_hash: string }[];
                         deleteMedia ??= this.db.prepare("DELETE FROM message_media WHERE session_id = ? AND seq = ?");
@@ -1311,6 +1316,7 @@ export class UnifiedStore {
             // #4313: one wall-clock sample per save batch — rows without a
             //  per-message first-sight stamp all carry the same second.
             const batchTs = Date.now();
+            let insertedLiveRows: { msg_id: string; seq: number }[] | undefined;
             if (messages.length > 0) {
                 // An exact replay with a live CAS reference makes the legacy bump and release cancel out.
                 const existingMessage = delta ? undefined : this.db.prepare(
@@ -1343,6 +1349,10 @@ export class UnifiedStore {
                         const res = insertMessage.run(s.sessionId, m.seq, m.msgId, m.ref, m.refNum, m.role, m.kind, hash,
                             m.identity ?? identityOfStoredContent(m.content), typeof m.ts === "number" ? m.ts : batchTs);
                         if (res.changes === 0) this.releaseContent(hash);
+                        else if (fullExistingRows !== undefined) {
+                            insertedLiveRows ??= [];
+                            insertedLiveRows.push({ msg_id: m.msgId, seq: m.seq });
+                        }
                     }
                     // A reactivated row can have exact text but need its media mappings back (#4506).
                     for (const md of m.media ?? []) {
@@ -1455,7 +1465,26 @@ export class UnifiedStore {
                 // yields no span → boundsForCovered demotes it honestly; if that
                 // empties the whole claim the -1 sentinel preserves stored bounds (#4608).
                 if (wanted.size > 0) {
-                    this.resolveCoveredSeqSpans(s.sessionId, wanted, seqSpanById);
+                    if (fullExistingRows !== undefined) {
+                        const addSpan = (msgId: string, seq: number): void => {
+                            const span = seqSpanById.get(msgId);
+                            if (!span) seqSpanById.set(msgId, [seq, seq]);
+                            else {
+                                if (seq < span[0]) span[0] = seq;
+                                if (seq > span[1]) span[1] = seq;
+                            }
+                        };
+                        for (const row of fullExistingRows) {
+                            if (row.retired_at === null && wanted.has(row.msg_id)) addSpan(row.msg_id, row.seq);
+                        }
+                        if (insertedLiveRows !== undefined) {
+                            for (const row of insertedLiveRows) {
+                                if (wanted.has(row.msg_id)) addSpan(row.msg_id, row.seq);
+                            }
+                        }
+                    } else {
+                        this.resolveCoveredSeqSpans(s.sessionId, wanted, seqSpanById);
+                    }
                 }
             }
             const boundsForCovered = (block: BlockRow): [number, number] => {
@@ -1865,7 +1894,14 @@ export class UnifiedStore {
     /** Full-ingest path of ingestSession, extracted for readability: the
      *  absolute-seq remap plus the #3133 watermark alignment decision.
      *  Mutates input.session.tailJson (pointer sequences become absolute). */
-    private remapPlanToAbsolute(input: IngestSessionInput, allowSparseLookup: boolean): { messages: MessageRow[]; watermark: number | null } {
+    private remapPlanToAbsolute(
+        input: IngestSessionInput,
+        allowSparseLookup: boolean,
+    ): {
+        messages: MessageRow[];
+        watermark: number | null;
+        existingRows?: { seq: number; msg_id: string; identity: string; retired_at: number | null }[];
+    } {
         const s = input.session;
         // Absolute-seq remap (#2671 soak finding): planIngest assigns seq
         // RELATIVE to the current snapshot's log (pluginSnapshot first,
@@ -1961,6 +1997,7 @@ export class UnifiedStore {
         let retireSibling: ReturnType<SqliteDatabase["prepare"]> | undefined;
         let selectLeftovers: ReturnType<SqliteDatabase["prepare"]> | undefined;
         let updateHash: ReturnType<SqliteDatabase["prepare"]> | undefined;
+        let deletedSeqs: Set<number> | undefined;
         for (const r of repairs) {
             // #4793: a sibling row may already hold the target bytes for this
             // msg_id — e.g. an old generation stamped with an EMPTY identity
@@ -1979,7 +2016,15 @@ export class UnifiedStore {
             retireSibling ??= this.db.prepare(
                 "UPDATE messages SET retired_at = ? WHERE session_id = ? AND msg_id = ? AND content_hash = ? AND seq <> ? AND retired_at IS NULL",
             );
-            retireSibling.run(Date.now(), s.sessionId, r.msgId, r.to, r.seq);
+            const retiredAt = Date.now();
+            const retiredRes = retireSibling.run(retiredAt, s.sessionId, r.msgId, r.to, r.seq);
+            if (messageIds === undefined && retiredRes.changes > 0) {
+                for (const row of existing) {
+                    if (row.msg_id === r.msgId && row.content_hash === r.to && row.seq !== r.seq && row.retired_at === null) {
+                        row.retired_at = retiredAt;
+                    }
+                }
+            }
             // A retired duplicate still occupies the triple (the constraint
             // is not partial): it is byte-identical, so dropping the row and
             // its media mappings loses nothing. Rare path; common case stays
@@ -1996,6 +2041,10 @@ export class UnifiedStore {
                     const leftoverMedia = selMedia.all(s.sessionId, l.seq) as { media_hash: string }[];
                     delMedia.run(s.sessionId, l.seq);
                     delRow.run(s.sessionId, l.seq);
+                    if (messageIds === undefined) {
+                        deletedSeqs ??= new Set<number>();
+                        deletedSeqs.add(l.seq);
+                    }
                     // Every deleted row owned one refcount on r.to (bumped at
                     // its insert) and each of its mapping rows owned one on
                     // its media hash. Deleting without releasing is a
@@ -2009,6 +2058,14 @@ export class UnifiedStore {
             this.putContent(r.content, r.to);
             updateHash ??= this.db.prepare("UPDATE messages SET content_hash = ? WHERE session_id = ? AND seq = ?");
             updateHash.run(r.to, s.sessionId, r.seq);
+            if (messageIds === undefined) {
+                for (const row of existing) {
+                    if (row.seq === r.seq) {
+                        row.content_hash = r.to;
+                        break;
+                    }
+                }
+            }
             this.releaseContent(r.from);
         }
         // #4390: a rewound message that comes back reactivates in place —
@@ -2016,11 +2073,21 @@ export class UnifiedStore {
         // heals without a duplicate row even on completeLog-less saves.
         if (retiredSeqs.length > 0) {
             const presentedSeqs = new Set(messages.map((m) => m.seq));
+            let reactivatedSeqs: Set<number> | undefined;
             let reactivate: ReturnType<SqliteDatabase["prepare"]> | undefined;
             for (const seq of retiredSeqs) {
                 if (!presentedSeqs.has(seq)) continue;
                 reactivate ??= this.db.prepare("UPDATE messages SET retired_at = NULL WHERE session_id = ? AND seq = ?");
                 reactivate.run(s.sessionId, seq);
+                if (messageIds === undefined) {
+                    reactivatedSeqs ??= new Set<number>();
+                    reactivatedSeqs.add(seq);
+                }
+            }
+            if (reactivatedSeqs !== undefined) {
+                for (const row of existing) {
+                    if (reactivatedSeqs.has(row.seq)) row.retired_at = null;
+                }
             }
         }
         const remapSeqs = (seqs: number[] | null | undefined): number[] | null | undefined =>
@@ -2033,7 +2100,10 @@ export class UnifiedStore {
             ...(pluginSnapshotSeqs !== undefined ? { pluginSnapshotSeqs } : {}),
             ...(tailSeqs !== undefined ? { tailSeqs } : {}),
         });
-        return { messages, watermark };
+        const existingRows = messageIds === undefined
+            ? (deletedSeqs ? existing.filter((row) => !deletedSeqs!.has(row.seq)) : existing)
+            : undefined;
+        return { messages, watermark, existingRows };
     }
 
     /** #3133: the session's ingest watermark — the absolute seq backing the

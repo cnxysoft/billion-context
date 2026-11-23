@@ -119,3 +119,29 @@ export function describeMessageContent(raw: string) {
         : identityOfStoredContent(split.content);
     return { ...split, role, contentType, identity };
 }
+
+export function describeCoreMessage(message: unknown, raw: string, opts?: { stripTs?: boolean }) {
+    if (message === null || typeof message !== "object" || Array.isArray(message) || typeof (message as { toJSON?: unknown }).toJSON === "function") {
+        return describeMessageContent(raw);
+    }
+    const record = message as Record<string, unknown>;
+    if (typeof record.role !== "string" || (record.contentType !== undefined && typeof record.contentType !== "string")) {
+        return describeMessageContent(raw);
+    }
+    const role = record.role;
+    const contentType = record.contentType;
+    const split = splitMediaContent(raw);
+    if (split.content !== raw) {
+        return { ...split, role, contentType, identity: identityOfStoredContent(split.content) };
+    }
+    if (record.id === undefined && record.wireIndex === undefined && record.ledgerSeq === undefined) {
+        return { ...split, role, contentType, identity: split.hash };
+    }
+    const stripTs = opts?.stripTs === true;
+    const stripped: Record<string, unknown> = {};
+    for (const key of Object.keys(record)) {
+        if (key === "id" || key === "wireIndex" || key === "ledgerSeq" || (stripTs && key === "ts")) continue;
+        stripped[key] = record[key];
+    }
+    return { ...split, role, contentType, identity: sha256Hex(JSON.stringify(stripped)) };
+}

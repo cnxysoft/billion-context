@@ -970,6 +970,47 @@ test("delta saves reuse unchanged block coverage bounds and committed ref prefix
             trustedTailSeqs: mark3.tailSeqs,
         }), true);
         assert.deepEqual(store.getRefs(legacy.id), deltaPlan3.refs);
+
+        // Full completeLog ingest reuses remapPlanToAbsolute's full-table rows
+        // for both the stale-row sweep and covered-seq span resolution, avoiding
+        // two redundant full scans of messages while retiring/reactivating accurately.
+        const m6 = msg(6);
+        // Drop m5 (should retire) and append m6 (should insert live + cover in b3).
+        legacy.lastMessages = [...legacy.lastMessages.slice(0, -1), m6];
+        byRaw[m6.id] = "m08204";
+        legacy.state.blocks.push({
+            blockId: "b3",
+            summary: "summary 3",
+            effectiveMessageIds: [m4.id, m6.id],
+            directMessageIds: [m4.id, m6.id],
+            startRef: "m08202",
+            endRef: "m08204",
+            tier: 1,
+            active: true,
+            createdAt: 3000,
+        } as unknown as (typeof legacy.state.blocks)[number]);
+        legacy.blockContents.set("b3", { one: { text: "one3", count: 2 }, full: { text: "full3", count: 2 } });
+        queries.length = 0;
+        store.ingestSession(planIngest(legacy), undefined, { completeLog: true });
+        assert.equal(queries.some((sql) => sql.includes("SELECT seq, msg_id, identity, retired_at FROM messages WHERE session_id = ?")), false, "completeLog sweep reuses remap rows");
+        assert.equal(queries.some((sql) => sql.includes("SELECT msg_id, seq, retired_at FROM messages WHERE session_id = ?")), false, "full ingest covered-seq bounds reuse remap + inserted rows");
+        assert.equal(queries.some((sql) => sql.includes("SELECT msg_id, seq FROM messages WHERE session_id = ? AND msg_id IN")), false, "full ingest covered-seq bounds skip batched IN queries");
+        const liveAfterFull = store.getMessages(legacy.id).map((row) => row.msgId);
+        assert.equal(liveAfterFull.includes(m5.id), false, "dropped m5 retired by reused sweep");
+        assert.equal(liveAfterFull.includes(m6.id), true, "new m6 inserted live");
+        const b3 = store.getBlocks(legacy.id).find((b) => b.blockId === "b3");
+        assert.ok(b3);
+        const m4Seq = store.getMessages(legacy.id).find((row) => row.msgId === m4.id)!.seq;
+        const m6Seq = store.getMessages(legacy.id).find((row) => row.msgId === m6.id)!.seq;
+        assert.equal(b3.startSeq, m4Seq);
+        assert.equal(b3.endSeq, m6Seq);
+
+        // Reactivate m5 via a second full completeLog ingest and verify bounds include it again.
+        legacy.lastMessages = [...legacy.lastMessages, m5];
+        queries.length = 0;
+        store.ingestSession(planIngest(legacy), undefined, { completeLog: true });
+        assert.equal(queries.some((sql) => sql.includes("SELECT seq, msg_id, identity, retired_at FROM messages WHERE session_id = ?")), false);
+        assert.equal(store.getMessages(legacy.id).some((row) => row.msgId === m5.id), true, "m5 reactivated cleanly");
     } finally {
         store.close();
         rmBestEffort(dir);

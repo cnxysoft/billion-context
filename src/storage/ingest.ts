@@ -29,7 +29,7 @@ import type { CoreMessage, CompressionBlock } from "../../kernel/src/types.js";
 import type { BlockView } from "../session.js";
 import { refToIndex } from "../../kernel/src/refs.js";
 import { sha256Hex, type BlockRow, type CcrEntryRow, type IngestSessionInput, type MessageRow, type RefRow, type SessionRow } from "./store.js";
-import { describeMessageContent, splitMediaContent } from "./identity.js";
+import { describeCoreMessage, splitMediaContent } from "./identity.js";
 
 /**
  * Field order of the hydration merge output — DERIVED from mergeState itself
@@ -203,7 +203,7 @@ export interface HandoffReplyStashRow {
 export function planStoredMessageRow(m: CoreMessage): HandoffReplyStashRow {
     const raw = serializeForStore(m);
     ingestSerializations.count++;
-    const split = describeMessageContent(raw);
+    const split = describeCoreMessage(m, raw, { stripTs: true });
     return {
         msgId: m.id,
         content: split.content,
@@ -232,7 +232,7 @@ export function planIngest(session: LegacySessionLike): IngestPlan {
     const intern = (m: CoreMessage): number => {
         const raw = serializeForStore(m);
         ingestSerializations.count++;
-        const entry = describeMessageContent(raw);
+        const entry = describeCoreMessage(m, raw, { stripTs: true });
         // #4390: the cross-save JOIN key is the POSITION-INDEPENDENT identity
         // (stored-bytes serialization minus id/wireIndex). content_hash stays
         // the byte-faithful CAS key; only the join moves to identity.
@@ -364,7 +364,7 @@ export function planIngestDelta(
         const m = tail[i];
         const raw = serializeForStore(m);
         ingestSerializations.count++;
-        const split = describeMessageContent(raw);
+        const split = describeCoreMessage(m, raw, { stripTs: true });
         // Placeholder seqs under the aligned assumption (no rows above the
         // watermark); ingestSession renumbers from max(seq)+1 inside the
         // transaction when a fold left rows above the trusted tip.
