@@ -85,6 +85,33 @@ test("#2824: identified-path chainFingerprint computes ZERO sketches (was ~2.2s/
     assert.equal(fp.itemHashes.length, Math.min(MAX_STORED_ITEMS_PIN, DEEP_TURNS * 2));
 });
 
+test("identified fingerprints match full affinity products, including a capped assistant tail", () => {
+    const resolver = new PrefixAffinityResolver();
+    const messages = [
+        { role: "system", content: "ignored system prompt" },
+        ...deepConversation("fingerprint-parity").slice(0, 140),
+        { type: "function_call_output", output: "tool output ϐ\u0000𐐷" },
+        ...Array.from({ length: 70 }, (_, i) => ({
+            type: "function_call", name: "read", arguments: JSON.stringify({ path: `file-${i}` }),
+        })),
+        { role: "user", content: "[model changed: test marker]" },
+    ];
+    const fingerprint = resolver.chainFingerprint(messages);
+    const full = resolver.resolve(messages);
+    assert.ok(fingerprint && full);
+    assert.equal(fingerprint.depth, full.incomingDepth);
+    assert.equal(fingerprint.tailHash, full.tailHash);
+    assert.deepEqual(fingerprint.itemHashes, full.itemHashes);
+    assert.deepEqual(fingerprint.tailFrags, full.tailFragments);
+    assert.equal(fingerprint.tailFrags?.length, 64);
+
+    messages[1] = { role: "user", content: "early history edited" };
+    const edited = resolver.chainFingerprint(messages);
+    assert.ok(edited);
+    assert.notEqual(edited.tailHash, fingerprint.tailHash);
+    assert.deepEqual(edited.itemHashes, fingerprint.itemHashes);
+});
+
 test("#2824: findResumeParent / findResumeParentWithin / chainContinues compute ZERO sketches", () => {
     const r = new PrefixAffinityResolver();
     const baseId = track(r, deepConversation("resume-base").slice(0, 40));

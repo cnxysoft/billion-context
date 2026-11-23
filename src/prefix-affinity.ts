@@ -994,13 +994,22 @@ export class PrefixAffinityResolver {
         //  #2824: sketchCap 0 — identified entries never carry sketches
         //  (note() below stores none), so computing them was pure waste on
         //  every request of a long session.
-        const turns = neutralTurns(messages);
-        const fingerprints = neutralFingerprints(turns, 0);
-        if (fingerprints.hashes.length === 0) return null;
+        const turns = neutralTurns(messages, "tail");
+        const itemHashes: string[] = [];
+        const itemStart = Math.max(0, turns.length - MAX_STORED_ITEMS);
+        let tailHash = "v2";
+        let bytes = 0;
+        for (const [i, turn] of turns.entries()) {
+            const canonical = neutralTurnCanonical(turn);
+            bytes += canonical.length;
+            tailHash = sha256(`${tailHash}\u0000${canonical}`);
+            if (i >= itemStart) itemHashes.push(sha256(`v2i\u0000${canonical}`));
+        }
+        if (bytes < MIN_CANONICAL_BYTES) return null;
         return {
             depth: turns.length,
-            tailHash: fingerprints.hashes[fingerprints.hashes.length - 1]!,
-            itemHashes: fingerprints.itemHashes.slice(-MAX_STORED_ITEMS),
+            tailHash,
+            itemHashes,
             normTailHash: neutralTailHashOf(turns),
             ...(turns[turns.length - 1]?.frags ? { tailFrags: turns[turns.length - 1]!.frags } : {}),
         };

@@ -63,6 +63,9 @@ jobs:
             tests/admin-origin.test.ts \
             tests/dsh-native.test.ts \
             tests/image-restore.test.ts \
+            tests/issue2824-regression.test.ts \
+            tests/prefix-affinity.test.ts \
+            tests/prefix-affinity-simhash.test.ts \
             tests/issue2322-session-name.test.ts \
             tests/issue3343-incremental-divert-authz.test.ts \
             tests/issue3407-shadow-blockcontents-order.test.ts \

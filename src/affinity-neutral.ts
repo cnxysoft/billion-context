@@ -191,33 +191,44 @@ function toolResultText(content: unknown): string {
 /** Project a protocol message list onto wire-neutral turns. Pure: the same
  *  list always yields the same turn list (same-wire stability), and the
  *  same logical conversation yields the same list across wires. */
-export function neutralTurns(messages: unknown[]): NeutralTurn[] {
+export function neutralTurns(messages: unknown[], fragmentScope: "all" | "tail" = "all"): NeutralTurn[] {
     const list = stripLeadingSystemRun(messages);
     const turns: NeutralTurn[] = [];
     let asst: NeutralTurn | null = null;
-    let asstFrags: string[] = [];
+    let asstFragments: (() => string)[] = [];
+    let tailFragments: (() => string[]) | undefined;
+    const pushTurn = (turn: NeutralTurn, fragments: () => string[]): void => {
+        if (fragmentScope === "all") turn.frags = fragments();
+        else tailFragments = fragments;
+        turns.push(turn);
+    };
+    const addAssistantFragment = (text: string, calls: string[]): void => {
+        if (asstFragments.length < MAX_TURN_FRAGS) {
+            asstFragments.push(() => fragmentHash("assistant", text, calls));
+        }
+    };
     const flushAssistant = (): void => {
         if (asst === null) return;
         if (asst.calls !== undefined && asst.calls.length === 0) {
             // no calls after all → plain assistant text turn
-            asst = { kind: "assistant", text: asst.text ?? "", frags: asstFrags.slice(0, MAX_TURN_FRAGS) };
+            asst = { kind: "assistant", text: asst.text ?? "" };
         } else if (asst.calls !== undefined) {
             // thinking text is renderer-divergent on tool turns — dropped
             delete asst.text;
-            asst.frags = asstFrags.slice(0, MAX_TURN_FRAGS);
         }
-        turns.push(asst);
+        const fragments = asstFragments;
+        pushTurn(asst, () => fragments.map((hash) => hash()));
         asst = null;
-        asstFrags = [];
+        asstFragments = [];
     };
-    const pushTextTurn = (kind: string, text: string, frags?: string[]): void => {
+    const pushTextTurn = (kind: string, text: string): void => {
         if (kind === "user" && CLIENT_MARKER_RE.test(text)) return; // client machinery
-        turns.push({ kind, text, ...(frags ? { frags } : {}) });
+        pushTurn({ kind, text }, () => [fragmentHash(kind, text, [])]);
     };
 
     for (const message of list) {
         if (!message || typeof message !== "object") {
-            turns.push({ kind: "raw", text: canon(message), frags: [fragmentHash("raw", canon(message), [])] });
+            pushTextTurn("raw", canon(message));
             continue;
         }
         const m = message as {
@@ -269,13 +280,13 @@ export function neutralTurns(messages: unknown[]): NeutralTurn[] {
                 const joined = texts.join("");
                 asst.text = (asst.text ?? "") + joined;
                 asst.calls = [...(asst.calls ?? []), ...calls];
-                asstFrags.push(fragmentHash("assistant", joined, calls));
+                addAssistantFragment(joined, calls);
                 continue;
             }
             flushAssistant();
-            for (const toolBody of toolBodies) turns.push({ kind: "tool", text: toolBody, frags: [fragmentHash("tool", toolBody, [])] });
-            if (calls.length > 0 && toolBodies.length === 0) turns.push({ kind: "assistant", calls, frags: [fragmentHash("assistant", "", calls)] });
-            else if (texts.length > 0) pushTextTurn(role, texts.join(""), [fragmentHash(role, texts.join(""), [])]);
+            for (const toolBody of toolBodies) pushTextTurn("tool", toolBody);
+            if (calls.length > 0 && toolBodies.length === 0) pushTurn({ kind: "assistant", calls }, () => [fragmentHash("assistant", "", calls)]);
+            else if (texts.length > 0) pushTextTurn(role, texts.join(""));
             continue;
         }
 
@@ -287,13 +298,13 @@ export function neutralTurns(messages: unknown[]): NeutralTurn[] {
             // merge into the pending run so it reduces like the openai render.
             asst = asst ?? { kind: "assistant", text: "", calls: [] };
             asst.calls = [...(asst.calls ?? []), call];
-            asstFrags.push(fragmentHash("assistant", "", [call]));
+            addAssistantFragment("", [call]);
             continue;
         }
         if (typeof m.type === "string" && (m.type === "function_call_output" || m.type === "local_shell_call_output")) {
             flushAssistant();
             const body = typeof m.output === "string" ? m.output : canon(m.output ?? "");
-            turns.push({ kind: "tool", text: body, frags: [fragmentHash("tool", body, [])] });
+            pushTextTurn("tool", body);
             continue;
         }
 
@@ -305,7 +316,7 @@ export function neutralTurns(messages: unknown[]): NeutralTurn[] {
             const body = typeof m.content === "string" ? m.content : Array.isArray(m.content)
                 ? m.content.map((b) => { const t = blockText(b); return t !== null ? t : canon(b); }).join("")
                 : m.content === undefined || m.content === null ? "" : canon(m.content);
-            turns.push({ kind: "tool", text: body, frags: [fragmentHash("tool", body, [])] });
+            pushTextTurn("tool", body);
             continue;
         }
 
@@ -321,11 +332,11 @@ export function neutralTurns(messages: unknown[]): NeutralTurn[] {
                 asst = asst ?? { kind: "assistant", text: "", calls: [] };
                 const own = text + (typeof m.reasoning_content === "string" ? m.reasoning_content : "");
                 asst.text = (asst.text ?? "") + own;
-                asstFrags.push(fragmentHash("assistant", own, []));
+                addAssistantFragment(own, []);
                 continue;
             }
             flushAssistant();
-            pushTextTurn(role, text, [fragmentHash(role, text, [])]);
+            pushTextTurn(role, text);
             continue;
         }
 
@@ -354,14 +365,14 @@ export function neutralTurns(messages: unknown[]): NeutralTurn[] {
                 const ownText = texts.join("") + (foreign ? "\u0000foreign:" + canon(m.content) : "");
                 asst.text = (asst.text ?? "") + ownText;
                 asst.calls = [...(asst.calls ?? []), ...calls];
-                asstFrags.push(fragmentHash("assistant", ownText, calls));
+                addAssistantFragment(ownText, calls);
                 continue;
             }
             flushAssistant();
-            for (const r of results) turns.push({ kind: "tool", text: r, frags: [fragmentHash("tool", r, [])] }); // split multi-result messages
-            if (results.length > 0 && texts.length > 0 && role === "user") pushTextTurn("user", texts.join(""), [fragmentHash("user", texts.join(""), [])]);
-            else if (results.length === 0 && texts.length > 0) pushTextTurn(role, texts.join(""), [fragmentHash(role, texts.join(""), [])]);
-            else if (results.length === 0 && texts.length === 0 && role === "user" && foreign) pushTextTurn("user", canon(m.content), [fragmentHash("user", canon(m.content), [])]);
+            for (const r of results) pushTextTurn("tool", r); // split multi-result messages
+            if (results.length > 0 && texts.length > 0 && role === "user") pushTextTurn("user", texts.join(""));
+            else if (results.length === 0 && texts.length > 0) pushTextTurn(role, texts.join(""));
+            else if (results.length === 0 && texts.length === 0 && role === "user" && foreign) pushTextTurn("user", canon(m.content));
             continue;
         }
 
@@ -373,16 +384,18 @@ export function neutralTurns(messages: unknown[]): NeutralTurn[] {
                     .filter((tc): tc is { function?: { name?: unknown; arguments?: unknown } } => !!tc && typeof tc === "object")
                     .map((tc) => `${String(tc.function?.name ?? "")}\u0000${canonicalCallArgs(tc.function?.arguments)}`);
                 asst.calls = [...(asst.calls ?? []), ...calls];
-                asstFrags.push(fragmentHash("assistant", "", calls));
+                addAssistantFragment("", calls);
                 continue;
             }
         }
 
         // unrecognized shape — canonical JSON keeps same-wire replays stable
         flushAssistant();
-        turns.push({ kind: role, text: canon(m), frags: [fragmentHash(role, canon(m), [])] });
+        const text = canon(m);
+        pushTurn({ kind: role, text }, () => [fragmentHash(role, text, [])]);
     }
     flushAssistant();
+    if (tailFragments) turns[turns.length - 1]!.frags = tailFragments();
     return turns;
 }
 
