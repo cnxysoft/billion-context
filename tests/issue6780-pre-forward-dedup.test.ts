@@ -72,6 +72,7 @@ interface Harness {
     /** Arm the sidecar record() spy (call right after the first
      *  ingestRowsNow). Returns the ingest counter. */
     spy: () => Count;
+    shadowStats: () => { ingests: number; verifySamples: number; verifyOk: number; verifyDrift: number };
     /** Bump the epoch exactly like session.ts markDirty does and schedule the
      *  save (calling session.markDirty would hit the module-singleton store,
      *  not the harness store). */
@@ -95,7 +96,10 @@ async function withHarness(run: (h: Harness) => Promise<void>): Promise<void> {
     try {
         const store = new SessionStore({ dir, debounceMs: 60_000, enabled: true });
         const anyStore = store as unknown as {
-            shadow: { record: (...args: unknown[]) => unknown };
+            shadow: {
+                record: (...args: unknown[]) => unknown;
+                stats: { ingests: number; verifySamples: number; verifyOk: number; verifyDrift: number };
+            };
             scheduleSave: (s: Session) => void;
             lastSaveLanded: Map<string, boolean>;
             ingestRowsNow: (s: Session) => void;
@@ -109,6 +113,7 @@ async function withHarness(run: (h: Harness) => Promise<void>): Promise<void> {
                 anyStore.shadow.record = (...args: unknown[]) => { ingests++; return real(...args); };
                 return () => ingests;
             },
+            shadowStats: () => ({ ...anyStore.shadow.stats }),
             markDirty: () => {
                 session.revisionEpoch = (session.revisionEpoch ?? 0) + 1;
                 anyStore.scheduleSave(session);
@@ -204,5 +209,48 @@ test("#6780 P0 (F2): the arm is single-shot — a later standalone markDirty can
         markDirty();
         await settle();
         assert.equal(ingests(), 2, "a stale arm must not justify skipping a save it never covered");
+    });
+});
+
+test("ingestRowsNow defers sampled read-back verification to the next non-deferred save", async () => {
+    await withHarness(async ({ session, ingestRowsNow, shadowStats, markDirty, settle }) => {
+        ingestRowsNow();
+        assert.equal(shadowStats().ingests, 1, "durability ingest committed synchronously");
+        assert.equal(shadowStats().verifySamples, 0, "pre-send ingestRowsNow must defer sampled read-back verify off TTFT");
+
+        // Same-tick prepare markDirty skips via durability arm (still deferred).
+        markDirty();
+        await settle();
+        assert.equal(shadowStats().verifySamples, 0, "skipped coalesced build keeps verify deferred until a real post-turn save");
+
+        // Post-turn save runs the deferred sampled verify.
+        session.stats.outputTokens += 1;
+        markDirty();
+        await settle();
+        assert.equal(shadowStats().verifySamples, 1, "next non-deferred save runs the deferred verify sample");
+        assert.equal(shadowStats().verifyOk, 1, "deferred verify sample must pass");
+        assert.equal(shadowStats().verifyDrift, 0, "no drift");
+    });
+});
+
+test("#6780 P0: durability skip detects both regular metadata mutations and replaced reconcile snapshot keys", async () => {
+    await withHarness(async ({ session, ingestRowsNow, spy, markDirty, settle }) => {
+        session.metadata.foldAnchors = { a: { n: "h1" } };
+        ingestRowsNow();
+        const ingests = spy();
+
+        // Replacing a pinned reconcile key defeats the skip.
+        session.metadata.foldAnchors = { a: { n: "h2" } };
+        markDirty();
+        await settle();
+        assert.equal(ingests(), 1, "replacing foldAnchors must defeat the durability skip");
+
+        // Re-arm and mutate a non-pinned metadata key (e.g. cacheLedger/nudge).
+        ingestRowsNow();
+        const before = ingests();
+        session.metadata.probeFlag = 1;
+        markDirty();
+        await settle();
+        assert.equal(ingests(), before + 1, "mutating a regular metadata key must defeat the durability skip");
     });
 });

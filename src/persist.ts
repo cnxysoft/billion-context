@@ -569,7 +569,14 @@ export class SessionStore {
      *  (~1.3s of #6780's pre-forward cost on a 23k-message session). Any
      *  mismatch falls through to the full build; the arm is a hint, never a
      *  commitment. */
-    private readonly durabilityArms = new Map<string, { epoch: number; messagesRef: CoreMessage[] | undefined; metadata: Record<string, unknown>; metadataFp: string }>();
+    private readonly durabilityArms = new Map<string, {
+        epoch: number;
+        messagesRef: CoreMessage[] | undefined;
+        metadata: Record<string, unknown>;
+        metadataRef: Record<string, unknown>;
+        pinnedRefs: Map<string, unknown>;
+        restFp: string;
+    }>();
     /** #5408: per-session cooldown for the frozen-skip ERROR log (epoch ms of
      *  the last notice) — a live session saves every turn, so without it the
      *  line would spam; one notice per cooldown still makes the freeze loud. */
@@ -3278,7 +3285,7 @@ export class SessionStore {
                     );
                 }
                 this.convergeToDisk(session, disk);
-                this.shadow.record(disk);
+                this.shadow.record(disk, undefined, undefined, { deferVerify: true });
                 this.noteOwnCommit(session.id, disk);
                 this.armDurabilitySkip(session, disk); // #6780 P0: the disk view is what is durable now
                 return;
@@ -3289,12 +3296,52 @@ export class SessionStore {
             this.shadow.record(payload !== undefined ? { ...record, decompositionLog: payload } : record,
                 tail && tail.length > 0
                     ? { lastMessages: tail, lastMessagesFolded: session.lastMessagesFolded }
-                    : undefined, session.contentStore ?? undefined);
+                    : undefined, session.contentStore ?? undefined, { deferVerify: true });
             this.noteOwnCommit(session.id, record);
             this.armDurabilitySkip(session, record); // #6780 P0: arm the same-tick dedup for prepare's markDirty
         } catch (err) {
             this.log("warn", `[persist] ingestRowsNow failed for ${session.id}: ${String(err)} — the debounced save retries the full path`);
         }
+    }
+
+    private static readonly RECONCILE_SNAPSHOT_KEYS = new Set([
+        "foldAnchors",
+        "foldAnchorOrder",
+        "foldPositions",
+        "foldEpisodeOrder",
+        "foldCoverageByBlock",
+    ]);
+
+    private static durabilityMetadataSnapshot(metadata: Record<string, unknown>): { pinnedRefs: Map<string, unknown>; restFp: string } {
+        const pinnedRefs = new Map<string, unknown>();
+        const rest: Record<string, unknown> = {};
+        for (const key of Object.keys(metadata)) {
+            if (SessionStore.RECONCILE_SNAPSHOT_KEYS.has(key)) {
+                pinnedRefs.set(key, metadata[key]);
+            } else {
+                rest[key] = metadata[key];
+            }
+        }
+        return { pinnedRefs, restFp: JSON.stringify(rest) };
+    }
+
+    private static durabilityMetadataUnchanged(
+        metadata: Record<string, unknown>,
+        armed: { metadataRef: Record<string, unknown>; pinnedRefs: Map<string, unknown>; restFp: string },
+    ): boolean {
+        if (metadata !== armed.metadataRef || isDroppedMetadata(metadata)) return false;
+        let seenPinned = 0;
+        const rest: Record<string, unknown> = {};
+        for (const key of Object.keys(metadata)) {
+            if (SessionStore.RECONCILE_SNAPSHOT_KEYS.has(key)) {
+                if (!armed.pinnedRefs.has(key) || armed.pinnedRefs.get(key) !== metadata[key]) return false;
+                seenPinned += 1;
+            } else {
+                rest[key] = metadata[key];
+            }
+        }
+        if (seenPinned !== armed.pinnedRefs.size) return false;
+        return JSON.stringify(rest) === armed.restFp;
     }
 
     /** #6780 P0: record that `record` (just ingested by ingestRowsNow) is
@@ -3303,15 +3350,18 @@ export class SessionStore {
      *  heavy legs. Validated against LIVE state at run time — see
      *  scheduleSave's writerOff branch for the gate. */
     private armDurabilitySkip(session: Session, record: PersistedSession): void {
+        if (isDroppedMetadata(session.metadata)) {
+            this.durabilityArms.delete(session.id);
+            return;
+        }
+        const { pinnedRefs, restFp } = SessionStore.durabilityMetadataSnapshot(session.metadata);
         this.durabilityArms.set(session.id, {
             epoch: session.revisionEpoch ?? 0,
             messagesRef: session.lastMessages,
             metadata: record.metadata ?? {},
-            // buildRecordForSave already ran above (its
-            // publicSnapshotStoredRefs mutation is idempotent), so this
-            // fingerprint is stable as long as nothing else touches the
-            // metadata before the coalesced build runs.
-            metadataFp: JSON.stringify(session.metadata),
+            metadataRef: session.metadata,
+            pinnedRefs,
+            restFp,
         });
     }
 
@@ -3366,7 +3416,7 @@ export class SessionStore {
                     session.decompositionLog === undefined &&
                     !session.contentStoreDirty &&
                     session.pendingLedgerAlign === undefined &&
-                    JSON.stringify(session.metadata) === armed.metadataFp;
+                    SessionStore.durabilityMetadataUnchanged(session.metadata, armed);
                 // #6780 P0 (review F2): single-shot arm — this run made the
                 // decision; the arm must not survive to justify a skip for a
                 // LATER save (a stale arm could match any later epoch exactly

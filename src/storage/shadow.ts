@@ -316,6 +316,7 @@ export class UnifiedShadow {
     /** #3133: per-session ingest counters (verify sampling). Per-process
      *  only — nothing persisted, no schema change. */
     private readonly ingestCounts = new Map<string, number>();
+    private readonly pendingVerifySessions = new Set<string>();
     /** Warn-dedup key of the last logged failure — the error message itself
      *  (#5140: one warn per distinct message, no per-turn spam). #5627 makes
      *  the message victim-specific where possible, so distinct victims still
@@ -599,7 +600,7 @@ export class UnifiedShadow {
      *  message log authoritatively, so the ingest uses the raw tail whenever
      *  available; both digest legs go through the same override, so parity
      *  accounting stays honest. */
-    record(record: unknown, rawTail?: { lastMessages: CoreMessage[]; lastMessagesFolded?: boolean }, liveCcr?: MessageContentStore): void {
+    record(record: unknown, rawTail?: { lastMessages: CoreMessage[]; lastMessagesFolded?: boolean }, liveCcr?: MessageContentStore, opts?: { deferVerify?: boolean }): void {
         // #3931 step 3: network backend — the ingest runs on the serial
         // queue (fire-and-forget; failures are logged once per distinct message — never disabled).
         if (this.sync === null) {
@@ -697,7 +698,11 @@ export class UnifiedShadow {
             phase = "verify-sample";
             const count = (this.ingestCounts.get(legacy.id) ?? 0) + 1;
             this.ingestCounts.set(legacy.id, count);
-            if ((count - 1) % VERIFY_EVERY_INGESTS === 0) {
+            const dueVerify = (count - 1) % VERIFY_EVERY_INGESTS === 0 || this.pendingVerifySessions.has(legacy.id);
+            if (dueVerify && opts?.deferVerify === true) {
+                this.pendingVerifySessions.add(legacy.id);
+            } else if (dueVerify) {
+                this.pendingVerifySessions.delete(legacy.id);
                 this.stats.verifySamples++;
                 const sessionRow = this.sync.getSessionRow(legacy.id);
                 if (!sessionRow) throw new Error(`session row missing after ingest: ${legacy.id}`);
@@ -969,6 +974,7 @@ export class UnifiedShadow {
     remove(id: string): void {
         if (this.sync === null) return;
         this.ingestCounts.delete(id);
+        this.pendingVerifySessions.delete(id);
         this.driftStreaks.delete(id);
         this.frozenEnvelopeIds.delete(id);
         this.frozenEnvelopeSince.delete(id);
