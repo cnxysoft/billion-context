@@ -474,30 +474,54 @@ function isNonModelTopLevelKey(key: string): boolean {
     return NON_MODEL_TOP_LEVEL_KEYS.has(key) || key.startsWith("dsh_");
 }
 
-export function estimateRawBodyTokens(parsed: unknown): number {
-    let tokens = 0;
-    const pending: [unknown, string | undefined][] = [];
-    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-        for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
-            if (isNonModelTopLevelKey(k)) continue;
-            pending.push([v, k]);
-        }
-    } else {
-        pending.push([parsed, undefined]);
+function countSubtreeTokens(root: unknown, rootKey: string | undefined): number {
+    if (typeof root === "string") {
+        return !rootKey || !NON_TEXT_BODY_KEYS.has(rootKey) ? defaultCountTokens(root) : 0;
     }
-    while (pending.length > 0) {
-        const [value, key] = pending.pop()!;
-        if (typeof value === "string") {
-            if (!key || !NON_TEXT_BODY_KEYS.has(key)) tokens += defaultCountTokens(value);
-            continue;
-        }
+    if (!root || typeof root !== "object") return 0;
+    let tokens = 0;
+    const pendingVal: unknown[] = [root];
+    const pendingKey: (string | undefined)[] = [rootKey];
+    while (pendingVal.length > 0) {
+        const value = pendingVal.pop()!;
+        const key = pendingKey.pop();
         if (Array.isArray(value)) {
-            for (const item of value) pending.push([item, key]);
+            const skipStrings = key !== undefined && NON_TEXT_BODY_KEYS.has(key);
+            for (let i = 0; i < value.length; i++) {
+                const item = value[i];
+                if (typeof item === "string") {
+                    if (!skipStrings) tokens += defaultCountTokens(item);
+                } else if (item && typeof item === "object") {
+                    pendingVal.push(item);
+                    pendingKey.push(key);
+                }
+            }
             continue;
         }
-        if (value && typeof value === "object") {
-            for (const [k, v] of Object.entries(value as Record<string, unknown>)) pending.push([v, k]);
+        const record = value as Record<string, unknown>;
+        for (const k in record) {
+            if (!Object.prototype.hasOwnProperty.call(record, k)) continue;
+            const v = record[k];
+            if (typeof v === "string") {
+                if (!NON_TEXT_BODY_KEYS.has(k)) tokens += defaultCountTokens(v);
+            } else if (v && typeof v === "object") {
+                pendingVal.push(v);
+                pendingKey.push(k);
+            }
         }
+    }
+    return tokens;
+}
+
+export function estimateRawBodyTokens(parsed: unknown): number {
+    if (typeof parsed === "string") return defaultCountTokens(parsed);
+    if (!parsed || typeof parsed !== "object") return 0;
+    if (Array.isArray(parsed)) return countSubtreeTokens(parsed, undefined);
+    let tokens = 0;
+    const record = parsed as Record<string, unknown>;
+    for (const k in record) {
+        if (!Object.prototype.hasOwnProperty.call(record, k) || isNonModelTopLevelKey(k)) continue;
+        tokens += countSubtreeTokens(record[k], k);
     }
     return tokens;
 }
@@ -519,29 +543,15 @@ export interface RawBodyBreakdown {
 
 export function estimateRawBodyBreakdown(parsed: unknown): RawBodyBreakdown {
     const buckets: [number, number, number, number] = [0, 0, 0, 0]; // messages, tools, system, other
-    const pending: [unknown, string | undefined, number][] = [];
     if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-        for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
-            if (isNonModelTopLevelKey(k)) continue;
+        const record = parsed as Record<string, unknown>;
+        for (const k in record) {
+            if (!Object.prototype.hasOwnProperty.call(record, k) || isNonModelTopLevelKey(k)) continue;
             const bucket = k === "messages" ? 0 : k === "tools" ? 1 : k === "system" ? 2 : 3;
-            pending.push([v, k, bucket]);
+            buckets[bucket] += countSubtreeTokens(record[k], k);
         }
     } else {
-        pending.push([parsed, undefined, 3]);
-    }
-    while (pending.length > 0) {
-        const [value, key, bucket] = pending.pop()!;
-        if (typeof value === "string") {
-            if (!key || !NON_TEXT_BODY_KEYS.has(key)) buckets[bucket] += defaultCountTokens(value);
-            continue;
-        }
-        if (Array.isArray(value)) {
-            for (const item of value) pending.push([item, key, bucket]);
-            continue;
-        }
-        if (value && typeof value === "object") {
-            for (const [k, v] of Object.entries(value as Record<string, unknown>)) pending.push([v, k, bucket]);
-        }
+        buckets[3] += countSubtreeTokens(parsed, undefined);
     }
     return {
         total: buckets[0] + buckets[1] + buckets[2] + buckets[3],
