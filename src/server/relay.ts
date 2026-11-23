@@ -343,8 +343,7 @@ export function tryAnswerEarlyHold(o: {
 }): boolean {
     if (o.method === "GET" || o.method === "HEAD") return false;
     if (o.protocol === null || o.bodyBytes < EARLY_HOLD_GATE_MIN_BYTES) return false;
-    const requestModel = typeof o.requestModel === "function" ? o.requestModel() : o.requestModel;
-    const reject = upstreamThrottlePeekReject(o.upstreamUrl, o.credHeaders, o.now ?? Date.now(), requestModel);
+    const reject = upstreamThrottlePeekReject(o.upstreamUrl, o.credHeaders, o.now ?? Date.now(), o.requestModel);
     if (reject === undefined) return false;
     answerLocalThrottleReject(o.res, reject, o.protocol, o.streamErrorShape, o.log, "pre-ingest");
     return true;

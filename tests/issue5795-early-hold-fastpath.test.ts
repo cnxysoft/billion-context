@@ -456,14 +456,20 @@ test("#5795 e2e: model-scoped hold — other models egress, matching model held"
     });
 });
 
-test("#5898 review: the early-hold requestModel supplier is lazy — sub-threshold and unknown-wire bodies are never scanned", () => {
+test("#5898 review: the early-hold requestModel supplier is lazy — sub-threshold, unknown-wire, unheld, and account-held bodies are never scanned", () => {
     withKnobs(KNOWN_KNOBS, () => {
         _resetUpstreamThrottleForTest();
-        noteUpstreamThrottle429(URL_A, H_EMPTY, null, T0);
         const logs: string[] = [];
         let scans = 0;
         const supplier = () => { scans += 1; return "model-x"; };
         const big = EARLY_HOLD_GATE_MIN_BYTES + 1;
+
+        // No active hold: must bail out before scanning even above threshold.
+        const unheld = makeFakeRes();
+        assert.equal(tryAnswerEarlyHold({ ...earlyHoldBase(logs), method: "POST", bodyBytes: big, requestModel: supplier, now: T0 + 100, res: unheld }), false);
+        assert.equal(scans, 0, "unheld body never scans");
+
+        noteUpstreamThrottle429(URL_A, H_EMPTY, null, T0);
 
         // Sub-threshold body: the function bails out before the model is ever
         // needed — the full-document scan must not run (hot-path tax).
@@ -476,12 +482,25 @@ test("#5898 review: the early-hold requestModel supplier is lazy — sub-thresho
         assert.equal(tryAnswerEarlyHold({ ...earlyHoldBase(logs), method: "POST", protocol: null, bodyBytes: big, requestModel: supplier, res: pnull }), false);
         assert.equal(scans, 0, "unknown wire never scans");
 
-        // At threshold with a hold active: the model IS needed — the supplier
-        // runs exactly once and the local 429 lands.
-        const held = makeFakeRes();
-        assert.equal(tryAnswerEarlyHold({ ...earlyHoldBase(logs), method: "POST", bodyBytes: big, requestModel: supplier, now: T0 + 100, res: held }), true);
-        assert.equal(scans, 1, "consulted exactly once when actually used");
-        assert.equal(held.headStatus, 429);
+        // Account-scoped hold: rejects without needing the model.
+        const acctHeld = makeFakeRes();
+        assert.equal(tryAnswerEarlyHold({ ...earlyHoldBase(logs), method: "POST", bodyBytes: big, requestModel: supplier, now: T0 + 100, res: acctHeld }), true);
+        assert.equal(scans, 0, "account-scoped hold rejects without scanning the body");
+        assert.equal(acctHeld.headStatus, 429);
+
+        // Model-scoped hold: the model IS needed — the supplier runs once and
+        // rejects a matching model while letting another model pass.
+        _resetUpstreamThrottleForTest();
+        noteUpstreamThrottle429(URL_A, H_EMPTY, null, T0, "model-x");
+        const modelHeld = makeFakeRes();
+        assert.equal(tryAnswerEarlyHold({ ...earlyHoldBase(logs), method: "POST", bodyBytes: big, requestModel: supplier, now: T0 + 100, res: modelHeld }), true);
+        assert.equal(scans, 1, "consulted exactly once when a model-scoped hold is active");
+        assert.equal(modelHeld.headStatus, 429);
+
+        const otherModel = makeFakeRes();
+        let otherScans = 0;
+        assert.equal(tryAnswerEarlyHold({ ...earlyHoldBase(logs), method: "POST", bodyBytes: big, requestModel: () => { otherScans += 1; return "model-y"; }, now: T0 + 100, res: otherModel }), false);
+        assert.equal(otherScans, 1, "model-scoped hold consults supplier for non-matching model");
 
         // The plain-string form still works unchanged.
         const strRes = makeFakeRes();

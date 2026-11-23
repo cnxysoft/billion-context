@@ -722,15 +722,26 @@ export function upstreamThrottlePeekReject(
     url: string,
     headers: Record<string, string>,
     now: number = Date.now(),
-    requestModel?: string,
+    requestModel?: string | (() => string | undefined),
 ): ThrottleLocalReject | undefined {
     if (!throttle429Enabled()) return undefined;
+    if (holds.size === 0 && provisionalGroups.size === 0) return undefined;
     const { key } = holdKey(url, headers);
+    let resolvedModel = typeof requestModel === "function" ? undefined : requestModel;
+    let modelResolved = typeof requestModel !== "function";
+    const getModel = (): string | undefined => {
+        if (!modelResolved) {
+            modelResolved = true;
+            resolvedModel = (requestModel as () => string | undefined)();
+        }
+        return resolvedModel;
+    };
     let rejectState: HoldState | undefined;
     for (const state of holds.values()) {
         if (state.accountKey !== key) continue;
-        if (!state.provisional && state.model !== undefined && state.model !== requestModel) continue;
-        if (slotBlocked(state, now)) rejectState = strongerReject(rejectState, state);
+        if (!slotBlocked(state, now)) continue;
+        if (!state.provisional && state.model !== undefined && state.model !== getModel()) continue;
+        rejectState = strongerReject(rejectState, state);
     }
     for (const group of provisionalGroups.values()) {
         const state = group.state;
