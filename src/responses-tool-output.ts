@@ -1,5 +1,5 @@
 import type { CoreMessage } from "acp-kernel";
-import { coreToResponses, patchResponsesInput, responsesToCore, type BiliMessage, type ResponseContentPart, type ResponseInputItem, type ResponsesProjection, type ResponsesRequestBody } from "acp-kernel/wire";
+import { coreToResponses, patchResponsesInput, responsesToCore, type BiliMessage, type ResponseContentPart, type ResponseInputItem, type ResponsesProjection, type ResponsesRequestBody, type ResponsesToCoreOptions } from "acp-kernel/wire";
 import { isRenderedSummaryMessage } from "acp-kernel";
 import { systemToUser } from "./util.js";
 
@@ -30,13 +30,14 @@ function outputText(parts: ResponseContentPart[]): string {
     return parts.filter((part) => part.type === "input_text").map((part) => part.text).join("\n");
 }
 
-export function responsesToCoreWithToolImages(body: ResponsesRequestBody): ResponsesProjection {
-    const projection = responsesToCore(body);
+export function responsesToCoreWithToolImages(body: ResponsesRequestBody, opts?: ResponsesToCoreOptions): ResponsesProjection {
+    const projection = responsesToCore(body, opts);
     // The layout supplies exact source ownership, including duplicate images.
     // Keep it on the core while it survives rendering; never guess ownership
     // later from text equality or the first image in a multipart carrier.
-    const byId = new Map(projection.msgs.map(message => [message.id, message]));
-    for (const slot of projection.layout) {
+    let byId: Map<string, BiliMessage> | undefined;
+    for (let s = 0; s < projection.layout.length; s++) {
+        const slot = projection.layout[s]!;
         const source = slot.original;
         if (source.role !== "user" || !Array.isArray(source.content)) continue;
         const parts = source.content as ResponseContentPart[];
@@ -44,12 +45,22 @@ export function responsesToCoreWithToolImages(body: ResponsesRequestBody): Respo
         const emitted = parts.filter(part => part.type === "input_image" || (typeof part.text === "string" && part.text.length > 0));
         const ids = slot.coreIds ?? (slot.coreId ? [slot.coreId] : []);
         if (ids.length !== emitted.length) continue;
-        ids.forEach((id, index) => {
+        if (byId === undefined) {
+            byId = new Map<string, BiliMessage>();
+            for (let i = 0; i < projection.msgs.length; i++) {
+                const msg = projection.msgs[i]!;
+                byId.set(msg.id, msg);
+            }
+        }
+        for (let index = 0; index < ids.length; index++) {
+            const id = ids[index]!;
             const message = byId.get(id) as PartBoundMessage | undefined;
             if (message) message[responsesPartBinding] = { source, part: emitted[index]!, sourceId: id };
-        });
+        }
     }
-    for (const message of projection.msgs) {
+    for (let i = 0; i < projection.msgs.length; i++) {
+        const message = projection.msgs[i]!;
+        if (message.role !== "tool") continue;
         const parts = responsesToolImageParts(message.rawResponsesItem);
         // Keep the codec's original content-derived id so persisted refs still
         // identify the same image-bearing message after the text-only repair.

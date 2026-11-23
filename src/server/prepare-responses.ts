@@ -220,7 +220,7 @@ export async function prepareResponses(
         // fold coverage, and byte-stable verbatim re-emission) for EVERY
         // client, not just plugin/codex; the head prefix still hoists into
         // systemParts for strict single-system upstreams (#377).
-        const projection = responsesToCore(parsed);
+        const projection = responsesToCore(parsed, { prevMsgs: session.lastMessages });
         if (onIncomingImages) incomingImages = collectIncomingImageCandidates(projection.msgs);
         if (checkpoint && checkpoint !== session.metadata.codexNativeCompactionKey) {
             const covered = coveredRealHistoryIds(session.state.blocks);
