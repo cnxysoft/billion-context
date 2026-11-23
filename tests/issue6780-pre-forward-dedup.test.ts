@@ -4,6 +4,8 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { SessionStore } from "../src/persist.ts";
+import { getCacheLedger } from "../src/cache-ledger.ts";
+import { buildRefRows, serializeSessionMetadata } from "../src/storage/ingest.ts";
 import { snapshotMessages, type Session } from "../src/session.ts";
 import type { CoreMessage } from "acp-kernel";
 
@@ -245,12 +247,70 @@ test("#6780 P0: durability skip detects both regular metadata mutations and repl
         await settle();
         assert.equal(ingests(), 1, "replacing foldAnchors must defeat the durability skip");
 
-        // Re-arm and mutate a non-pinned metadata key (e.g. cacheLedger/nudge).
+        // Re-arm and mutate a non-pinned metadata key (e.g. probeFlag).
         ingestRowsNow();
         const before = ingests();
         session.metadata.probeFlag = 1;
         markDirty();
         await settle();
         assert.equal(ingests(), before + 1, "mutating a regular metadata key must defeat the durability skip");
+
+        // Re-arm with a live cacheLedger, verify unchanged skips, and mutating via getCacheLedger defeats the skip.
+        const led = getCacheLedger(session);
+        ingestRowsNow();
+        const beforeUnchanged = ingests();
+        markDirty();
+        await settle();
+        assert.equal(ingests(), beforeUnchanged, "unchanged cacheLedger keeps the durability skip active");
+
+        ingestRowsNow();
+        const beforeMutated = ingests();
+        getCacheLedger(session).sampleSeq += 1;
+        markDirty();
+        await settle();
+        assert.equal(ingests(), beforeMutated + 1, "mutating cacheLedger via getCacheLedger must defeat the durability skip");
+        assert.equal(led.sampleSeq, 1);
     });
+});
+
+test("serializeSessionMetadata and buildRefRows match uncached serialization across mutations", () => {
+    const fakeSession = { id: "s1", metadata: {}, state: { blocks: [] } } as unknown as Parameters<typeof getCacheLedger>[0];
+    const led = getCacheLedger(fakeSession);
+    const anchors = { a: { n: "h1", c: "text" } };
+    const order = ["a", "b"];
+    const positions = { ids: ["a", "b"], canon: ["c1", "c2"] };
+    const meta: Record<string, unknown> = {
+        cacheLedger: led,
+        foldAnchors: anchors,
+        foldAnchorOrder: order,
+        foldPositions: positions,
+        small: "v1",
+        omitted: undefined,
+    };
+    assert.equal(serializeSessionMetadata(meta), JSON.stringify(meta), "cold serialization matches JSON.stringify byte-for-byte");
+    assert.equal(serializeSessionMetadata(meta), JSON.stringify(meta), "warm cache hit matches JSON.stringify byte-for-byte");
+
+    // Mutate cacheLedger via getCacheLedger and directly; both must invalidate.
+    getCacheLedger(fakeSession).sampleSeq += 1;
+    assert.equal(serializeSessionMetadata(meta), JSON.stringify(meta), "getCacheLedger mutation invalidates cached JSON");
+    led.lines.push({ seq: 1, at: 100, input: 10, cached: 5, output: 2, hitPct: 50, tr: 0, cr: 0, nc: 5 } as never);
+    assert.equal(serializeSessionMetadata(meta), JSON.stringify(meta), "direct structural cacheLedger mutation invalidates cached JSON");
+
+    // Replace foldAnchors / extend foldAnchorOrder / mutate small key.
+    meta.foldAnchors = { a: { n: "h2", c: "text" } };
+    order.push("c");
+    meta.small = "v2";
+    assert.equal(serializeSessionMetadata(meta), JSON.stringify(meta), "fold snapshot replacement and array append stay byte-identical");
+
+    // buildRefRows: cold, warm identical, append, edit, delete.
+    const byRaw: Record<string, string> = { r1: "m00001", r2: "m00002" };
+    const expected = () => Object.entries(byRaw).map(([rawId, ref], ord) => ({ ord, rawId, ref, refNum: Number(ref.slice(1)) }));
+    assert.deepEqual(buildRefRows(byRaw), expected());
+    assert.deepEqual(buildRefRows(byRaw), expected());
+    byRaw.r3 = "m00003";
+    assert.deepEqual(buildRefRows(byRaw), expected());
+    byRaw.r2 = "m00099";
+    assert.deepEqual(buildRefRows(byRaw), expected());
+    delete byRaw.r1;
+    assert.deepEqual(buildRefRows(byRaw), expected());
 });

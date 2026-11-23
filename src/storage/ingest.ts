@@ -30,6 +30,7 @@ import type { BlockView } from "../session.js";
 import { refToIndex } from "../../kernel/src/refs.js";
 import { sha256Hex, type BlockRow, type CcrEntryRow, type IngestSessionInput, type MessageRow, type RefRow, type SessionRow } from "./store.js";
 import { serializeAndDescribeCoreMessage, splitMediaContent } from "./identity.js";
+import { cacheLedgerFingerprint } from "../cache-ledger.js";
 
 /**
  * Field order of the hydration merge output — DERIVED from mergeState itself
@@ -419,6 +420,128 @@ function serializeBlockView(view: BlockView): { json: string; hash: string } {
     return { json, hash: sha256Hex(json) };
 }
 
+const refRowsCache = new WeakMap<Record<string, string>, RefRow[]>();
+
+export function buildRefRows(byRawRef: Record<string, string>): RefRow[] {
+    const keys = Object.keys(byRawRef);
+    const prev = refRowsCache.get(byRawRef);
+    if (prev !== undefined && keys.length >= prev.length) {
+        let prefixOk = true;
+        for (let i = 0; i < prev.length; i++) {
+            const row = prev[i]!;
+            const key = keys[i]!;
+            if (key !== row.rawId || byRawRef[key] !== row.ref) {
+                prefixOk = false;
+                break;
+            }
+        }
+        if (prefixOk) {
+            if (keys.length === prev.length) return prev.slice();
+            const next = prev.slice();
+            for (let ord = prev.length; ord < keys.length; ord++) {
+                const rawId = keys[ord]!;
+                const ref = byRawRef[rawId]!;
+                next.push({ ord, rawId, ref, refNum: refToIndex(ref) });
+            }
+            refRowsCache.set(byRawRef, next);
+            return next.slice();
+        }
+    }
+    const rows: RefRow[] = new Array<RefRow>(keys.length);
+    for (let ord = 0; ord < keys.length; ord++) {
+        const rawId = keys[ord]!;
+        const ref = byRawRef[rawId]!;
+        rows[ord] = { ord, rawId, ref, refNum: refToIndex(ref) };
+    }
+    refRowsCache.set(byRawRef, rows);
+    return rows.slice();
+}
+
+const FOLD_OBJECT_KEYS = new Set(["foldAnchors", "foldCoverageByBlock"]);
+const FOLD_ARRAY_KEYS = new Set(["foldAnchorOrder", "foldEpisodeOrder"]);
+const foldObjectJsonCache = new WeakMap<object, string>();
+const foldArrayJsonCache = new WeakMap<unknown[], { len: number; first: unknown; last: unknown; json: string }>();
+const foldPositionsJsonCache = new WeakMap<object, { idsRef: unknown; canonRef: unknown; idsLen: number; canonLen: number; lastId: unknown; json: string }>();
+const cacheLedgerJsonCache = new WeakMap<object, { fp: string; json: string }>();
+
+function serializeCachedMetadataValue(key: string, val: unknown): string | undefined {
+    if (val === null || typeof val !== "object" || typeof (val as { toJSON?: unknown }).toJSON === "function") {
+        return JSON.stringify(val);
+    }
+    if (key === "cacheLedger") {
+        const fp = cacheLedgerFingerprint(val);
+        if (fp !== null) {
+            const cached = cacheLedgerJsonCache.get(val);
+            if (cached !== undefined && cached.fp === fp) return cached.json;
+            const json = JSON.stringify(val);
+            cacheLedgerJsonCache.set(val, { fp, json });
+            return json;
+        }
+        return JSON.stringify(val);
+    }
+    if (FOLD_OBJECT_KEYS.has(key) && !Array.isArray(val)) {
+        const cached = foldObjectJsonCache.get(val);
+        if (cached !== undefined) return cached;
+        const json = JSON.stringify(val);
+        foldObjectJsonCache.set(val, json);
+        return json;
+    }
+    if (FOLD_ARRAY_KEYS.has(key) && Array.isArray(val)) {
+        const len = val.length;
+        const first = len > 0 ? val[0] : undefined;
+        const last = len > 0 ? val[len - 1] : undefined;
+        const cached = foldArrayJsonCache.get(val);
+        if (cached !== undefined && cached.len === len && cached.first === first && cached.last === last) {
+            return cached.json;
+        }
+        const json = JSON.stringify(val);
+        foldArrayJsonCache.set(val, { len, first, last, json });
+        return json;
+    }
+    if (key === "foldPositions" && !Array.isArray(val)) {
+        const pos = val as { ids?: unknown; canon?: unknown };
+        if (Array.isArray(pos.ids) && Array.isArray(pos.canon)) {
+            const idsLen = pos.ids.length;
+            const canonLen = pos.canon.length;
+            const lastId = idsLen > 0 ? pos.ids[idsLen - 1] : undefined;
+            const cached = foldPositionsJsonCache.get(val);
+            if (
+                cached !== undefined &&
+                cached.idsRef === pos.ids &&
+                cached.canonRef === pos.canon &&
+                cached.idsLen === idsLen &&
+                cached.canonLen === canonLen &&
+                cached.lastId === lastId
+            ) {
+                return cached.json;
+            }
+            const json = JSON.stringify(val);
+            foldPositionsJsonCache.set(val, { idsRef: pos.ids, canonRef: pos.canon, idsLen, canonLen, lastId, json });
+            return json;
+        }
+    }
+    return JSON.stringify(val);
+}
+
+/** Byte-identical to JSON.stringify(metadata), while caching the serialized
+ *  JSON of multi-MB metadata subtrees (cacheLedger, foldAnchors, foldPositions,
+ *  foldAnchorOrder, foldEpisodeOrder, foldCoverageByBlock) across saves. */
+export function serializeSessionMetadata(metadata: Record<string, unknown>): string {
+    if (metadata === null || typeof metadata !== "object" || Array.isArray(metadata) || typeof (metadata as { toJSON?: unknown }).toJSON === "function") {
+        return JSON.stringify(metadata);
+    }
+    const keys = Object.keys(metadata);
+    const parts: string[] = [];
+    for (let i = 0; i < keys.length; i++) {
+        const key = keys[i]!;
+        const val = metadata[key];
+        if (val === undefined || typeof val === "function" || typeof val === "symbol") continue;
+        const encoded = serializeCachedMetadataValue(key, val);
+        if (encoded !== undefined) parts.push(`${JSON.stringify(key)}:${encoded}`);
+    }
+    return `{${parts.join(",")}}`;
+}
+
 function finishPlan(
     session: LegacySessionLike,
     byRawRef: Record<string, string>,
@@ -428,12 +551,7 @@ function finishPlan(
 ): IngestPlan {
     // Ref ledger: verbatim, ordered by the persisted map's key order.
     // Ghost ids (dead refs) have rows here and nowhere else — by design.
-    const refs: RefRow[] = Object.entries(byRawRef).map(([rawId, ref], ord) => ({
-        ord,
-        rawId,
-        ref,
-        refNum: refToIndex(ref),
-    }));
+    const refs: RefRow[] = buildRefRows(byRawRef);
 
     const messages: MessageRow[] = log.map((e) => ({
         seq: e.seq,
@@ -565,7 +683,7 @@ function finishPlan(
         nextRunId: session.state.nextRunId,
         metaJson: JSON.stringify(session.meta),
         statsJson: JSON.stringify(session.stats),
-        metadataJson: JSON.stringify(session.metadata),
+        metadataJson: serializeSessionMetadata(session.metadata),
         kstateJson: JSON.stringify(kstate),
         tailJson: JSON.stringify({ pluginSnapshotSeqs, tailSeqs, tailFolded: session.lastMessagesFolded === true }),
         ccrJson: session.contentStore ? JSON.stringify(session.contentStore) : null,

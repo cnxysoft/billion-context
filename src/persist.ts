@@ -37,6 +37,7 @@ import { validCostUsd } from "./billing.js";
 import { mergeState } from "./state-hydration.js";
 import { restampRefsToLedger, restampContentStore } from "acp-kernel";
 import { LazyBlockContents, isDroppedContentStore, isDroppedMetadata, lazyContentStore, lazyMetadata, peekSession, sessionWeight } from "./session.js";
+import { cacheLedgerFingerprint } from "./cache-ledger.js";
 import type { Session, BlockContent, BlockView } from "./session.js";
 import { orphanContents, resolveStorageMode, UnifiedShadow, hadIntegrityQuickCheckFailure, type StorageMode } from "./storage/shadow.js";
 import { noteColdLoad } from "./attach-heartbeat.js";
@@ -575,6 +576,8 @@ export class SessionStore {
         metadata: Record<string, unknown>;
         metadataRef: Record<string, unknown>;
         pinnedRefs: Map<string, unknown>;
+        cacheLedgerRef?: unknown;
+        cacheLedgerFp?: string;
         restFp: string;
     }>();
     /** #5408: per-session cooldown for the frozen-skip ERROR log (epoch ms of
@@ -3312,35 +3315,62 @@ export class SessionStore {
         "foldCoverageByBlock",
     ]);
 
-    private static durabilityMetadataSnapshot(metadata: Record<string, unknown>): { pinnedRefs: Map<string, unknown>; restFp: string } {
+    private static durabilityMetadataSnapshot(metadata: Record<string, unknown>): {
+        pinnedRefs: Map<string, unknown>;
+        cacheLedgerRef?: unknown;
+        cacheLedgerFp?: string;
+        restFp: string;
+    } {
         const pinnedRefs = new Map<string, unknown>();
+        let cacheLedgerRef: unknown;
+        let cacheLedgerFp: string | undefined;
         const rest: Record<string, unknown> = {};
         for (const key of Object.keys(metadata)) {
             if (SessionStore.RECONCILE_SNAPSHOT_KEYS.has(key)) {
                 pinnedRefs.set(key, metadata[key]);
+            } else if (key === "cacheLedger") {
+                const fp = cacheLedgerFingerprint(metadata[key]);
+                if (fp !== null) {
+                    cacheLedgerRef = metadata[key];
+                    cacheLedgerFp = fp;
+                } else {
+                    rest[key] = metadata[key];
+                }
             } else {
                 rest[key] = metadata[key];
             }
         }
-        return { pinnedRefs, restFp: JSON.stringify(rest) };
+        return { pinnedRefs, cacheLedgerRef, cacheLedgerFp, restFp: JSON.stringify(rest) };
     }
 
     private static durabilityMetadataUnchanged(
         metadata: Record<string, unknown>,
-        armed: { metadataRef: Record<string, unknown>; pinnedRefs: Map<string, unknown>; restFp: string },
+        armed: {
+            metadataRef: Record<string, unknown>;
+            pinnedRefs: Map<string, unknown>;
+            cacheLedgerRef?: unknown;
+            cacheLedgerFp?: string;
+            restFp: string;
+        },
     ): boolean {
         if (metadata !== armed.metadataRef || isDroppedMetadata(metadata)) return false;
         let seenPinned = 0;
+        let seenCacheLedger = false;
         const rest: Record<string, unknown> = {};
         for (const key of Object.keys(metadata)) {
             if (SessionStore.RECONCILE_SNAPSHOT_KEYS.has(key)) {
                 if (!armed.pinnedRefs.has(key) || armed.pinnedRefs.get(key) !== metadata[key]) return false;
                 seenPinned += 1;
+            } else if (key === "cacheLedger" && armed.cacheLedgerFp !== undefined) {
+                if (metadata[key] !== armed.cacheLedgerRef) return false;
+                if (cacheLedgerFingerprint(metadata[key]) !== armed.cacheLedgerFp) return false;
+                seenCacheLedger = true;
             } else {
                 rest[key] = metadata[key];
             }
         }
         if (seenPinned !== armed.pinnedRefs.size) return false;
+        if (armed.cacheLedgerFp !== undefined && !seenCacheLedger) return false;
         return JSON.stringify(rest) === armed.restFp;
     }
 
@@ -3354,13 +3384,15 @@ export class SessionStore {
             this.durabilityArms.delete(session.id);
             return;
         }
-        const { pinnedRefs, restFp } = SessionStore.durabilityMetadataSnapshot(session.metadata);
+        const { pinnedRefs, cacheLedgerRef, cacheLedgerFp, restFp } = SessionStore.durabilityMetadataSnapshot(session.metadata);
         this.durabilityArms.set(session.id, {
             epoch: session.revisionEpoch ?? 0,
             messagesRef: session.lastMessages,
             metadata: record.metadata ?? {},
             metadataRef: session.metadata,
             pinnedRefs,
+            cacheLedgerRef,
+            cacheLedgerFp,
             restFp,
         });
     }

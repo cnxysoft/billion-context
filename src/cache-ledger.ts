@@ -1242,6 +1242,55 @@ function detectSeam(session: Session, led: CacheLedger): void {
     }
 }
 
+const cacheLedgerVersions = new WeakMap<object, number>();
+
+function bumpCacheLedgerVersion(led: CacheLedger): void {
+    cacheLedgerVersions.set(led, (cacheLedgerVersions.get(led) ?? 0) + 1);
+}
+
+/** O(1) mutation stamp for a live CacheLedger object so storage serialization
+ *  and durability-skip checks avoid re-stringifying multi-MB ledgers when no
+ *  mutation occurred. Returns null for non-v1 / malformed shapes (caller falls
+ *  back to full JSON.stringify). */
+export function cacheLedgerFingerprint(value: unknown): string | null {
+    if (value === null || typeof value !== "object" || Array.isArray(value)) return null;
+    if (typeof (value as { toJSON?: unknown }).toJSON === "function") return null;
+    const led = value as Partial<CacheLedger>;
+    if (led.v !== 1 || !Array.isArray(led.lines) || !Array.isArray(led.folds) || !led.agg || typeof led.agg !== "object") {
+        return null;
+    }
+    const ver = cacheLedgerVersions.get(value) ?? 0;
+    const lastLine = led.lines.length > 0 ? led.lines[led.lines.length - 1] : undefined;
+    const lastFold = led.folds.length > 0 ? led.folds[led.folds.length - 1] : undefined;
+    const recLen = Array.isArray(led.recovery) ? led.recovery.length : -1;
+    return [
+        ver,
+        led.lastBlockId ?? -1,
+        led.consumedFoldSeq ?? -1,
+        led.sampleSeq ?? -1,
+        led.foldSeqCounter ?? -1,
+        led.lines.length,
+        led.folds.length,
+        recLen,
+        led.agg.requests ?? -1,
+        led.agg.input ?? -1,
+        led.agg.cached ?? -1,
+        led.agg.output ?? -1,
+        lastLine?.seq ?? -1,
+        lastLine?.at ?? -1,
+        lastLine?.input ?? -1,
+        lastLine?.cached ?? -1,
+        lastFold?.seq ?? -1,
+        lastFold?.requestsAfter ?? -1,
+        lastFold?.k ?? -1,
+        led.lastSweptCount ?? -1,
+        led.sweepThisSample ?? -1,
+        led.agg.nc ?? -1,
+        led.agg.cr ?? -1,
+        led.agg.tr ?? -1,
+    ].join("\u0000");
+}
+
 export function getCacheLedger(session: Session): CacheLedger {
     const meta = session.metadata ?? (session.metadata = {});
     const existing = meta[LEDGER_KEY] as CacheLedger | undefined;
@@ -1259,6 +1308,7 @@ export function getCacheLedger(session: Session): CacheLedger {
         ] as const) {
             if (typeof g[key] !== "number") g[key] = 0;
         }
+        bumpCacheLedgerVersion(existing);
         return existing;
     }
     // Bootstrap: blocks already present predate ledger tracking — record
@@ -1275,6 +1325,7 @@ export function getCacheLedger(session: Session): CacheLedger {
         agg: { requests: 0, input: 0, cached: 0, output: 0, nc: 0, cr: 0, tr: 0, switches: 0, switchMissed: 0, effSwitches: 0, effSwitchMissed: 0, keySwitches: 0, keySwitchMissed: 0, promptSwitches: 0, promptSwitchMissed: 0, projSwitches: 0, projSwitchMissed: 0, wireSwitches: 0, wireSwitchMissed: 0, upstreamSwitches: 0, upstreamSwitchMissed: 0, restartDrops: 0, restartDropMissed: 0, attributedMissed: 0, unknownSamples: 0, unknownInput: 0, nbSamples: 0, nbInput: 0, seamSuspects: 0, seamMissed: 0, providerSideMisses: 0, providerSideMissed: 0, providerTtlMisses: 0, providerTtlMissed: 0, rewinds: 0, rewindMissed: 0, abortCorrelated: 0, clientInserts: 0, clientInsertMissed: 0, orphanSweepSeams: 0, orphanSweepMissed: 0 },
     };
     meta[LEDGER_KEY] = led;
+    bumpCacheLedgerVersion(led);
     return led;
 }
 
