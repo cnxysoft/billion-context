@@ -3595,11 +3595,18 @@ export class UnifiedStore {
             const chunk = rows.slice(i, i + CHUNK);
             const hashes = [...new Set(chunk.map((row) => row.content_hash as string))];
             const contents = this.prepareMessageRead(`SELECT hash, bytes FROM content WHERE hash IN (${hashes.map(() => "?").join(",")})`)
-                .all(...hashes) as { hash: string; bytes: Uint8Array }[];
+                .all(...hashes) as { hash: string; bytes: Uint8Array | string }[];
             const byHash = new Map(contents.map((row) => [row.hash, row.bytes]));
             for (const row of chunk) {
                 const bytes = byHash.get(row.content_hash as string);
-                yield [row, bytes === undefined ? "" : Buffer.from(bytes).toString("utf8")];
+                if (bytes === undefined) {
+                    yield [row, ""];
+                    continue;
+                }
+                const buffer = typeof bytes === "string"
+                    ? Buffer.from(bytes)
+                    : Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+                yield [row, buffer.toString("utf8")];
             }
         }
     }

@@ -878,8 +878,9 @@ test("schema v10: v9→v10 migration adds messages.ts without backfill; idempote
             const ver = (reopened as unknown as { db: { prepare(q: string): { get(): unknown } } }).db
                 .prepare("PRAGMA user_version").get() as { user_version: number };
             assert.equal(ver.user_version, 11, "v9 library migrates to v11");
-            const rows = reopened.getMessages("v10-mig-1") as { seq: number; ts?: number | null }[];
+            const rows = reopened.getMessages("v10-mig-1");
             assert.equal(rows.length, 1, "row survives the migration");
+            assert.equal(rows[0].content, "hello", "legacy TEXT content still decodes");
             assert.ok(rows[0].ts === null || rows[0].ts === undefined, "pre-existing row keeps NULL (never backfilled)");
         } finally {
             reopened.close();
