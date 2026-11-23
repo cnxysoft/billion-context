@@ -2,7 +2,7 @@ name: Android long-session baseline
 
 on:
   push:
-    branches: [2026-11-23_android-long-session, 2026-11-23_dsh-focused-prewarm]
+    branches: [2026-11-23_android-long-session, 2026-11-23_dsh-focused-prewarm, 2026-11-23_dsh-p0-ttft]
     paths:
       - '.github/workflows/fork-android-long-session.yml'
       - 'src/**'
@@ -38,6 +38,9 @@ jobs:
       - name: Build package
         run: npm run build
 
+      - name: Run kernel unit tests
+        run: npm --prefix kernel test
+
       - name: Pack and smoke-test a clean install
         run: |
           package_dir="$RUNNER_TEMP/bili-package"
@@ -63,6 +66,8 @@ jobs:
             tests/admin-origin.test.ts \
             tests/dsh-fork-adopt.test.ts \
             tests/dsh-native.test.ts \
+            tests/fold-reconcile.test.ts \
+            tests/golden-wire-contract.test.ts \
             tests/image-restore.test.ts \
             tests/issue2824-regression.test.ts \
             tests/prefix-affinity.test.ts \
@@ -72,6 +77,7 @@ jobs:
             tests/issue3407-shadow-blockcontents-order.test.ts \
             tests/issue5140-cold-raw-tail-fork.test.ts \
             tests/issue5756-lazy-sweep.test.ts \
+            tests/issue5795-early-hold-fastpath.test.ts \
             tests/issue6947-turn-final-writeback.test.ts \
             tests/issue7190-dsh-runtime-preset-coverage.test.ts \
             tests/media-cas.test.ts \
@@ -84,6 +90,7 @@ jobs:
             tests/storage-message-content-join.test.ts \
             tests/storage-null-identity.test.ts \
             tests/unified-remap-collision.test.ts \
+            tests/verif-subset-guard.test.ts \
             tests/web-storage-fallback.test.ts
 
       - name: Run real Codex against the deterministic fake upstream
