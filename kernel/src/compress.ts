@@ -1327,14 +1327,20 @@ const assignRefsNode: PipelineNode = {
           ],
         }
       : { ...io.state, messageRefs: refResult.map };
-    return { ...io, state };
+    return {
+      ...io,
+      state,
+      effects: { ...io.effects, freshMessageRefs: refResult.map },
+    };
   },
 };
 
 const syncBlocksNode: PipelineNode = {
   name: "sync-blocks",
   run(io, ctx) {
-    const synced = syncBlocks(io.messages, io.state);
+    const synced = syncBlocks(io.messages, io.state, {
+      reuseMessageRefs: io.effects.freshMessageRefs === io.state.messageRefs,
+    });
     advanceSurvival(synced.state, ctx.config.promotionThreshold);
     return { ...io, state: synced.state };
   },

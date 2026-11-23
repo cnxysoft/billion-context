@@ -83,6 +83,11 @@ export interface ResolveBoundariesInput {
    *  (screening screens many units against one array — build once per pass).
    *  Omitted callers build one here as before. */
   indexByMessageId?: Map<string, number>;
+  /** Precomputed active blocks for `state` (avoids re-filtering per unit). */
+  activeBlocksList?: readonly CompressionBlock[];
+  /** Precomputed earliest visible raw index per active blockId over
+   *  `indexByMessageId` (avoids O(activeBlocks * effectiveIds) per unit). */
+  blockEarliestIndex?: ReadonlyMap<string, number | null>;
 }
 
 export interface ResolvedRange {
@@ -156,8 +161,19 @@ export function resolveBoundaries(
 
   const nestedBlockIds: string[] = [];
   const nestedSeen = new Set<string>();
-  for (const block of activeBlocks(input.state)) {
-    if (blockVisibleInRange(block, indexByMessageId, startIndex, endIndex)) {
+  const blocksToScan = input.activeBlocksList ?? activeBlocks(input.state);
+  const blockEarliestIndex = input.blockEarliestIndex;
+  for (const block of blocksToScan) {
+    const precomputed = blockEarliestIndex?.get(block.blockId);
+    if (
+      blockVisibleInRange(
+        block,
+        indexByMessageId,
+        startIndex,
+        endIndex,
+        precomputed,
+      )
+    ) {
       if (!nestedSeen.has(block.blockId)) {
         nestedSeen.add(block.blockId);
         nestedBlockIds.push(block.blockId);
@@ -463,6 +479,7 @@ export function blockVisibleInRange(
   indexByMessageId: Map<string, number>,
   startIndex: number,
   endIndex: number,
+  precomputedEarliestIndex?: number | null,
 ): boolean {
   const summaryIndex = indexByMessageId.get(summaryMessageId(block.blockId));
   if (
@@ -472,10 +489,10 @@ export function blockVisibleInRange(
   ) {
     return true;
   }
-  const rawIndex = earliestIndexOfIds(
-    block.effectiveMessageIds,
-    indexByMessageId,
-  );
+  const rawIndex =
+    precomputedEarliestIndex !== undefined
+      ? precomputedEarliestIndex
+      : earliestIndexOfIds(block.effectiveMessageIds, indexByMessageId);
   return rawIndex !== null && rawIndex >= startIndex && rawIndex <= endIndex;
 }
 

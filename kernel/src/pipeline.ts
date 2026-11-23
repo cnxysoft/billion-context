@@ -34,6 +34,9 @@ export interface NodeEffects {
    *  pre-transform-snapshot node so the view-latch node can replay latched
    *  bytes for messages the transform nodes dropped or rewrote. */
   preTransformMessages?: CoreMessage[];
+  /** Pipeline-internal: fresh MessageRefMap cloned by assign-refs this turn,
+   *  letting sync-blocks reuse it without a redundant 100K-key object clone. */
+  freshMessageRefs?: import("./types.js").MessageRefMap;
   readonly [key: string]: unknown;
 }
 

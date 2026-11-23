@@ -26,6 +26,27 @@ export function indexToRef(index: number): string {
 }
 
 export function refToIndex(ref: string): number | null {
+  const len = ref.length;
+  // Fast ASCII path for canonical refs ("m00001".."m9999999", no whitespace):
+  // avoids trim/toLowerCase/RegExp allocations on 100K+ ledger scans.
+  if (len >= 2 && len <= 8) {
+    const c0 = ref.charCodeAt(0);
+    if (c0 === 109 || c0 === 77) {
+      let value = 0;
+      let digits = true;
+      for (let i = 1; i < len; i++) {
+        const d = ref.charCodeAt(i) - 48;
+        if (d < 0 || d > 9) {
+          digits = false;
+          break;
+        }
+        value = value * 10 + d;
+      }
+      if (digits) {
+        return value >= MIN_INDEX && value <= MAX_INDEX ? value : null;
+      }
+    }
+  }
   const match = REF_PATTERN.exec(ref.trim().toLowerCase());
   if (!match) return null;
   const index = Number(match[1]);
@@ -95,27 +116,41 @@ export function assignRefs(
   // binding the moment ONE sibling loses protection would re-tag a
   // still-protected sibling's already-sent bytes. Migration requires that NO
   // message with that id is protected this pass.
+  // Only ids currently holding BLOCKED_REF can migrate on this pass; ids
+  // newly assigned BLOCKED_REF below record themselves inline so later
+  // siblings see the same protection barrier without evaluating isProtected
+  // on already-numbered messages.
   const siblingProtected = new Set<string>();
-  for (const message of messages) {
-    if (!message.id || options.shouldSkip?.(message)) continue;
-    if (options.isProtected?.(message)) siblingProtected.add(message.id);
+  if (options.isProtected) {
+    let hasBlockedInMessages = false;
+    for (const message of messages) {
+      if (message.id && map.byRaw[message.id] === BLOCKED_REF) {
+        hasBlockedInMessages = true;
+        break;
+      }
+    }
+    if (hasBlockedInMessages) {
+      for (const message of messages) {
+        if (!message.id || map.byRaw[message.id] !== BLOCKED_REF) continue;
+        if (options.shouldSkip?.(message)) continue;
+        if (options.isProtected(message)) siblingProtected.add(message.id);
+      }
+    }
   }
 
   for (const message of messages) {
-    if (!message.id || options.shouldSkip?.(message)) continue;
+    if (!message.id) continue;
+    const prev = map.byRaw[message.id];
+    if (prev && prev !== BLOCKED_REF) continue;
+    if (options.shouldSkip?.(message)) continue;
 
     const protectedNow = options.isProtected?.(message) ?? false;
-    const prev = map.byRaw[message.id];
-    if (prev) {
+    if (prev === BLOCKED_REF) {
       // Stale BLOCKED entries migrate to a fresh numeric ref once protection
       // is lifted (#2607: #1188 pinned all media; archivable images now fold
       // and must be citable via decompress({ imageRef })). Fresh number only —
       // the id-never-reused contract holds.
-      if (
-        prev === BLOCKED_REF &&
-        !protectedNow &&
-        !siblingProtected.has(message.id)
-      ) {
+      if (!protectedNow && !siblingProtected.has(message.id)) {
         delete map.byRaw[message.id];
         migratedIds.push(message.id);
       } else continue;
@@ -123,6 +158,7 @@ export function assignRefs(
 
     if (protectedNow) {
       map.byRaw[message.id] = BLOCKED_REF;
+      siblingProtected.add(message.id);
       continue;
     }
 

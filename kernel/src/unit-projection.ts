@@ -6,6 +6,7 @@ import {
 } from "./state.js";
 import {
   buildIndexByMessageId,
+  earliestIndexOfIds,
   resolveBoundaries,
   blockVisibleInRange,
 } from "./boundaries.js";
@@ -31,6 +32,7 @@ import {
   buildToolPairExtremes,
 } from "./tool-pairs.js";
 import type {
+  CompressionBlock,
   CompressionState,
   CompressionTier,
   Config,
@@ -142,6 +144,8 @@ export function projectUnit(input: UnitProjectionInput): UnitProjection {
     messages: input.messages,
     state: input.state,
     indexByMessageId: byId,
+    activeBlocksList: shared?.activeBlocksList,
+    blockEarliestIndex: shared?.blockEarliestIndex,
   });
 
   // Host checkpoint carriers (#335): a host that renders its own compression
@@ -197,10 +201,18 @@ export function projectUnit(input: UnitProjectionInput): UnitProjection {
           resolved.endIndex)
         : resolved.endIndex;
     const nestedSeen = new Set(resolved.nestedBlockIds);
-    for (const block of activeBlocks(input.state)) {
+    const blocksToScan = shared?.activeBlocksList ?? activeBlocks(input.state);
+    const blockEarliestIndex = shared?.blockEarliestIndex;
+    for (const block of blocksToScan) {
       if (nestedSeen.has(block.blockId)) continue;
       if (
-        blockVisibleInRange(block, indexByMessageId, adjustedStart, adjustedEnd)
+        blockVisibleInRange(
+          block,
+          indexByMessageId,
+          adjustedStart,
+          adjustedEnd,
+          blockEarliestIndex?.get(block.blockId),
+        )
       ) {
         nestedSeen.add(block.blockId);
         resolved.nestedBlockIds.push(block.blockId);
@@ -854,6 +866,10 @@ export interface ProjectionShared {
   anchorMessage: CoreMessage | undefined;
   /** Per-message inputs of computeIntegrityWithdrawals (#684 gate). */
   integrityPre: IntegrityPre;
+  /** Precomputed active blocks list for `state`. */
+  activeBlocksList: CompressionBlock[];
+  /** Precomputed earliest visible raw index per active blockId over `byId`. */
+  blockEarliestIndex: Map<string, number | null>;
 }
 
 /** One-pass build of {@link ProjectionShared}; see that interface for what
@@ -863,6 +879,15 @@ export function buildProjectionShared(
   state: CompressionState,
   config: Config,
 ): ProjectionShared {
+  const byId = buildIndexByMessageId(messages);
+  const activeBlocksList = activeBlocks(state);
+  const blockEarliestIndex = new Map<string, number | null>();
+  for (const block of activeBlocksList) {
+    blockEarliestIndex.set(
+      block.blockId,
+      earliestIndexOfIds(block.effectiveMessageIds, byId),
+    );
+  }
   const liveCarrierIds = new Set<string>();
   for (const message of messages) {
     if (isLiveCheckpointCarrier(message, state)) liveCarrierIds.add(message.id);
@@ -883,7 +908,7 @@ export function buildProjectionShared(
     }
   }
   return {
-    byId: buildIndexByMessageId(messages),
+    byId,
     liveCarrierIds,
     failedCompressCallIds,
     latestProtected,
@@ -893,6 +918,8 @@ export function buildProjectionShared(
     toolPairExtremes: buildToolPairExtremes(messages),
     anchorMessage: lastUserAnchor(messages, coveredMessageIds(state), config),
     integrityPre: buildIntegrityPre(messages),
+    activeBlocksList,
+    blockEarliestIndex,
   };
 }
 

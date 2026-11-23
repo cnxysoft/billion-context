@@ -37,18 +37,44 @@ export interface SyncResult {
   deactivated: string[];
 }
 
+export interface SyncBlocksOptions {
+  /** Internal pipeline hint: caller already freshly cloned `state.messageRefs`
+   *  this turn (e.g., assignRefsNode immediately prior), so syncBlocks does not
+   *  need to clone the 100K-entry byRaw/byRef maps a second time. */
+  reuseMessageRefs?: boolean;
+}
+
 export function syncBlocks(
   messages: CoreMessage[],
   state: CompressionState,
+  options?: SyncBlocksOptions,
 ): SyncResult {
-  const presentIds = new Set(messages.map((message) => message.id));
+  const presentIds = new Set<string>();
   const presentBases = new Set<string>();
+  const existingSnapshot = state.tokenSnapshot;
+  const existingSnapshotKeys = existingSnapshot
+    ? Object.keys(existingSnapshot)
+    : [];
+  const liveRefs =
+    existingSnapshotKeys.length > 0 ? new Set<string>() : null;
+  const byRaw = state.messageRefs.byRaw;
+  let hasLedgerSeq = false;
   // Subid coverage only applies to messages that actually carry a string id.
   // Id-less host-shaped entries were silently digested by every release
   // before 0.0.90 (presentIds merely held undefined and no has() ever
   // matched); baseIdOf would throw on them and hard-crash processTurn (#421).
-  for (const message of messages) {
-    if (typeof message.id === "string") presentBases.add(baseIdOf(message.id));
+  for (let i = 0; i < messages.length; i++) {
+    const message = messages[i]!;
+    const id = message.id;
+    presentIds.add(id);
+    if (typeof id === "string") presentBases.add(baseIdOf(id));
+    if (liveRefs !== null) {
+      const ref = byRaw[id];
+      if (typeof ref === "string") liveRefs.add(ref);
+    }
+    if (!hasLedgerSeq && typeof message.ledgerSeq === "number") {
+      hasLedgerSeq = true;
+    }
   }
   const deactivated: string[] = [];
   // Deep-clone (not just `{...state}`) so the caller's input state is never
@@ -62,10 +88,12 @@ export function syncBlocks(
       effectiveMessageIds: [...block.effectiveMessageIds],
       directBlockIds: [...block.directBlockIds],
     })),
-    messageRefs: {
-      byRaw: { ...state.messageRefs.byRaw },
-      byRef: { ...state.messageRefs.byRef },
-    },
+    messageRefs: options?.reuseMessageRefs
+      ? state.messageRefs
+      : {
+          byRaw: { ...state.messageRefs.byRaw },
+          byRef: { ...state.messageRefs.byRef },
+        },
     // Snapshot is keyed by ref with primitive values — shallow copy suffices.
     tokenSnapshot: { ...(state.tokenSnapshot ?? {}) },
     nudge: { ...state.nudge, anchors: { ...state.nudge.anchors } },
@@ -130,15 +158,11 @@ export function syncBlocks(
   // Refs are additive (assignRefs never removes them from messageRefs), so
   // prune the snapshot by currently-present message refs — otherwise it grows
   // unboundedly as messages are compressed/deleted across a long session.
-  const liveRefs = new Set(
-    messages
-      .map((m) => result.messageRefs.byRaw[m.id])
-      .filter((r): r is string => typeof r === "string"),
-  );
-  if (Object.keys(result.tokenSnapshot).length !== liveRefs.size) {
+  if (liveRefs !== null && existingSnapshotKeys.length !== liveRefs.size) {
     const pruned: Record<string, number> = {};
-    for (const [ref, n] of Object.entries(result.tokenSnapshot)) {
-      if (liveRefs.has(ref)) pruned[ref] = n;
+    for (let i = 0; i < existingSnapshotKeys.length; i++) {
+      const ref = existingSnapshotKeys[i]!;
+      if (liveRefs.has(ref)) pruned[ref] = result.tokenSnapshot![ref]!;
     }
     result.tokenSnapshot = pruned;
   }
@@ -186,7 +210,7 @@ export function syncBlocks(
     const stillPresent =
       block.effectiveMessageIds.some((id) => presentBases.has(baseIdOf(id))) ||
       presentIds.has(summaryMessageId(block.blockId)) ||
-      blockSeqPresent(block, messages);
+      (hasLedgerSeq && blockSeqPresent(block, messages));
     if (!stillPresent) {
       block.active = false;
       deactivated.push(block.blockId);

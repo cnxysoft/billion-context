@@ -208,7 +208,15 @@ export function matchToolPattern(toolName: string, pattern: string): boolean {
 // the preceding `/` is exactly the case a boundary class would break. The
 // separator runs on RAW JSON text, where a Windows `\` arrives escaped as a
 // backslash PAIR — so accept `\\` (escaped pair), `\` (unescaped text) or `/`.
+// Fast literal gate: avoids regex backtracking across megabytes of tool-call
+// JSON payloads that never mention SKILL.md.
+const SKILL_MD_QUICK_RE = /skill\.md/i;
 const SKILL_MD_ANCHOR_RE = /([A-Za-z0-9][A-Za-z0-9._-]*)(?:\\\\|\\|\/)SKILL\.md/i;
+
+const toolPathCache = new WeakMap<
+  CoreMessage,
+  { toolName: string; contentType: string; text: string | undefined; path: string }
+>();
 
 function isValidSkillName(name: string): boolean {
   return (
@@ -247,13 +255,27 @@ function skillNameFromCallText(text: string | undefined): string | undefined {
 export function toolPathOf(msg: CoreMessage): string {
   const toolName = msg.toolName ?? "";
   if (!toolName || msg.contentType !== "tool-call") return toolName;
-  if (toolName.toLowerCase() === "skill") {
-    const name = skillNameFromCallText(msg.text);
-    if (name) return `skill/${name}`;
+  const text = msg.text;
+  const cached = toolPathCache.get(msg);
+  if (
+    cached !== undefined &&
+    cached.toolName === toolName &&
+    cached.contentType === msg.contentType &&
+    cached.text === text
+  ) {
+    return cached.path;
   }
-  const anchored = (msg.text ?? "").match(SKILL_MD_ANCHOR_RE)?.[1];
-  if (anchored && isValidSkillName(anchored)) return `skill/${anchored}`;
-  return toolName;
+  let path = toolName;
+  if (toolName.toLowerCase() === "skill") {
+    const name = skillNameFromCallText(text);
+    if (name) path = `skill/${name}`;
+  }
+  if (path === toolName && text && SKILL_MD_QUICK_RE.test(text)) {
+    const anchored = text.match(SKILL_MD_ANCHOR_RE)?.[1];
+    if (anchored && isValidSkillName(anchored)) path = `skill/${anchored}`;
+  }
+  toolPathCache.set(msg, { toolName, contentType: msg.contentType, text, path });
+  return path;
 }
 
 /** Match a canonical tool path against a protectedTools/protectedLatestTools
@@ -263,13 +285,15 @@ export function toolPathOf(msg: CoreMessage): string {
  *  segment, i.e. the node and ALL its descendants: `skill` ≡ `skill/*`
  *  (#1947). */
 export function matchToolPath(path: string, pattern: string): boolean {
+  if (!pattern.includes("/")) {
+    const slash = path.indexOf("/");
+    const pathFirst = slash === -1 ? path : path.slice(0, slash);
+    return matchToolPattern(pathFirst, pattern);
+  }
   const patSegs = pattern.toLowerCase().split("/");
   const patFirst = patSegs[0] ?? "";
-  const pathFirst = path.toLowerCase().split("/")[0] ?? "";
-  if (patSegs.length === 1) {
-    return matchToolPattern(pathFirst, patFirst);
-  }
   const pathSegs = path.toLowerCase().split("/");
+  const pathFirst = pathSegs[0] ?? "";
   if (patSegs.length === 2 && patSegs[1] === "*") {
     return matchToolPattern(pathFirst, patFirst);
   }

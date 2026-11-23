@@ -27,17 +27,26 @@ function isAssistantAct(msg: CoreMessage): boolean {
  *
  * @returns disjoint member-id arrays; a message appears in at most one group.
  */
-export function computeTurnGroups(messages: CoreMessage[]): string[][] {
-  const resultIdByCallId = new Map<string, string>();
-  for (const msg of messages) {
-    if (
-      msg.contentType === "tool-result" &&
-      typeof msg.toolCallId === "string" &&
-      msg.id
-    ) {
-      if (!resultIdByCallId.has(msg.toolCallId))
-        resultIdByCallId.set(msg.toolCallId, msg.id);
+export function computeTurnGroups(
+  messages: CoreMessage[],
+  prebuiltResultIdByCallId?: ReadonlyMap<string, string>,
+): string[][] {
+  let resultIdByCallId: ReadonlyMap<string, string>;
+  if (prebuiltResultIdByCallId !== undefined) {
+    resultIdByCallId = prebuiltResultIdByCallId;
+  } else {
+    const builtMap = new Map<string, string>();
+    for (const msg of messages) {
+      if (
+        msg.contentType === "tool-result" &&
+        typeof msg.toolCallId === "string" &&
+        msg.id
+      ) {
+        if (!builtMap.has(msg.toolCallId))
+          builtMap.set(msg.toolCallId, msg.id);
+      }
     }
+    resultIdByCallId = builtMap;
   }
 
   const grouped = new Set<string>();
@@ -130,6 +139,13 @@ export interface IntegrityPre {
   callIdByMessageId: Map<string, string>;
   resultIdByCallId: Map<string, string>;
   groups: string[][];
+  /** Reasoning message id -> index in `groups` (each reasoning message belongs
+   *  to at most one group). Enables O(|foldedIds|) candidate-group filtering. */
+  groupIndexByReasoningId?: Map<string, number>;
+  /** Message id (call or result) -> sorted indices in `callMessages` whose
+   *  (call, result) pair includes that message id. Enables O(|foldedIds|)
+   *  candidate-pair filtering. */
+  pairIndicesByMsgId?: Map<string, number[]>;
 }
 
 /** One-pass build of {@link IntegrityPre} for a message array. */
@@ -155,13 +171,43 @@ export function buildIntegrityPre(messages: CoreMessage[]): IntegrityPre {
       }
     }
   }
+  const groups = computeTurnGroups(messages, resultIdByCallId);
+  const groupIndexByReasoningId = new Map<string, number>();
+  for (let g = 0; g < groups.length; g++) {
+    const group = groups[g]!;
+    for (let k = 0; k < group.length; k++) {
+      const id = group[k]!;
+      if (reasoningIds.has(id)) groupIndexByReasoningId.set(id, g);
+    }
+  }
+  const pairIndicesByMsgId = new Map<string, number[]>();
+  const pushPairIndex = (msgId: string, idx: number): void => {
+    let list = pairIndicesByMsgId.get(msgId);
+    if (list === undefined) {
+      list = [idx];
+      pairIndicesByMsgId.set(msgId, list);
+    } else {
+      list.push(idx);
+    }
+  };
+  for (let idx = 0; idx < callMessages.length; idx++) {
+    const m = callMessages[idx]!;
+    const callId = callIdByMessageId.get(m.id);
+    if (callId === undefined) continue;
+    const resultId = resultIdByCallId.get(callId);
+    if (resultId === undefined) continue;
+    pushPairIndex(m.id, idx);
+    if (resultId !== m.id) pushPairIndex(resultId, idx);
+  }
   return {
     reasoningIds,
     callIds,
     callMessages,
     callIdByMessageId,
     resultIdByCallId,
-    groups: computeTurnGroups(messages),
+    groups,
+    groupIndexByReasoningId,
+    pairIndicesByMsgId,
   };
 }
 
@@ -201,6 +247,9 @@ export function computeIntegrityWithdrawals(
   pre?: IntegrityPre,
   invisibleIds?: ReadonlySet<string>,
 ): IntegrityWithdrawals {
+  if (foldedIds.size === 0) {
+    return { withdrawn: new Set<string>(), splitTurnCount: 0, splitPairCount: 0 };
+  }
   const remaining = new Set(foldedIds);
   const withdrawn = new Set<string>();
   const handledTurns = new Set<number>();
@@ -212,44 +261,115 @@ export function computeIntegrityWithdrawals(
   const callIdByMessageId = built.callIdByMessageId;
   const resultIdByCallId = built.resultIdByCallId;
   const groups = built.groups;
+  const groupIndexByReasoningId = built.groupIndexByReasoningId;
+  const pairIndicesByMsgId = built.pairIndicesByMsgId;
+
+  // `remaining` only shrinks across fixed-point iterations, so any group that
+  // can ever fire INV1 must already have a reasoning id in initial `foldedIds`,
+  // and any (call, result) pair that can ever fire INV2 must already have at
+  // least one endpoint in initial `foldedIds`. Sorting ascending preserves
+  // exact scan order over `groups` and `callMessages`.
+  let candidateGroups: number[] | null = null;
+  if (groupIndexByReasoningId !== undefined) {
+    const seen = new Set<number>();
+    for (const id of remaining) {
+      const g = groupIndexByReasoningId.get(id);
+      if (g !== undefined) seen.add(g);
+    }
+    candidateGroups = [...seen].sort((a, b) => a - b);
+  }
+  let candidatePairIndices: number[] | null = null;
+  if (pairIndicesByMsgId !== undefined) {
+    const seen = new Set<number>();
+    for (const id of remaining) {
+      const indices = pairIndicesByMsgId.get(id);
+      if (indices !== undefined) {
+        for (let k = 0; k < indices.length; k++) seen.add(indices[k]!);
+      }
+    }
+    candidatePairIndices = [...seen].sort((a, b) => a - b);
+  }
+
   let changed = true;
   while (changed) {
     changed = false;
 
-    for (let g = 0; g < groups.length; g++) {
-      if (handledTurns.has(g)) continue;
-      const group = groups[g]!;
-      const foldHasReasoning = group.some(
-        (id) => remaining.has(id) && reasoningIds.has(id),
-      );
-      if (!foldHasReasoning) continue;
-      const keptHasCall = group.some(
-        (id) =>
-          !remaining.has(id) &&
-          callIds.has(id) &&
-          !invisibleIds?.has(id),
-      );
-      if (!keptHasCall) continue;
-      handledTurns.add(g);
-      for (const id of group) {
-        remaining.delete(id);
-        withdrawn.add(id);
+    if (candidateGroups !== null) {
+      for (let ci = 0; ci < candidateGroups.length; ci++) {
+        const g = candidateGroups[ci]!;
+        if (handledTurns.has(g)) continue;
+        const group = groups[g]!;
+        const foldHasReasoning = group.some(
+          (id) => remaining.has(id) && reasoningIds.has(id),
+        );
+        if (!foldHasReasoning) continue;
+        const keptHasCall = group.some(
+          (id) =>
+            !remaining.has(id) &&
+            callIds.has(id) &&
+            !invisibleIds?.has(id),
+        );
+        if (!keptHasCall) continue;
+        handledTurns.add(g);
+        for (const id of group) {
+          remaining.delete(id);
+          withdrawn.add(id);
+        }
+        changed = true;
       }
-      changed = true;
+    } else {
+      for (let g = 0; g < groups.length; g++) {
+        if (handledTurns.has(g)) continue;
+        const group = groups[g]!;
+        const foldHasReasoning = group.some(
+          (id) => remaining.has(id) && reasoningIds.has(id),
+        );
+        if (!foldHasReasoning) continue;
+        const keptHasCall = group.some(
+          (id) =>
+            !remaining.has(id) &&
+            callIds.has(id) &&
+            !invisibleIds?.has(id),
+        );
+        if (!keptHasCall) continue;
+        handledTurns.add(g);
+        for (const id of group) {
+          remaining.delete(id);
+          withdrawn.add(id);
+        }
+        changed = true;
+      }
     }
 
-    for (const m of built.callMessages) {
-      const callId = callIdByMessageId.get(m.id);
-      if (callId === undefined || handledPairs.has(callId)) continue;
-      const resultId = resultIdByCallId.get(callId);
-      if (resultId === undefined) continue;
-      if (remaining.has(m.id) === remaining.has(resultId)) continue;
-      handledPairs.add(callId);
-      remaining.delete(m.id);
-      remaining.delete(resultId);
-      withdrawn.add(m.id);
-      withdrawn.add(resultId);
-      changed = true;
+    if (candidatePairIndices !== null) {
+      for (let ci = 0; ci < candidatePairIndices.length; ci++) {
+        const m = built.callMessages[candidatePairIndices[ci]!]!;
+        const callId = callIdByMessageId.get(m.id);
+        if (callId === undefined || handledPairs.has(callId)) continue;
+        const resultId = resultIdByCallId.get(callId);
+        if (resultId === undefined) continue;
+        if (remaining.has(m.id) === remaining.has(resultId)) continue;
+        handledPairs.add(callId);
+        remaining.delete(m.id);
+        remaining.delete(resultId);
+        withdrawn.add(m.id);
+        withdrawn.add(resultId);
+        changed = true;
+      }
+    } else {
+      for (const m of built.callMessages) {
+        const callId = callIdByMessageId.get(m.id);
+        if (callId === undefined || handledPairs.has(callId)) continue;
+        const resultId = resultIdByCallId.get(callId);
+        if (resultId === undefined) continue;
+        if (remaining.has(m.id) === remaining.has(resultId)) continue;
+        handledPairs.add(callId);
+        remaining.delete(m.id);
+        remaining.delete(resultId);
+        withdrawn.add(m.id);
+        withdrawn.add(resultId);
+        changed = true;
+      }
     }
   }
 
