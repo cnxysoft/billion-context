@@ -483,6 +483,60 @@ const foldObjectJsonCache = new WeakMap<object, string>();
 const foldArrayJsonCache = new WeakMap<unknown[], { len: number; first: unknown; last: unknown; json: string }>();
 const foldPositionsJsonCache = new WeakMap<object, { idsRef: unknown; canonRef: unknown; idsLen: number; canonLen: number; lastId: unknown; json: string }>();
 const cacheLedgerJsonCache = new WeakMap<object, { fp: string; json: string }>();
+const cacheLedgerLinesPrefixCache = new WeakMap<unknown[], { prefixLen: number; prefixJson: string; firstObj: unknown; lastPrefixObj: unknown }>();
+
+function serializeCacheLedgerIncremental(val: Record<string, unknown>): string {
+    const keys = Object.keys(val);
+    const parts: string[] = [];
+    for (let i = 0; i < keys.length; i++) {
+        const k = keys[i]!;
+        const v = val[k];
+        if (v === undefined || typeof v === "function" || typeof v === "symbol") continue;
+        if (k === "lines" && Array.isArray(v) && v.length >= 2) {
+            const len = v.length;
+            const targetPrefixLen = len - 1;
+            const cached = cacheLedgerLinesPrefixCache.get(v);
+            let prefixJson: string;
+            if (
+                cached !== undefined &&
+                cached.prefixLen <= targetPrefixLen &&
+                cached.prefixLen >= 1 &&
+                v[0] === cached.firstObj &&
+                v[cached.prefixLen - 1] === cached.lastPrefixObj
+            ) {
+                prefixJson = cached.prefixJson;
+                if (cached.prefixLen < targetPrefixLen) {
+                    const extra: string[] = [];
+                    for (let j = cached.prefixLen; j < targetPrefixLen; j++) {
+                        extra.push(JSON.stringify(v[j]));
+                    }
+                    prefixJson = `${prefixJson},${extra.join(",")}`;
+                    cacheLedgerLinesPrefixCache.set(v, {
+                        prefixLen: targetPrefixLen,
+                        prefixJson,
+                        firstObj: v[0],
+                        lastPrefixObj: v[targetPrefixLen - 1],
+                    });
+                }
+            } else {
+                const encoded: string[] = new Array<string>(targetPrefixLen);
+                for (let j = 0; j < targetPrefixLen; j++) encoded[j] = JSON.stringify(v[j]);
+                prefixJson = encoded.join(",");
+                cacheLedgerLinesPrefixCache.set(v, {
+                    prefixLen: targetPrefixLen,
+                    prefixJson,
+                    firstObj: v[0],
+                    lastPrefixObj: v[targetPrefixLen - 1],
+                });
+            }
+            parts.push(`"lines":[${prefixJson},${JSON.stringify(v[len - 1])}]`);
+            continue;
+        }
+        const enc = JSON.stringify(v);
+        if (enc !== undefined) parts.push(`${JSON.stringify(k)}:${enc}`);
+    }
+    return `{${parts.join(",")}}`;
+}
 
 function serializeCachedMetadataValue(key: string, val: unknown): string | undefined {
     if (val === null || typeof val !== "object" || typeof (val as { toJSON?: unknown }).toJSON === "function") {
@@ -493,7 +547,7 @@ function serializeCachedMetadataValue(key: string, val: unknown): string | undef
         if (fp !== null) {
             const cached = cacheLedgerJsonCache.get(val);
             if (cached !== undefined && cached.fp === fp) return cached.json;
-            const json = JSON.stringify(val);
+            const json = serializeCacheLedgerIncremental(val as Record<string, unknown>);
             cacheLedgerJsonCache.set(val, { fp, json });
             return json;
         }
@@ -562,6 +616,94 @@ export function serializeSessionMetadata(metadata: Record<string, unknown>): str
     return `{${parts.join(",")}}`;
 }
 
+interface CachedBlockSerialization {
+    eff: readonly string[];
+    dir: readonly string[];
+    coveredHash: string;
+    keys: readonly string[];
+    snapshot: Record<string, unknown>;
+    payloadJson: string;
+}
+
+const blockSerBySessionCache = new Map<string, Map<string, CachedBlockSerialization>>();
+const MAX_BLOCK_SER_SESSIONS = 64;
+
+function stringArraysEqual(a: readonly string[] | undefined, b: readonly string[] | undefined): boolean {
+    if (a === b) return true;
+    if (!a || !b || a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+    return true;
+}
+
+function blockSerializationMapFor(sessionId: string): Map<string, CachedBlockSerialization> {
+    let map = blockSerBySessionCache.get(sessionId);
+    if (map !== undefined) {
+        blockSerBySessionCache.delete(sessionId);
+        blockSerBySessionCache.set(sessionId, map);
+        return map;
+    }
+    map = new Map<string, CachedBlockSerialization>();
+    blockSerBySessionCache.set(sessionId, map);
+    if (blockSerBySessionCache.size > MAX_BLOCK_SER_SESSIONS) {
+        const oldest = blockSerBySessionCache.keys().next().value;
+        if (oldest !== undefined) blockSerBySessionCache.delete(oldest);
+    }
+    return map;
+}
+
+function serializeBlockMetadata(
+    b: CompressionBlock,
+    sessionCache: Map<string, CachedBlockSerialization>,
+): { coveredHash: string; payloadJson: string } {
+    const prev = sessionCache.get(b.blockId);
+    const sameCoverage =
+        prev !== undefined &&
+        stringArraysEqual(prev.eff, b.effectiveMessageIds) &&
+        stringArraysEqual(prev.dir, b.directMessageIds);
+    const coveredHash = sameCoverage
+        ? prev!.coveredHash
+        : sha256Hex(JSON.stringify({ effectiveMessageIds: b.effectiveMessageIds, directMessageIds: b.directMessageIds }));
+
+    const rec = b as unknown as Record<string, unknown>;
+    const keys = Object.keys(rec);
+    if (sameCoverage && prev !== undefined && keys.length === prev.keys.length) {
+        let samePayload = true;
+        for (let i = 0; i < keys.length; i++) {
+            const k = keys[i]!;
+            if (k !== prev.keys[i]) { samePayload = false; break; }
+            if (k === "effectiveMessageIds" || k === "directMessageIds") continue;
+            const curVal = rec[k];
+            const prevVal = prev.snapshot[k];
+            if (curVal === prevVal && (curVal === null || typeof curVal !== "object")) continue;
+            if (k === "directBlockIds" && Array.isArray(curVal) && Array.isArray(prevVal) && stringArraysEqual(curVal as string[], prevVal as string[])) {
+                continue;
+            }
+            samePayload = false;
+            break;
+        }
+        if (samePayload) {
+            return { coveredHash, payloadJson: prev.payloadJson };
+        }
+    }
+
+    const payloadJson = JSON.stringify(b);
+    const snapshot: Record<string, unknown> = {};
+    for (let i = 0; i < keys.length; i++) {
+        const k = keys[i]!;
+        const v = rec[k];
+        snapshot[k] = k === "directBlockIds" && Array.isArray(v) ? [...v] : v;
+    }
+    sessionCache.set(b.blockId, {
+        eff: [...b.effectiveMessageIds],
+        dir: [...b.directMessageIds],
+        coveredHash,
+        keys,
+        snapshot,
+        payloadJson,
+    });
+    return { coveredHash, payloadJson };
+}
+
 function finishPlan(
     session: LegacySessionLike,
     byRawRef: Record<string, string>,
@@ -597,13 +739,14 @@ function finishPlan(
     for (const e of log) if (!seqById.has(e.msgId)) seqById.set(e.msgId, e.seq);
 
     const blockContents = completeBlockContents(session.blockContents, session.state.blocks);
+    const blockSerCache = blockSerializationMapFor(session.id);
     const blocks: BlockRow[] = session.state.blocks.map((b, ord) => {
         const views = blockContents.get(b.blockId);
         const full = views?.full ?? { text: b.summary, count: 0 };
         const one = views?.one ?? null;
         const fullSer = serializeBlockView(full);
         const oneSer = one === null ? null : serializeBlockView(one);
-        const covered = { effectiveMessageIds: b.effectiveMessageIds, directMessageIds: b.directMessageIds };
+        const { coveredHash, payloadJson } = serializeBlockMetadata(b, blockSerCache);
         let startSeq = -1;
         let endSeq = -1;
         if (seqById.size > 0) {
@@ -635,8 +778,8 @@ function finishPlan(
             supersedesBlockId: null,
             active: b.active,
             createdAt: b.createdAt,
-            coveredHash: sha256Hex(JSON.stringify(covered)),
-            payloadJson: JSON.stringify(b),
+            coveredHash,
+            payloadJson,
             coveredIds,
         };
     });

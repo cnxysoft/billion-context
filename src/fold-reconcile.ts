@@ -755,6 +755,42 @@ export function wordBagDigest(text: string): number {
  *  ids against 1.3k inbound messages) held the event loop past the 300 s
  *  watchdog. Buckets keep candidate order, so a scan of the bucket finds the
  *  same first match a scan of every candidate would. */
+const WORD_BAG_MEMO_MAX = 4096;
+const wordBagMemo = new Map<string, { text: string; wh: number }>();
+const POS_FP_MEMO_MAX = 4096;
+const posFpMemo = new Map<string, { role: string; contentType: string; toolName: string; text: string; fp: string }>();
+
+function cachedPositionalFingerprint(m: CoreMessage): string {
+    const id = m.id;
+    const role = m.role;
+    const contentType = m.contentType ?? "";
+    const toolName = m.toolName ?? "";
+    const text = m.text ?? "";
+    if (id !== undefined) {
+        const hit = posFpMemo.get(id);
+        if (
+            hit !== undefined &&
+            hit.role === role &&
+            hit.contentType === contentType &&
+            hit.toolName === toolName &&
+            hit.text === text
+        ) {
+            return hit.fp;
+        }
+    }
+    const fp = positionalFingerprint(m);
+    if (id !== undefined && text.length <= 16_384) {
+        if (posFpMemo.size >= POS_FP_MEMO_MAX) {
+            const oldest = posFpMemo.keys().next().value;
+            if (oldest !== undefined) posFpMemo.delete(oldest);
+        }
+        posFpMemo.set(id, { role, contentType, toolName, text, fp });
+    }
+    return fp;
+}
+
+const checkedNonRebaseBySession = new WeakMap<Session, Set<string>>();
+
 function candidateWordEvidence<C extends { message: CoreMessage }>(candidates: readonly C[]) {
     const canon = new WeakMap<CoreMessage, string>();
     const bags = new WeakMap<CoreMessage, number>();
@@ -766,7 +802,25 @@ function candidateWordEvidence<C extends { message: CoreMessage }>(candidates: r
     };
     const wordBag = (m: CoreMessage): number => {
         let wh = bags.get(m);
-        if (wh === undefined) bags.set(m, (wh = wordBagDigest(canonicalOf(m))));
+        if (wh !== undefined) return wh;
+        const id = m.id;
+        const raw = m.text ?? "";
+        if (id !== undefined) {
+            const hit = wordBagMemo.get(id);
+            if (hit !== undefined && hit.text === raw) {
+                bags.set(m, hit.wh);
+                return hit.wh;
+            }
+        }
+        wh = wordBagDigest(canonicalOf(m));
+        bags.set(m, wh);
+        if (id !== undefined && raw.length <= 16_384) {
+            if (wordBagMemo.size >= WORD_BAG_MEMO_MAX) {
+                const oldest = wordBagMemo.keys().next().value;
+                if (oldest !== undefined) wordBagMemo.delete(oldest);
+            }
+            wordBagMemo.set(id, { text: raw, wh });
+        }
         return wh;
     };
     const sketch = (m: CoreMessage): string => {
@@ -980,13 +1034,45 @@ export function planReconciliation(
     const newOrder: string[] = [];
     const ownById = preBuiltById === undefined ? new Map<string, CoreMessage>() : undefined;
     const byId: ReadonlyMap<string, CoreMessage> = preBuiltById ?? ownById!;
-    let posPrefixAligned = posLen > 0;
+    // Detect constant shift between stored posIds (which may be head-sliced to
+    // MAX_ORDER) and the current msgs array so steady-state turns with
+    // msgs.length > MAX_ORDER reuse posCanon in O(1) without allocating a
+    // 32K-entry canonById Map.
+    let posShift = 0;
+    let posShiftAligned = false;
+    if (posLen > 0 && posIds !== undefined) {
+        const lastPosId = posIds[posLen - 1];
+        const minTailProbe = Math.max(posLen - 1, msgs.length - 16);
+        for (let k = msgs.length - 1; k >= minTailProbe; k--) {
+            if (msgs[k]?.id === lastPosId) {
+                const candidateShift = k - (posLen - 1);
+                if (candidateShift >= 0 && msgs[candidateShift]?.id === posIds[0]) {
+                    posShift = candidateShift;
+                    posShiftAligned = true;
+                    break;
+                }
+            }
+        }
+    }
+    let posPrefixAligned = posLen > 0 && !posShiftAligned;
     for (const m of msgs) {
         if (m.id === undefined) continue;
         const i = newOrder.length;
         newOrder.push(m.id);
         if (ownById !== undefined) ownById.set(m.id, m);
-        if (i < posLen) {
+        if (posShiftAligned) {
+            const pj = i - posShift;
+            if (pj >= 0 && pj < posLen) {
+                if (posIds![pj] === m.id) {
+                    canon.push(posCanon![pj]!);
+                    continue;
+                }
+                posShiftAligned = false;
+            } else {
+                canon.push(cachedPositionalFingerprint(m));
+                continue;
+            }
+        } else if (i < posLen) {
             if (posIds![i] === m.id) {
                 canon.push(posCanon![i]!);
                 continue;
@@ -997,7 +1083,7 @@ export function planReconciliation(
             // appended tail item is either brand new or a rare duplicate whose
             // deterministic fingerprint equals the stored one without paying
             // an O(history) Map build.
-            canon.push(positionalFingerprint(m));
+            canon.push(cachedPositionalFingerprint(m));
             continue;
         }
         if (canonById === undefined && posLen > 0) {
@@ -1005,7 +1091,7 @@ export function planReconciliation(
             for (let j = 0; j < posLen; j++) canonById.set(posIds![j]!, posCanon![j]!);
         }
         const priorCanon = canonById?.get(m.id);
-        canon.push(priorCanon !== undefined ? priorCanon : positionalFingerprint(m));
+        canon.push(priorCanon !== undefined ? priorCanon : cachedPositionalFingerprint(m));
     }
     plan.newOrder = newOrder;
     plan.nextCanon = canon;
@@ -1930,9 +2016,16 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
     // index also qualifies: benign either way (info vs warn; no claim logic).
     let offloadPending = (session.metadata[METADATA_OFFLOAD_PENDING] as Record<string, number> | undefined) ?? {};
     if (plan.unmatched.length > 0 && opts.storedRowLookup !== undefined) {
+        const agentScope = classifyCarrier !== undefined ? String(session.metadata.pluginAgent) : "";
+        let checkedNegative = checkedNonRebaseBySession.get(session);
+        if (checkedNegative === undefined) {
+            checkedNegative = new Set<string>();
+            checkedNonRebaseBySession.set(session, checkedNegative);
+        }
         const needed: string[] = [];
         for (const id of plan.unmatched) {
             if (expected[id] !== undefined || offloadPending[id] !== undefined) continue;
+            if (checkedNegative.has(`${agentScope}\u0000${id}`)) continue;
             needed.push(id);
             if (needed.length >= MAX_REBASE_LOOKUP_PER_PASS) break;
         }
@@ -1962,7 +2055,14 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
                             if (path !== undefined) { expected[id] = path; continue; }
                         }
                     }
-                    if (hasImageMarker) offloadPending[id] = 1;
+                    if (hasImageMarker) {
+                        offloadPending[id] = 1;
+                    } else {
+                        // In-memory negative cache only (never persisted into session.metadata,
+                        // preserving #5142 storage-invisibility while avoiding repeated 256-row
+                        // SQLite reads on every subsequent turn).
+                        checkedNegative.add(`${agentScope}\u0000${id}`);
+                    }
                 }
             }
         }
