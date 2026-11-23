@@ -399,6 +399,28 @@ export function planIngestDelta(
  *  fast path must not change what a full ingest would write. (#4182: the
  *  duplicate-identity case feeds this function DIFFERENT logs by design;
  *  see planIngestDelta's strict-append precondition.) */
+const blockViewJsonMemo = new WeakMap<object, { firstKey: string; text: unknown; count: unknown; json: string; hash: string }>();
+
+function serializeBlockView(view: BlockView): { json: string; hash: string } {
+    const keys = Object.keys(view);
+    const simpleTwoKey =
+        keys.length === 2 &&
+        ((keys[0] === "text" && keys[1] === "count") || (keys[0] === "count" && keys[1] === "text"));
+    if (simpleTwoKey) {
+        const firstKey = keys[0]!;
+        const cached = blockViewJsonMemo.get(view);
+        if (cached !== undefined && cached.firstKey === firstKey && cached.text === view.text && cached.count === view.count) {
+            return { json: cached.json, hash: cached.hash };
+        }
+        const json = JSON.stringify(view);
+        const hash = sha256Hex(json);
+        blockViewJsonMemo.set(view, { firstKey, text: view.text, count: view.count, json, hash });
+        return { json, hash };
+    }
+    const json = JSON.stringify(view);
+    return { json, hash: sha256Hex(json) };
+}
+
 function finishPlan(
     session: LegacySessionLike,
     byRawRef: Record<string, string>,
@@ -443,17 +465,22 @@ function finishPlan(
         const views = blockContents.get(b.blockId);
         const full = views?.full ?? { text: b.summary, count: 0 };
         const one = views?.one ?? null;
-        const summaryJson = JSON.stringify(full);
-        const oneJson = one === null ? null : JSON.stringify(one);
+        const fullSer = serializeBlockView(full);
+        const oneSer = one === null ? null : serializeBlockView(one);
         const covered = { effectiveMessageIds: b.effectiveMessageIds, directMessageIds: b.directMessageIds };
         let startSeq = -1;
         let endSeq = -1;
-        for (const id of b.effectiveMessageIds) {
-            const s = seqById.get(id);
-            if (s === undefined) continue;
-            if (startSeq === -1 || s < startSeq) startSeq = s;
-            if (s > endSeq) endSeq = s;
+        if (seqById.size > 0) {
+            for (const id of b.effectiveMessageIds) {
+                const s = seqById.get(id);
+                if (s === undefined) continue;
+                if (startSeq === -1 || s < startSeq) startSeq = s;
+                if (s > endSeq) endSeq = s;
+            }
         }
+        const coveredIds = b.directMessageIds && b.directMessageIds.length > 0
+            ? [...b.effectiveMessageIds, ...b.directMessageIds]
+            : b.effectiveMessageIds;
         return {
             blockId: b.blockId,
             ord,
@@ -462,18 +489,19 @@ function finishPlan(
             startRef: b.startRef !== undefined ? refToIndex(b.startRef) : null,
             endRef: b.endRef !== undefined ? refToIndex(b.endRef) : null,
             tier: b.tier,
-            summary: summaryJson,
-            one: oneJson,
+            summary: fullSer.json,
+            one: oneSer === null ? null : oneSer.json,
             // #5744: carry the digests so ingestSession can compare against the
             // stored row BEFORE any CAS op (putContent with a precomputed hash
             // recomputes nothing — same bytes, same utf8, same sha256).
-            summaryHash: sha256Hex(summaryJson),
-            oneHash: oneJson === null ? null : sha256Hex(oneJson),
+            summaryHash: fullSer.hash,
+            oneHash: oneSer === null ? null : oneSer.hash,
             supersedesBlockId: null,
             active: b.active,
             createdAt: b.createdAt,
             coveredHash: sha256Hex(JSON.stringify(covered)),
             payloadJson: JSON.stringify(b),
+            coveredIds,
         };
     });
 

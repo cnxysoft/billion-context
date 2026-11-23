@@ -204,6 +204,8 @@ export interface BlockRow {
     coveredHash: string;
     /** Verbatim serialized CompressionBlock (includes summary). */
     payloadJson: string;
+    /** Optional planner-provided covered message ids (effective + direct) to avoid re-parsing payloadJson on ingest. */
+    coveredIds?: readonly string[];
 }
 
 export interface RefRow {
@@ -504,6 +506,7 @@ export class UnifiedStore {
     private releaseDecrement: ReturnType<SqliteDatabase["prepare"]> | null = null;
     private releaseDelete: ReturnType<SqliteDatabase["prepare"]> | null = null;
     private readonly messageReadStatements = new Map<string, ReturnType<SqliteDatabase["prepare"]>>();
+    private readonly committedRefPrefixes = new Map<string, { rawIds: string[]; refs: string[]; refNums: (number | null)[] }>();
 
     private constructor(db: SqliteDatabase, engine: SqliteEngineName, engineSource: SqliteEngineSource, lockPath: string | null, foreignLockHolder: { pid: number } | null, dbPath: string) {
         this.db = db;
@@ -1078,6 +1081,7 @@ export class UnifiedStore {
         opts?: { completeLog?: boolean; envelopeImport?: boolean },
     ): boolean {
         const s = input.session;
+        let refCacheUpdate: { mode: "append"; added: RefRow[] } | { mode: "replace"; rows: RefRow[] } | null = null;
         const ok = this.db.transaction((): boolean => {
             let messages: MessageRow[];
             let watermark: number | null;
@@ -1407,16 +1411,40 @@ export class UnifiedStore {
             // and suppress the seq-0 message (PR #4725 N1); -1 keeps the
             // #4608 CASE guard honest (unknown < 0 → preserve stored bounds).
             const seqSpanById = new Map<string, [number, number]>();
-            const coverageByBlock = new Map<BlockRow, string[]>();
+            const coverageByBlock = new Map<BlockRow, readonly string[]>();
+            const reusedBounds = new Map<BlockRow, [number, number]>();
             if (!skipIncomingBlocks && input.blocks.length > 0) {
+                const newMsgIds = delta ? new Set(messages.map((m) => m.msgId)) : undefined;
                 const wanted = new Set<string>();
                 for (const b of input.blocks) {
-                    try {
-                        const cov = JSON.parse(b.payloadJson) as { effectiveMessageIds?: string[]; directMessageIds?: string[] };
-                        const ids = [...(cov.effectiveMessageIds ?? []), ...(cov.directMessageIds ?? [])];
-                        coverageByBlock.set(b, ids);
-                        for (const id of ids) wanted.add(id);
-                    } catch { /* malformed payload: no covered ids to resolve */ }
+                    let ids: readonly string[] | undefined = b.coveredIds;
+                    if (ids === undefined) {
+                        try {
+                            const cov = JSON.parse(b.payloadJson) as { effectiveMessageIds?: string[]; directMessageIds?: string[] };
+                            ids = [...(cov.effectiveMessageIds ?? []), ...(cov.directMessageIds ?? [])];
+                        } catch { /* malformed payload: no covered ids to resolve */ }
+                    }
+                    if (!ids) continue;
+                    if (delta !== undefined) {
+                        const ex = storedBlocks.get(b.blockId);
+                        if (ex !== undefined && ex.covered_hash === b.coveredHash && ex.start_seq >= 0 && ex.end_seq >= 0) {
+                            let touched = false;
+                            if (newMsgIds!.size > 0) {
+                                for (const id of ids) {
+                                    if (newMsgIds!.has(id)) {
+                                        touched = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            if (!touched) {
+                                reusedBounds.set(b, [ex.start_seq, ex.end_seq]);
+                                continue;
+                            }
+                        }
+                    }
+                    coverageByBlock.set(b, ids);
+                    for (const id of ids) wanted.add(id);
                 }
                 // LIVE rows only (#4801 review): block bounds describe what is
                 // CURRENTLY covered in the unified replay — getMessages filters
@@ -1426,9 +1454,13 @@ export class UnifiedStore {
                 // is re-covered at a new seq). An id whose rows are all retired
                 // yields no span → boundsForCovered demotes it honestly; if that
                 // empties the whole claim the -1 sentinel preserves stored bounds (#4608).
-                this.resolveCoveredSeqSpans(s.sessionId, wanted, seqSpanById);
+                if (wanted.size > 0) {
+                    this.resolveCoveredSeqSpans(s.sessionId, wanted, seqSpanById);
+                }
             }
             const boundsForCovered = (block: BlockRow): [number, number] => {
+                const reused = reusedBounds.get(block);
+                if (reused !== undefined) return reused;
                 let lo = Number.POSITIVE_INFINITY;
                 let hi = -1;
                 for (const id of coverageByBlock.get(block) ?? []) {
@@ -1567,7 +1599,10 @@ export class UnifiedStore {
             // mid-batch and rolls the whole ingest back. If a future producer
             // can reorder survivors upward, add a delete-all fallback around
             // the write phase below.
-            const { goneRefIds, touchedRefs } = this.diffRefs(s.sessionId, input.refs);
+            const { goneRefIds, touchedRefs, prefixMatched } = this.diffRefs(s.sessionId, input.refs, delta !== undefined);
+            refCacheUpdate = prefixMatched && goneRefIds.length === 0
+                ? { mode: "append", added: touchedRefs }
+                : { mode: "replace", rows: input.refs };
             if (goneRefIds.length > 0) {
                 const perChunk = REF_STMT_MAX_PARAMS - 1; // reserve the leading session_id slot
                 for (let i = 0; i < goneRefIds.length; i += perChunk) {
@@ -1643,11 +1678,84 @@ export class UnifiedStore {
             }
             return true;
         });
-        if (ok) this.maybeCheckpointWal();
+        if (ok) {
+            this.updateCommittedRefPrefix(s.sessionId, refCacheUpdate);
+            this.maybeCheckpointWal();
+        }
         return ok;
     }
 
-    private diffRefs(sessionId: string, refs: RefRow[]): { goneRefIds: string[]; touchedRefs: RefRow[] } {
+    private updateCommittedRefPrefix(
+        sessionId: string,
+        update: { mode: "append"; added: RefRow[] } | { mode: "replace"; rows: RefRow[] } | null,
+    ): void {
+        if (update === null) return;
+        if (update.mode === "append") {
+            const cached = this.committedRefPrefixes.get(sessionId);
+            if (cached !== undefined) {
+                for (const r of update.added) {
+                    if (r.ord !== cached.rawIds.length) {
+                        this.committedRefPrefixes.delete(sessionId);
+                        return;
+                    }
+                    cached.rawIds.push(r.rawId);
+                    cached.refs.push(r.ref);
+                    cached.refNums.push(r.refNum);
+                }
+                return;
+            }
+            return;
+        }
+        const rows = update.rows;
+        if (rows.length === 0) {
+            this.committedRefPrefixes.delete(sessionId);
+            return;
+        }
+        const rawIds = new Array<string>(rows.length);
+        const refs = new Array<string>(rows.length);
+        const refNums = new Array<number | null>(rows.length);
+        for (let i = 0; i < rows.length; i++) {
+            const r = rows[i]!;
+            if (r.ord !== i) {
+                this.committedRefPrefixes.delete(sessionId);
+                return;
+            }
+            rawIds[i] = r.rawId;
+            refs[i] = r.ref;
+            refNums[i] = r.refNum;
+        }
+        this.committedRefPrefixes.set(sessionId, { rawIds, refs, refNums });
+    }
+
+    private diffRefs(sessionId: string, refs: RefRow[], isDelta = false): { goneRefIds: string[]; touchedRefs: RefRow[]; prefixMatched: boolean } {
+        if (isDelta) {
+            const cached = this.committedRefPrefixes.get(sessionId);
+            if (cached !== undefined && cached.rawIds.length > 0 && refs.length >= cached.rawIds.length) {
+                const n = cached.rawIds.length;
+                const bounds = this.db
+                    .prepare("SELECT count(*) AS n, MAX(ord) AS max_ord FROM refs WHERE session_id = ?")
+                    .get(sessionId) as { n: number; max_ord: number | null };
+                if (bounds.n === n && bounds.max_ord === n - 1) {
+                    const last = this.db
+                        .prepare("SELECT raw_id, ref, ref_num FROM refs WHERE session_id = ? AND ord = ?")
+                        .get(sessionId, n - 1) as { raw_id: string; ref: string; ref_num: number | null } | undefined;
+                    if (last !== undefined &&
+                        last.raw_id === cached.rawIds[n - 1] &&
+                        last.ref === cached.refs[n - 1] &&
+                        last.ref_num === cached.refNums[n - 1]) {
+                        let same = true;
+                        for (let i = 0; i < n; i++) {
+                            const r = refs[i]!;
+                            if (r.ord !== i || r.rawId !== cached.rawIds[i] || r.ref !== cached.refs[i] || r.refNum !== cached.refNums[i]) {
+                                same = false;
+                                break;
+                            }
+                        }
+                        if (same) return { goneRefIds: [], touchedRefs: refs.slice(n), prefixMatched: true };
+                    }
+                }
+            }
+        }
         // Compare the complete ordered prefix inside the write transaction.
         // One aggregate avoids allocating a JS object for every unchanged row.
         if (refs.length >= REF_PREFIX_MIN_ROWS && refs.length <= REF_PREFIX_MAX_ROWS) {
@@ -1659,7 +1767,7 @@ export class UnifiedStore {
                 const prefix = refs.slice(0, proof.n);
                 if (prefix.every((r) => r.refNum === null || Number.isSafeInteger(r.refNum)) &&
                     JSON.stringify(prefix.map((r) => [r.ord, r.rawId, r.ref, r.refNum])) === proof.prefix) {
-                    return { goneRefIds: [], touchedRefs: refs.slice(proof.n) };
+                    return { goneRefIds: [], touchedRefs: refs.slice(proof.n), prefixMatched: false };
                 }
             }
         }
@@ -1680,7 +1788,7 @@ export class UnifiedStore {
             }
         }
         for (const rawId of oldRefs.keys()) goneRefIds.push(rawId);
-        return { goneRefIds, touchedRefs };
+        return { goneRefIds, touchedRefs, prefixMatched: false };
     }
 
     /** #3250: cadence-tick WAL reclamation (see WAL_CHECKPOINT_EVERY_INGESTS).
@@ -1972,6 +2080,7 @@ export class UnifiedStore {
      *  every same-length save would re-take the unverified empty delta
      *  against a stale watermark and the divergence would be permanent. */
     clearIngestWatermark(sessionId: string): void {
+        this.committedRefPrefixes.delete(sessionId);
         this.db.prepare("UPDATE sessions SET last_ingested_seq = NULL WHERE session_id = ?").run(sessionId);
     }
 
@@ -1989,6 +2098,7 @@ export class UnifiedStore {
      *  ingestSession — re-establishing trust from this process's own view.
      *  Cost: one full ingest per saved session per boot. */
     resetAllIngestWatermarks(): void {
+        this.committedRefPrefixes.clear();
         this.db.prepare("UPDATE sessions SET last_ingested_seq = NULL").run();
     }
 
@@ -2227,6 +2337,7 @@ export class UnifiedStore {
             this.db.prepare("DELETE FROM blocks WHERE session_id = ?").run(sessionId);
             this.db.prepare("DELETE FROM dead_refs WHERE session_id = ?").run(sessionId);
             this.db.prepare("DELETE FROM refs WHERE session_id = ?").run(sessionId);
+            this.committedRefPrefixes.delete(sessionId);
             this.db.prepare("DELETE FROM ccr_entries WHERE session_id = ?").run(sessionId);
             this.db.prepare("DELETE FROM conversations WHERE session_id = ?").run(sessionId);
             this.db.prepare("DELETE FROM session_ext WHERE session_id = ?").run(sessionId);
@@ -2463,6 +2574,7 @@ export class UnifiedStore {
             this.db.prepare("DELETE FROM blocks WHERE session_id = ?").run(sessionId);
             this.db.prepare("DELETE FROM dead_refs WHERE session_id = ?").run(sessionId);
             this.db.prepare("DELETE FROM refs WHERE session_id = ?").run(sessionId);
+            this.committedRefPrefixes.delete(sessionId);
             this.db.prepare("DELETE FROM ccr_entries WHERE session_id = ?").run(sessionId);
             this.db.prepare("DELETE FROM session_ext WHERE session_id = ?").run(sessionId);
             this.db.prepare("UPDATE sessions SET status = 'archived' WHERE session_id = ?").run(sessionId);
@@ -2574,6 +2686,7 @@ export class UnifiedStore {
             for (const b of dump.blocks) insBlock.run(b.block_id, sessionId, b.ord, b.start_seq, b.end_seq, b.start_ref ?? null, b.end_ref ?? null, b.tier, b.summary_hash, b.one_hash ?? null, b.supersedes_block_id ?? null, b.active, b.created_at, b.covered_hash, b.payload_json);
             const insRef = this.db.prepare("INSERT INTO refs (session_id, ord, raw_id, ref, ref_num) VALUES (?, ?, ?, ?, ?)");
             for (const r of dump.refs) insRef.run(sessionId, r.ord, r.raw_id, r.ref, r.ref_num ?? null);
+            this.committedRefPrefixes.delete(sessionId);
             const insDead = this.db.prepare("INSERT INTO dead_refs (session_id, ord, ref, ref_num, recorded_at) VALUES (?, ?, ?, ?, ?)");
             for (const d of dump.deadRefs) insDead.run(sessionId, d.ord, d.ref, d.ref_num, d.recorded_at);
             const insCcr = this.db.prepare("INSERT INTO ccr_entries (session_id, ord, ccr_key, content_hash) VALUES (?, ?, ?, ?)");

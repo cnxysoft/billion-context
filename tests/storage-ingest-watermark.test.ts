@@ -871,3 +871,107 @@ test("large ref ledgers compare the whole stored prefix and fall back for edits 
         rmBestEffort(dir);
     }
 });
+
+test("delta saves reuse unchanged block coverage bounds and committed ref prefixes, falling back on edits or newly covered messages", (t) => {
+    const dir = tmpdir("bili-wm-delta-reuse-");
+    const store = UnifiedStore.open(path.join(dir, "index.db"));
+    try {
+        const db = (store as unknown as { db: ReturnType<typeof openSqliteDatabase>["db"] }).db;
+        const prepare = db.prepare.bind(db);
+        const queries: string[] = [];
+        t.mock.method(db, "prepare", (sql: string) => {
+            queries.push(sql);
+            return prepare(sql);
+        });
+        const msgs = [msg(0), msg(1), msg(2)];
+        const legacy = mkLegacy("delta-reuse-session", msgs);
+        const byRaw = legacy.state.messageRefs.byRaw;
+        for (let i = 1; i <= 8200; i++) byRaw[`ref-${i}`] = `m${String(i).padStart(5, "0")}`;
+        legacy.state.blocks = [{
+            blockId: "b1",
+            summary: "summary 1",
+            effectiveMessageIds: [msgs[0]!.id, msgs[1]!.id],
+            directMessageIds: [msgs[0]!.id, msgs[1]!.id],
+            startRef: "m00001",
+            endRef: "m00002",
+            tier: 1,
+            active: true,
+            createdAt: 1000,
+        } as unknown as (typeof legacy.state.blocks)[number]];
+        legacy.blockContents.set("b1", { one: { text: "one", count: 2 }, full: { text: "full", count: 2 } });
+
+        // Initial full ingest establishes bounds [0, 1] and committed ref prefix.
+        assert.equal(store.ingestSession(planIngest(legacy), undefined, { completeLog: true }), true);
+        const b1Initial = store.getBlocks(legacy.id);
+        assert.equal(b1Initial[0]!.startSeq, 0);
+        assert.equal(b1Initial[0]!.endSeq, 1);
+
+        // Delta save appending 1 uncovered message + 1 ref skips block span scan AND ref json_group_array.
+        const m3 = msg(3);
+        legacy.lastMessages = [...msgs, m3];
+        byRaw[m3.id] = "m08201";
+        const mark1 = store.ingestWatermark(legacy.id)!;
+        const boundary1 = store.probeIngestBoundary(legacy.id, mark1.seq)!;
+        const deltaPlan1 = planIngestDelta(legacy, mark1.seq, mark1.tailSeqs, { msgId: boundary1.msgId, contentHash: boundary1.contentHash }, true)!;
+        queries.length = 0;
+        assert.equal(store.ingestSession(deltaPlan1, {
+            trustedSeq: mark1.seq,
+            boundaryMsgId: boundary1.msgId,
+            boundaryHash: boundary1.contentHash,
+            trustedTailSeqs: mark1.tailSeqs,
+        }), true);
+        assert.equal(queries.some((sql) => sql.includes("json_group_array(json_array(ord")), false, "delta append skips full ref prefix JSON aggregation");
+        assert.equal(queries.some((sql) => sql.includes("FROM messages WHERE session_id = ? AND msg_id IN")), false, "unchanged block skips covered-seq query");
+        assert.equal(queries.some((sql) => sql.includes("SELECT msg_id, seq, retired_at FROM messages")), false, "unchanged block skips full messages scan");
+        assert.deepEqual(store.getRefs(legacy.id), deltaPlan1.refs);
+
+        // Counterfactual 1: adding a new block on a delta save resolves its seq bounds accurately.
+        const m4 = msg(4);
+        legacy.lastMessages = [...legacy.lastMessages, m4];
+        byRaw[m4.id] = "m08202";
+        legacy.state.blocks.push({
+            blockId: "b2",
+            summary: "summary 2",
+            effectiveMessageIds: [msgs[2]!.id, m3.id],
+            directMessageIds: [msgs[2]!.id, m3.id],
+            startRef: "m00003",
+            endRef: "m08201",
+            tier: 1,
+            active: true,
+            createdAt: 2000,
+        } as unknown as (typeof legacy.state.blocks)[number]);
+        legacy.blockContents.set("b2", { one: { text: "one2", count: 2 }, full: { text: "full2", count: 2 } });
+        const mark2 = store.ingestWatermark(legacy.id)!;
+        const boundary2 = store.probeIngestBoundary(legacy.id, mark2.seq)!;
+        const deltaPlan2 = planIngestDelta(legacy, mark2.seq, mark2.tailSeqs, { msgId: boundary2.msgId, contentHash: boundary2.contentHash }, true)!;
+        assert.equal(store.ingestSession(deltaPlan2, {
+            trustedSeq: mark2.seq,
+            boundaryMsgId: boundary2.msgId,
+            boundaryHash: boundary2.contentHash,
+            trustedTailSeqs: mark2.tailSeqs,
+        }), true);
+        const blocksAfter2 = store.getBlocks(legacy.id);
+        assert.equal(blocksAfter2[1]!.blockId, "b2");
+        assert.equal(blocksAfter2[1]!.startSeq, 2);
+        assert.equal(blocksAfter2[1]!.endSeq, 3);
+
+        // Counterfactual 2: pruning a ref on a delta save falls back and removes the deleted ref.
+        delete byRaw["ref-100"];
+        const m5 = msg(5);
+        legacy.lastMessages = [...legacy.lastMessages, m5];
+        byRaw[m5.id] = "m08203";
+        const mark3 = store.ingestWatermark(legacy.id)!;
+        const boundary3 = store.probeIngestBoundary(legacy.id, mark3.seq)!;
+        const deltaPlan3 = planIngestDelta(legacy, mark3.seq, mark3.tailSeqs, { msgId: boundary3.msgId, contentHash: boundary3.contentHash }, true)!;
+        assert.equal(store.ingestSession(deltaPlan3, {
+            trustedSeq: mark3.seq,
+            boundaryMsgId: boundary3.msgId,
+            boundaryHash: boundary3.contentHash,
+            trustedTailSeqs: mark3.tailSeqs,
+        }), true);
+        assert.deepEqual(store.getRefs(legacy.id), deltaPlan3.refs);
+    } finally {
+        store.close();
+        rmBestEffort(dir);
+    }
+});
