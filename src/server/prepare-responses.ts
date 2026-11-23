@@ -178,6 +178,8 @@ export async function prepareResponses(
         resolveCompressProtocol(opts.routes, upstreamOrigin) === "marker";
     const renderTags: "text-only" | "none" = knobRenderNone() || isCompactionTrigger ? "none" : "text-only";
 
+    let incomingImages: IncomingImageCandidate[] | undefined;
+    let incomingImagesReported = false;
     try {
         // [#1638] Position-preserve mid-history system/developer items for
         // plugin agents and native Codex. Both append developer
@@ -219,7 +221,7 @@ export async function prepareResponses(
         // client, not just plugin/codex; the head prefix still hoists into
         // systemParts for strict single-system upstreams (#377).
         const projection = responsesToCore(parsed);
-        if (onIncomingImages) onIncomingImages(collectIncomingImageCandidates(projection.msgs));
+        if (onIncomingImages) incomingImages = collectIncomingImageCandidates(projection.msgs);
         if (checkpoint && checkpoint !== session.metadata.codexNativeCompactionKey) {
             const covered = coveredRealHistoryIds(session.state.blocks);
             const gap = foldCoverage(covered, projection.msgs.map(message => message.id));
@@ -467,6 +469,10 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
         reapOrphansLogged(session, msgs, log, sessionId);
         rebuiltInput = patchResponsesInput(projection, processedMessages);
         if (Array.isArray(rebuiltInput)) rebuiltInput = mergeAdjacentConfigurationUpdates(hoistTrappedToolItems(rebuiltInput));
+        if (onIncomingImages && incomingImages && !incomingImagesReported) {
+            incomingImagesReported = true;
+            onIncomingImages(incomingImages);
+        }
         // #3400: the Responses steady path rebuilds items from the RAW parsed
         // input (patchOriginalItem), so BiliMessage-level modifications never
         // reach it — rescale at item level instead. Outbound copies only.
@@ -605,6 +611,10 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
         }
         transformOk = true;
     } catch (err) {
+        if (onIncomingImages && incomingImages && !incomingImagesReported) {
+            incomingImagesReported = true;
+            onIncomingImages(incomingImages);
+        }
         log("warn", `[${sessionId}] kernel transform failed, forwarding unchanged: ${String(err)}`);
         processedMessages = [];
     }

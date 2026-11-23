@@ -109,3 +109,71 @@ test("real HTTP preparation archives the same pixels with escaped and literal da
         await Promise.all([new Promise<void>(resolve => proxy.close(() => resolve())), new Promise<void>(resolve => upstream.close(() => resolve()))]);
     }
 });
+
+test("real Responses HTTP preparation indexes user and tool-output images across turns via single projection", async () => {
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    setRegistryForTest({});
+    const upstream = http.createServer(async (request, response) => {
+        for await (const _chunk of request) { /* consume */ }
+        response.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({
+            id: "resp_fixture",
+            object: "response",
+            status: "completed",
+            model: "gpt-fixture",
+            output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: "ok" }] }],
+            usage: { input_tokens: 10, output_tokens: 1, total_tokens: 11 },
+        }));
+    });
+    upstream.listen(0, "127.0.0.1");
+    await once(upstream, "listening");
+    const origin = `http://127.0.0.1:${(upstream.address() as { port: number }).port}`;
+    const proxy = await startServer({ port: 0, host: "127.0.0.1", upstream: origin, routes: { [origin]: { models: { "gpt-fixture": { context: 100_000 } } } }, modelContextLimit: 100_000, kernelConfig: defaultConfig(100_000), compress: { injectTool: true, injectNudge: true }, promptCache: { routing: "auto" }, sessionHeader: "x-acp-session", log: false, debug: false, passthrough: false, passthroughSource: null, autoUpdate: false, autoRestartOnUpdate: false, updateTag: "latest", advisoryCheck: false, releaseNotesCheck: false, compat: { roles: {} }, streamErrorShape: "protocol", mitm: { enabled: false, domains: [] } } as ProxyOptions);
+    if (!proxy.listening) await once(proxy, "listening");
+    try {
+        const label = "responses-single-projection-images";
+        const turn1 = {
+            model: "gpt-fixture",
+            stream: false,
+            input: [
+                { type: "message", role: "user", content: [{ type: "input_text", text: "look" }, { type: "input_image", image_url: `data:image/png;base64,${PNG}` }] },
+                { type: "function_call", call_id: "call_img_1", name: "view_img", arguments: "{}" },
+                { type: "function_call_output", call_id: "call_img_1", output: [{ type: "input_text", text: "tool-img" }, { type: "input_image", image_url: `data:image/png;base64,${PNG}` }] },
+            ],
+        };
+        const res1 = await fetch(`http://127.0.0.1:${(proxy.address() as { port: number }).port}/bili/${origin}/v1/responses`, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-acp-session": label },
+            body: JSON.stringify(turn1),
+            signal: AbortSignal.timeout(10_000),
+        });
+        assert.equal(res1.status, 200, await res1.text());
+        const session = listSessions().find((candidate) => candidate.meta.label === label);
+        assert.ok(session);
+        assert.equal(session.incomingImageIndex?.size, 2, "turn 1 indexes both user and tool-output images");
+        for (const images of session.incomingImageIndex!.values()) {
+            assert.deepEqual(readFileSync(images[0]!.path), Buffer.from(PNG, "base64"));
+        }
+        const turn2 = {
+            ...turn1,
+            input: [
+                ...turn1.input,
+                { type: "message", role: "assistant", content: [{ type: "output_text", text: "ok" }] },
+                { type: "message", role: "user", content: [{ type: "input_text", text: "again" }] },
+            ],
+        };
+        const res2 = await fetch(`http://127.0.0.1:${(proxy.address() as { port: number }).port}/bili/${origin}/v1/responses`, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-acp-session": label },
+            body: JSON.stringify(turn2),
+            signal: AbortSignal.timeout(10_000),
+        });
+        assert.equal(res2.status, 200, await res2.text());
+        assert.equal(session.incomingImageIndex?.size, 2, "turn 2 preserves both historical images in index");
+        for (const images of session.incomingImageIndex!.values()) {
+            assert.deepEqual(readFileSync(images[0]!.path), Buffer.from(PNG, "base64"));
+        }
+    } finally {
+        proxy.closeAllConnections(); upstream.closeAllConnections();
+        await Promise.all([new Promise<void>(resolve => proxy.close(() => resolve())), new Promise<void>(resolve => upstream.close(() => resolve()))]);
+    }
+});

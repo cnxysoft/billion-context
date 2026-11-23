@@ -3167,8 +3167,10 @@ async function handleRequest(
                 overflowWindow?: number,
             ) => Promise<{ body: string | Buffer; prepared: Prepared | null } | null>) | undefined = async (respondFailFast, overflowWindow) => {
                 let projectedIncomingImages: IncomingImageCandidate[] | undefined;
+                let projectedIncomingImagesIndexed = false;
                 const runPrepareInner = async (): Promise<Prepared> => {
                     projectedIncomingImages = undefined;
+                    projectedIncomingImagesIndexed = false;
                     // #1820: this prepare consumes one unit of post-rebuild anchor
                     // validity (the last one deletes it — see session.ts).
                     tickPostRebuildAnchor(session);
@@ -3231,8 +3233,14 @@ async function handleRequest(
                     // without the full-history conversion (today's no-image
                     // result, minus the wasted wire→core pass).
                     // Eviction rides along (best-effort, throttled to once a minute).
+                    // Responses prepares the exact same wire body via
+                    // responsesToCoreWithToolImages and feeds its collected
+                    // image candidates back through onIncomingImages right
+                    // before applyImageRescaleItems, so skip the duplicate
+                    // pre-prepare responsesToCore pass here.
+                    const deferResponsesImageIndex = protocol === "responses" && !responsesCompact;
                     if (protocol && !countTokens) {
-                        session.incomingImageIndex = bodyMayCarryImages
+                        session.incomingImageIndex = bodyMayCarryImages && !deferResponsesImageIndex
                             ? buildIncomingImageIndex(parsed, protocol, session.state, session.id)
                             : new Map<string, IndexedImage[]>();
                         if (session.lastImgPrune === undefined || Date.now() - session.lastImgPrune > 60_000) {
@@ -3280,7 +3288,11 @@ async function handleRequest(
                             // prepareResponsesCompact falls back to the raw bodyBuffer —
                             // forward it unchanged (byte-identical passthrough).
                             ? prepareResponsesCompact(bodyBuffer, work as ResponsesRequestBody, session, req, core, reqConfig, log)
-                            : await prepareResponses(work as ResponsesRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, responsesIdentity!, pluginMode, upstreamOrigin, nativeWindow, reasoningCfg, visibilityMarkers, route?.rewrittenUrl, decide, bodyMayCarryImages ? images => { projectedIncomingImages = images; } : undefined);
+                            : await prepareResponses(work as ResponsesRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, responsesIdentity!, pluginMode, upstreamOrigin, nativeWindow, reasoningCfg, visibilityMarkers, route?.rewrittenUrl, decide, bodyMayCarryImages ? (images) => {
+                                projectedIncomingImages = images;
+                                session.incomingImageIndex = refreshIncomingImageIndex(parsed, protocol, session.state, session.id, session.incomingImageIndex, images);
+                                projectedIncomingImagesIndexed = true;
+                            } : undefined);
                     // The resolved model rides with the prepared request: on the
                     // Anthropic-on-Vertex wire the body carries none, and the
                     // relay's compress-loop rebuild reads it from here.
@@ -3382,7 +3394,7 @@ async function handleRequest(
                 // #2824: skipped for provably image-free bodies — the rebuild
                 // would find nothing regardless of which refs prepare just
                 // assigned (refs gate indexing; they cannot create images).
-                if (!countTokens && !responsesCompact && protocol && prepared && bodyMayCarryImages) {
+                if (!countTokens && !responsesCompact && protocol && prepared && bodyMayCarryImages && !projectedIncomingImagesIndexed) {
                     session.incomingImageIndex = refreshIncomingImageIndex(parsed, protocol, session.state, session.id, session.incomingImageIndex, projectedIncomingImages);
                 }
                 // #2155 self-heal round: one evaluation per request, on the
