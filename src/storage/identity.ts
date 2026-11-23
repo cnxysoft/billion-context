@@ -120,6 +120,82 @@ export function describeMessageContent(raw: string) {
     return { ...split, role, contentType, identity };
 }
 
+export function serializeAndDescribeCoreMessage(
+    message: unknown,
+    opts?: { stripTs?: boolean; stringify?: (value: unknown) => string },
+) {
+    const stringify = opts?.stringify ?? JSON.stringify;
+    const stripTs = opts?.stripTs === true;
+    const fallback = () => {
+        if (stripTs && message !== null && typeof message === "object" && !Array.isArray(message) && (message as { ts?: unknown }).ts !== undefined) {
+            const copy = { ...(message as Record<string, unknown>) };
+            delete copy.ts;
+            const raw = stringify(copy);
+            return describeCoreMessage(message, raw, { stripTs: true });
+        }
+        const raw = stringify(message);
+        return describeCoreMessage(message, raw, { stripTs });
+    };
+    if (message === null || typeof message !== "object" || Array.isArray(message) || typeof (message as { toJSON?: unknown }).toJSON === "function") {
+        return fallback();
+    }
+    const record = message as Record<string, unknown>;
+    if (typeof record.role !== "string" || (record.contentType !== undefined && typeof record.contentType !== "string")) {
+        return fallback();
+    }
+    const keys = Object.keys(record);
+    const stripped: Record<string, unknown> = {};
+    const leadingParts: string[] = [];
+    const trailingParts: string[] = [];
+    let seenNonPos = false;
+    let seenTrailingPos = false;
+    for (let i = 0; i < keys.length; i++) {
+        const key = keys[i]!;
+        if (stripTs && key === "ts") continue;
+        const val = record[key];
+        if (val === undefined || typeof val === "function" || typeof val === "symbol") continue;
+        if (key === "id" || key === "wireIndex" || key === "ledgerSeq") {
+            const encoded = stringify(val);
+            if (encoded === undefined) continue;
+            const pair = `${JSON.stringify(key)}:${encoded}`;
+            if (!seenNonPos) {
+                leadingParts.push(pair);
+            } else {
+                seenTrailingPos = true;
+                trailingParts.push(pair);
+            }
+            continue;
+        }
+        if (seenTrailingPos) {
+            // A positional key sits between non-positional keys: keep exact
+            // key order via the standard two-pass path.
+            return fallback();
+        }
+        seenNonPos = true;
+        stripped[key] = val;
+    }
+    const strippedJson = stringify(stripped);
+    let raw: string;
+    if (leadingParts.length === 0 && trailingParts.length === 0) {
+        raw = strippedJson;
+    } else {
+        const inner = strippedJson.length > 2 ? strippedJson.slice(1, -1) : "";
+        const chunks: string[] = [];
+        if (leadingParts.length > 0) chunks.push(leadingParts.join(","));
+        if (inner.length > 0) chunks.push(inner);
+        if (trailingParts.length > 0) chunks.push(trailingParts.join(","));
+        raw = `{${chunks.join(",")}}`;
+    }
+    const role = record.role;
+    const contentType = record.contentType;
+    const split = splitMediaContent(raw);
+    if (split.content !== raw) {
+        return { ...split, role, contentType, identity: identityOfStoredContent(split.content) };
+    }
+    const identity = raw === strippedJson ? split.hash : sha256Hex(strippedJson);
+    return { ...split, role, contentType, identity };
+}
+
 export function describeCoreMessage(message: unknown, raw: string, opts?: { stripTs?: boolean }) {
     if (message === null || typeof message !== "object" || Array.isArray(message) || typeof (message as { toJSON?: unknown }).toJSON === "function") {
         return describeMessageContent(raw);

@@ -29,7 +29,7 @@ import type { CoreMessage, CompressionBlock } from "../../kernel/src/types.js";
 import type { BlockView } from "../session.js";
 import { refToIndex } from "../../kernel/src/refs.js";
 import { sha256Hex, type BlockRow, type CcrEntryRow, type IngestSessionInput, type MessageRow, type RefRow, type SessionRow } from "./store.js";
-import { describeCoreMessage, splitMediaContent } from "./identity.js";
+import { serializeAndDescribeCoreMessage, splitMediaContent } from "./identity.js";
 
 /**
  * Field order of the hydration merge output — DERIVED from mergeState itself
@@ -153,25 +153,29 @@ export function toLegacyLike(s: {
  *  ts is appended last by its producers (stamper node, row hydration), so
  *  deleting it restores the pre-feature key order exactly. */
 function serializeForStore(m: CoreMessage): string {
-    if (m.ts === undefined) return stringifyForStore(m);
+    if (m.ts === undefined) return stringifyForStore(m, m.id);
     const copy = { ...m };
     delete copy.ts;
-    return stringifyForStore(copy);
+    return stringifyForStore(copy, m.id);
 }
 
-/** #5627: V8's serializer recurses into arbitrarily nested data, so a
- *  pathologically nested message dies as the generic "Maximum call stack
- *  size exceeded" naming nothing. Re-throw naming the OFFENDING MESSAGE so
- *  the failure forensics point at the exact row to remove or flatten. */
-function stringifyForStore(m: CoreMessage): string {
+function stringifyForStore(m: unknown, msgId?: string): string {
     try {
         return JSON.stringify(m);
     } catch (err) {
         if (err instanceof RangeError) {
-            throw new RangeError(`message ${m.id}: nesting too deep for JSON serialization (engine call-stack overflow) — remove or flatten this message to unblock the unified store`);
+            throw new RangeError(`message ${msgId ?? "unknown"}: nesting too deep for JSON serialization (engine call-stack overflow) — remove or flatten this message to unblock the unified store`);
         }
         throw err;
     }
+}
+
+function serializeAndDescribeForStore(m: CoreMessage) {
+    ingestSerializations.count++;
+    return serializeAndDescribeCoreMessage(m, {
+        stripTs: true,
+        stringify: (value) => stringifyForStore(value, m.id),
+    });
 }
 
 /** A persisted turn-final reply row. Stored under the session's
@@ -201,9 +205,7 @@ export interface HandoffReplyStashRow {
  *  against view rows by (msgId, identity) if they ever join. Exported so the
  *  host capture (handoff-response.ts) and this module cannot drift apart. */
 export function planStoredMessageRow(m: CoreMessage): HandoffReplyStashRow {
-    const raw = serializeForStore(m);
-    ingestSerializations.count++;
-    const split = describeCoreMessage(m, raw, { stripTs: true });
+    const split = serializeAndDescribeForStore(m);
     return {
         msgId: m.id,
         content: split.content,
@@ -230,9 +232,7 @@ export function planIngest(session: LegacySessionLike): IngestPlan {
     const log: LogEntry[] = [];
     const seqByIdentity = new Map<string, number>();
     const intern = (m: CoreMessage): number => {
-        const raw = serializeForStore(m);
-        ingestSerializations.count++;
-        const entry = describeCoreMessage(m, raw, { stripTs: true });
+        const entry = serializeAndDescribeForStore(m);
         // #4390: the cross-save JOIN key is the POSITION-INDEPENDENT identity
         // (stored-bytes serialization minus id/wireIndex). content_hash stays
         // the byte-faithful CAS key; only the join moves to identity.
@@ -362,9 +362,7 @@ export function planIngestDelta(
     const appended: number[] = [];
     for (let i = trustedLen; i < tail.length; i++) {
         const m = tail[i];
-        const raw = serializeForStore(m);
-        ingestSerializations.count++;
-        const split = describeCoreMessage(m, raw, { stripTs: true });
+        const split = serializeAndDescribeForStore(m);
         // Placeholder seqs under the aligned assumption (no rows above the
         // watermark); ingestSession renumbers from max(seq)+1 inside the
         // transaction when a fold left rows above the trusted tip.

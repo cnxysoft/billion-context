@@ -141,7 +141,7 @@ function applyProvenCorruptionPolicy(
 const VERIFY_BATCH_SIZE = 32;
 
 /** Bound transient CAS strings during normal cold loads, not the retained history. */
-const VIEW_READ_BATCH_SIZE = 32;
+const VIEW_READ_BATCH_SIZE = 256;
 
 interface ResidentFields {
     header: { requests: number; nextBlockId: number; activeBlockCount: number; mappedRefCount: number };

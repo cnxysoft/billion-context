@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { openSqliteDatabase } from "../src/storage/driver.ts";
-import { describeCoreMessage, describeMessageContent, identityOfStoredContent, splitMediaContent } from "../src/storage/identity.ts";
+import { describeCoreMessage, describeMessageContent, identityOfStoredContent, serializeAndDescribeCoreMessage, splitMediaContent } from "../src/storage/identity.ts";
 import { migrateSchema } from "../src/storage/schema.ts";
 import { rmrf } from "./tmp-rm.ts";
 
@@ -44,17 +44,51 @@ test("planned message content agrees with the stored identity on plain and media
             identity: identityOfStoredContent(split.content),
         });
         assert.deepEqual(describeCoreMessage(row, raw), describeMessageContent(raw));
+        assert.deepEqual(serializeAndDescribeCoreMessage(row), describeMessageContent(raw));
     }
     const noPosition = { role: "user", content: "plain" };
     assert.deepEqual(describeCoreMessage(noPosition, JSON.stringify(noPosition)), describeMessageContent(JSON.stringify(noPosition)));
+    assert.deepEqual(serializeAndDescribeCoreMessage(noPosition), describeMessageContent(JSON.stringify(noPosition)));
     const withTs = { ...message, ts: 1700000000000 };
     const withoutTsRaw = JSON.stringify(message);
     assert.deepEqual(describeCoreMessage(withTs, withoutTsRaw, { stripTs: true }), describeMessageContent(withoutTsRaw));
+    assert.deepEqual(serializeAndDescribeCoreMessage(withTs, { stripTs: true }), describeMessageContent(withoutTsRaw));
     const withTsRaw = JSON.stringify(withTs);
     assert.deepEqual(describeCoreMessage(withTs, withTsRaw), describeMessageContent(withTsRaw));
+    assert.deepEqual(serializeAndDescribeCoreMessage(withTs), describeMessageContent(withTsRaw));
     const customToJson = { ...message, toJSON: () => ({ role: "user", content: "from-toJSON", id: "x" }) };
     const customRaw = JSON.stringify(customToJson);
     assert.deepEqual(describeCoreMessage(customToJson, customRaw), describeMessageContent(customRaw));
+    assert.deepEqual(serializeAndDescribeCoreMessage(customToJson), describeMessageContent(customRaw));
+
+    // Edge shapes for single-stringify splice: leading id + trailing wireIndex/ledgerSeq,
+    // mid-object positional key (fallback), undefined fields, and integer keys.
+    for (const shape of [
+        { id: "m1", role: "user", text: "hi", wireIndex: 4, ledgerSeq: 5, ts: 99 },
+        { role: "user", id: "mid", text: "between", wireIndex: 1 },
+        { omitted: undefined, id: "m2", role: "assistant", text: "ok", ledgerSeq: 2 },
+        { id: "m3", "0": "idx", role: "user", text: "int-key", wireIndex: 3 },
+        { id: "m4", role: "user", wireIndex: undefined, ledgerSeq: 9 },
+    ]) {
+        const copy: Record<string, unknown> = { ...shape };
+        delete copy.ts;
+        const expectedRaw = JSON.stringify(copy);
+        assert.deepEqual(serializeAndDescribeCoreMessage(shape, { stripTs: true }), describeMessageContent(expectedRaw));
+    }
+
+    // Verify fast path stringifies the large message body only ONCE.
+    let objectStringifies = 0;
+    const typical = { id: "m-fast", role: "user", text: "payload".repeat(200), wireIndex: 7, ledgerSeq: 8, ts: 123 };
+    const expectedTypical = describeMessageContent(JSON.stringify({ id: "m-fast", role: "user", text: typical.text, wireIndex: 7, ledgerSeq: 8 }));
+    const fastRes = serializeAndDescribeCoreMessage(typical, {
+        stripTs: true,
+        stringify: (v) => {
+            if (v !== null && typeof v === "object") objectStringifies++;
+            return JSON.stringify(v);
+        },
+    });
+    assert.deepEqual(fastRes, expectedTypical);
+    assert.equal(objectStringifies, 1, "leading/trailing positional keys stringify the message object only once");
 });
 
 test("v8 identity migration can finish with a JSON-null content row", () => {
