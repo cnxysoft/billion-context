@@ -15,6 +15,7 @@ import { yieldToEventLoop } from "../yield-loop.js";
 import { buildDecisionPrompt, buildDirectiveText, consumeFallback, ladderMode, resolveDecisionRange, stripDecisionReasoningFields, type DecideConfig } from "../nudge-decide.js";
 import { excludeDeadRefRanges } from "../acp-status.js";
 import { mergeAdjacentConfigurationUpdates, patchResponsesInputWithToolImages as patchResponsesInput, responsesToCoreWithToolImages as responsesToCore } from "../responses-tool-output.js";
+import type { CanonicalBaseHint } from "acp-kernel/wire";
 import { dropWhitespaceResponsesMessages, normalizeResponsesMessageItems, sanitizeResponsesInputIds } from "../loop/adapter-responses.js";
 import { METADATA_LAST_RESPONSES_MODE, noteCanonicalSystemFingerprint, reconcileFoldCoverage, noteSystemPromptFingerprint, resolveFoldReconcileMode } from "../fold-reconcile.js";
 import { buildAnchoredView, maybeSnapshotView, noteAnchoredRender, SnapshotAnchorFallbackError, wsAnchoredPayload } from "./snapshot-render.js";
@@ -51,6 +52,22 @@ import { clampOutgoingOutput, countLoadedToolTokens, countSystemAndToolsTokens, 
 import { FORCE_TEXT_PROTOCOL, injectResponsesTool, injectTool } from "./inject.js";
 import { nudgeOn, resolveLaneDecisions, surfaceOffDetail } from "./lane-decisions.js";
 import { pluginAgentHeader } from "../plugin.js";
+
+const ACTIVE_HINTS_TTL_MS = 120_000;
+let activeResponsesHints: {
+    sessionId: string;
+    hints: (CanonicalBaseHint | undefined)[];
+    timer: ReturnType<typeof setTimeout>;
+} | null = null;
+
+function setActiveResponsesHints(sessionId: string, hints: (CanonicalBaseHint | undefined)[]): void {
+    if (activeResponsesHints !== null) clearTimeout(activeResponsesHints.timer);
+    const timer = setTimeout(() => {
+        if (activeResponsesHints?.hints === hints) activeResponsesHints = null;
+    }, ACTIVE_HINTS_TTL_MS);
+    timer.unref?.();
+    activeResponsesHints = { sessionId, hints, timer };
+}
 
 export async function prepareResponses(
     parsed: ResponsesRequestBody,
@@ -220,7 +237,10 @@ export async function prepareResponses(
         // fold coverage, and byte-stable verbatim re-emission) for EVERY
         // client, not just plugin/codex; the head prefix still hoists into
         // systemParts for strict single-system upstreams (#377).
-        const projection = responsesToCore(parsed, { prevMsgs: session.lastMessages });
+        const prevHints = activeResponsesHints?.sessionId === sessionId ? activeResponsesHints.hints : undefined;
+        const nextHints: (CanonicalBaseHint | undefined)[] = [];
+        const projection = responsesToCore(parsed, { prevHints, nextHints });
+        if (nextHints.length > 0) setActiveResponsesHints(sessionId, nextHints);
         if (onIncomingImages) incomingImages = collectIncomingImageCandidates(projection.msgs);
         if (checkpoint && checkpoint !== session.metadata.codexNativeCompactionKey) {
             const covered = coveredRealHistoryIds(session.state.blocks);

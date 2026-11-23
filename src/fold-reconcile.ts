@@ -2040,7 +2040,10 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
                 }
                 for (const id of needed) {
                     const hit = best.get(id);
-                    if (hit === undefined) continue; // stable absence — re-checked next drift pass (bounded read)
+                    if (hit === undefined) {
+                        checkedNegative.add(`${agentScope}\u0000${id}`);
+                        continue;
+                    }
                     const content = hit.content;
                     const hasImageMarker = (content.includes("\"rawAnthropicBlock\"") && content.includes("\"type\":\"image\""))
                         || content.includes("\"imageBase64\":\"")
