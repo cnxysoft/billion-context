@@ -113,3 +113,37 @@ for (const engine of ["node:sqlite", "better-sqlite3"] as const) {
         assert.deepEqual(store.getBlockContents("target", { limit: 1 }), [expected]);
     });
 }
+
+for (const engine of ["node:sqlite", "better-sqlite3"] as const) {
+    test(`${engine}: large coverage resolves live generations when the bounded scan completes or overflows`, (t) => {
+        const fixture = setup(engine, t);
+        if (!fixture) return;
+        const { store, writer } = fixture;
+        const plan = input();
+        const block = plan.blocks[0];
+        const ids = ["m0", "m2", ...Array.from({ length: 8192 }, (_, i) => `missing-${i}`)];
+        block.payloadJson = JSON.stringify({ blockId: block.blockId, directMessageIds: ["later"], effectiveMessageIds: ids });
+        const insert = writer.prepare(`INSERT INTO messages (session_id, seq, msg_id, role, kind, content_hash, retired_at)
+            SELECT session_id, ?, ?, role, kind, content_hash, ? FROM messages WHERE session_id = ? AND seq = ?`);
+        insert.run(6, "m2", null, "target", 3);
+        insert.run(7, "m2", 1, "target", 4);
+        insert.run(8, "uncovered", null, "target", 4);
+        insert.run(9, "later", null, "target", 4);
+        store.ingestSession({ ...plan, messages: [], blocks: [block] });
+        const bounds = () => store.getBlocks("target").map(({ startSeq, endSeq }) => [startSeq, endSeq]);
+        assert.deepEqual(bounds(), [[0, 9]]);
+
+        writer.prepare(`WITH RECURSIVE filler(seq) AS (
+            SELECT 10 UNION ALL SELECT seq + 1 FROM filler WHERE seq < 16410
+        ) INSERT INTO messages (session_id, seq, msg_id, role, kind, content_hash)
+            SELECT session_id, filler.seq, 'uncovered-' || filler.seq, role, kind, content_hash
+            FROM filler CROSS JOIN messages WHERE session_id = ? AND messages.seq = 0`).run("target");
+        writer.prepare("UPDATE messages SET seq = ? WHERE session_id = ? AND msg_id = ?").run(100_000, "target", "later");
+        store.ingestSession({ ...plan, messages: [], blocks: [block] });
+        assert.deepEqual(bounds(), [[0, 100_000]]);
+
+        writer.prepare("UPDATE messages SET retired_at = ? WHERE session_id = ? AND msg_id = ?").run(1, "target", "later");
+        store.ingestSession({ ...plan, messages: [], blocks: [block] });
+        assert.deepEqual(bounds(), [[0, 6]]);
+    });
+}

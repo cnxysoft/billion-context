@@ -41,6 +41,8 @@ const WAL_CHECKPOINT_EVERY_INGESTS = 20;
 /** PR #4725 N3: covered-seq span point queries chunk the msg_id IN (…) list
  *  to stay under SQLite's 999 bound-parameter limit (1 session id + 500). */
 const SEQ_SPAN_QUERY_BATCH = 500;
+const SEQ_SPAN_SCAN_MIN_IDS = 8192;
+const SEQ_SPAN_SCAN_MAX_ROWS = 100_000;
 const MESSAGE_READ_STATEMENT_LIMIT = 64;
 const REPLAY_PROOF_MIN_ROWS = 4096;
 const REPLAY_PROOF_BATCH = 512;
@@ -1402,8 +1404,6 @@ export class UnifiedStore {
             const seqSpanById = new Map<string, [number, number]>();
             const coverageByBlock = new Map<BlockRow, string[]>();
             if (!skipIncomingBlocks && input.blocks.length > 0) {
-                // point query over the covered ids only (PR #4725 N3): a
-                // full-session scan per save taxed every session with blocks.
                 const wanted = new Set<string>();
                 for (const b of input.blocks) {
                     try {
@@ -1421,21 +1421,7 @@ export class UnifiedStore {
                 // is re-covered at a new seq). An id whose rows are all retired
                 // yields no span → boundsForCovered demotes it honestly; if that
                 // empties the whole claim the -1 sentinel preserves stored bounds (#4608).
-                const wantedIds = Array.from(wanted);
-                for (let i = 0; i < wantedIds.length; i += SEQ_SPAN_QUERY_BATCH) {
-                    const ids = wantedIds.slice(i, i + SEQ_SPAN_QUERY_BATCH);
-                    const rows = this.db
-                        .prepare(`SELECT msg_id, seq FROM messages WHERE session_id = ? AND msg_id IN (${ids.map(() => "?").join(", ")}) AND retired_at IS NULL`)
-                        .all(s.sessionId, ...ids) as Array<{ msg_id: string; seq: number }>;
-                    for (const r of rows) {
-                        const cur = seqSpanById.get(r.msg_id);
-                        if (!cur) seqSpanById.set(r.msg_id, [r.seq, r.seq]);
-                        else {
-                            if (r.seq < cur[0]) cur[0] = r.seq;
-                            if (r.seq > cur[1]) cur[1] = r.seq;
-                        }
-                    }
-                }
+                this.resolveCoveredSeqSpans(s.sessionId, wanted, seqSpanById);
             }
             const boundsForCovered = (block: BlockRow): [number, number] => {
                 let lo = Number.POSITIVE_INFINITY;
@@ -1731,6 +1717,36 @@ export class UnifiedStore {
             ? ` lastCheckpoint=(busy=${this.lastWalTick.busy} log=${this.lastWalTick.log} checkpointed=${this.lastWalTick.checkpointed} took=${this.lastWalTick.ms}ms)`
             : "";
         return `, ${formatDbSize(walBytes)} WAL${tick}`;
+    }
+
+    private resolveCoveredSeqSpans(sessionId: string, wanted: Set<string>, spans: Map<string, [number, number]>): void {
+        type SeqRow = { msg_id: string; seq: number };
+        const add = ({ msg_id, seq }: SeqRow) => {
+            const span = spans.get(msg_id);
+            if (!span) spans.set(msg_id, [seq, seq]);
+            else {
+                if (seq < span[0]) span[0] = seq;
+                if (seq > span[1]) span[1] = seq;
+            }
+        };
+        if (wanted.size >= SEQ_SPAN_SCAN_MIN_IDS) {
+            const limit = Math.min(wanted.size * 2, SEQ_SPAN_SCAN_MAX_ROWS);
+            // Count tombstones toward the scan limit so even a heavily retired transcript bounds the work.
+            const rows = this.db.prepare("SELECT msg_id, seq, retired_at FROM messages WHERE session_id = ? ORDER BY seq LIMIT ?")
+                .all(sessionId, limit + 1) as (SeqRow & { retired_at: number | null })[];
+            if (rows.length <= limit) {
+                for (const row of rows) if (row.retired_at === null && wanted.has(row.msg_id)) add(row);
+                return;
+            }
+        }
+        const ids = Array.from(wanted);
+        for (let i = 0; i < ids.length; i += SEQ_SPAN_QUERY_BATCH) {
+            const batch = ids.slice(i, i + SEQ_SPAN_QUERY_BATCH);
+            const rows = this.db.prepare(
+                `SELECT msg_id, seq FROM messages WHERE session_id = ? AND msg_id IN (${batch.map(() => "?").join(", ")}) AND retired_at IS NULL`,
+            ).all(sessionId, ...batch) as SeqRow[];
+            for (const row of rows) add(row);
+        }
     }
 
     /** Full-ingest path of ingestSession, extracted for readability: the
