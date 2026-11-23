@@ -1,0 +1,82 @@
+name: Android long-session baseline
+
+on:
+  push:
+    branches: [2026-11-23_android-long-session]
+    paths:
+      - '.github/workflows/fork-android-long-session.yml'
+      - 'src/**'
+      - 'tests/**'
+      - 'kernel/**'
+      - 'pi-subagents/**'
+      - 'scripts/**'
+      - 'docs/**'
+      - 'package*.json'
+      - 'tsconfig.json'
+      - 'tsup.config.ts'
+
+permissions:
+  contents: read
+
+jobs:
+  baseline:
+    if: github.repository == 'cnxysoft/billion-context'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Build package
+        run: npm run build
+
+      - name: Pack and smoke-test a clean install
+        run: |
+          package_dir="$RUNNER_TEMP/bili-package"
+          smoke_dir="$RUNNER_TEMP/bili-smoke"
+          mkdir -p "$package_dir" "$smoke_dir"
+          filename=$(npm pack --quiet --pack-destination "$package_dir")
+          npm install --prefix "$smoke_dir" --no-audit --no-fund "$package_dir/$filename"
+          "$smoke_dir/node_modules/.bin/bili" --version
+
+      - name: Upload npm tarball
+        uses: actions/upload-artifact@v4
+        with:
+          name: billion-context-android-baseline
+          path: ${{ runner.temp }}/bili-package/*.tgz
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Run baseline regression tests
+        run: |
+          node --import ./tests/preload-test-env.mjs --import ./tests/preload-storage-baseline.mjs --import tsx --test \
+            tests/dsh-native.test.ts \
+            tests/image-restore.test.ts \
+            tests/issue2322-session-name.test.ts \
+            tests/issue3343-incremental-divert-authz.test.ts \
+            tests/issue3407-shadow-blockcontents-order.test.ts \
+            tests/issue5140-cold-raw-tail-fork.test.ts \
+            tests/issue7190-dsh-runtime-preset-coverage.test.ts \
+            tests/opencode-rolling-cache-marks.test.ts \
+            tests/plugin-status-provenance.test.ts \
+            tests/plugin-terminal-usage.test.ts \
+            tests/storage-batched-verification.test.ts \
+            tests/storage-ingest-watermark.test.ts \
+            tests/storage-message-content-join.test.ts \
+            tests/storage-null-identity.test.ts \
+            tests/web-storage-fallback.test.ts
+
+      - name: Run real Codex against the deterministic fake upstream
+        env:
+          ACP_TEST_E2E_FAKE: '1'
+        run: |
+          npm install --global --no-audit --no-fund @openai/codex@0.147.0
+          npm run test:e2e:fake
