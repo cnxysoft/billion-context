@@ -147,6 +147,8 @@ type ToolDefinition = {
 };
 
 type CommandOutcome = { kind: "success" | "error"; text: string };
+type SessionHistoryRead = (request: unknown, signal: AbortSignal) => unknown;
+type SessionHistoryController = { page?: SessionHistoryRead; events?: SessionHistoryRead; follow?: SessionHistoryRead };
 
 export type PluginContext = {
     tools: { register: (definition: ToolDefinition) => unknown; get?: (name: string) => unknown };
@@ -181,6 +183,7 @@ export type PluginContext = {
     // live traffic after a proxy respawn (fresh dedup key, nothing armed).
     sessions?: { get?: (id: string) => { id?: unknown } | undefined; list?: () => Array<{ id?: unknown }> };
     sessionTitle?: { get?: (session: unknown) => { title?: unknown } | undefined };
+    sessionController?: SessionHistoryController;
     // #1809: browser HTTP carrier (web/desktop profiles only) — hosts the live
     // /bili/origin route the settings entry polls. Optional like llm/
     // profileContext above: TUI/headless profiles lack it.
@@ -1965,6 +1968,50 @@ async function maybeRecallBeforeSend(ctx: PluginContext, url: string, init: Requ
     init.headers = headers;
 }
 
+export function attachDshSessionPrewarm(controller: SessionHistoryController, origin: () => string | undefined, fetchImpl: typeof fetch = fetch): () => void {
+    let inFlight = false;
+    let nextAttemptAt = 0;
+    let disposed = false;
+    const schedule = (value: unknown, signal: AbortSignal, follow: boolean) => {
+        if (disposed || inFlight || signal.aborted || Date.now() < nextAttemptAt || typeof value !== "object" || value === null) return;
+        const request = value as { address?: { kind?: unknown; sessionId?: unknown }; beforeSeq?: unknown; throughSeq?: unknown; activate?: unknown };
+        const id = request.address?.sessionId;
+        if (request.address?.kind !== "session" || typeof id !== "string" || !/^session-[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(id) ||
+            request.beforeSeq != null || request.throughSeq != null || (follow && request.activate !== true)) return;
+        const base = origin();
+        if (!base) return;
+        const url = new URL("/__bili/plugin/status", base);
+        if (url.protocol !== "http:" || !["127.0.0.1", "localhost", "[::1]"].includes(url.hostname)) return;
+        url.searchParams.set("conversationId", id);
+        inFlight = true;
+        nextAttemptAt = Date.now() + 30_000;
+        void fetchImpl(url, { method: "HEAD", redirect: "error", signal: AbortSignal.timeout(12_000) })
+            .catch(() => {}).finally(() => { inFlight = false; });
+    };
+    const removers: (() => void)[] = [];
+    for (const key of ["page", "events", "follow"] as const) {
+        const original = controller[key];
+        if (typeof original !== "function") continue;
+        const own = Object.getOwnPropertyDescriptor(controller, key);
+        const wrapped: SessionHistoryRead = function(this: SessionHistoryController, request, signal) {
+            try { schedule(request, signal, key === "follow"); } catch { /* best-effort prefetch */ }
+            return original.call(this, request, signal);
+        };
+        try {
+            Object.defineProperty(controller, key, { configurable: true, writable: true, value: wrapped });
+        } catch { continue; }
+        removers.push(() => {
+            if (Object.getOwnPropertyDescriptor(controller, key)?.value !== wrapped) return;
+            if (own) Object.defineProperty(controller, key, own);
+            else delete controller[key];
+        });
+    }
+    return () => {
+        disposed = true;
+        for (const remove of removers) remove();
+    };
+}
+
 export async function apply(ctx: PluginContext): Promise<void> {
     const plan = planNativeDsh(process.env);
     if (plan.mode === "off") return;
@@ -2120,6 +2167,13 @@ export async function apply(ctx: PluginContext): Promise<void> {
                 // re-entry (#5614).
                 return runLlmDispatch(scope, () => wrapScopedIterable(next(), scope));
             });
+        });
+    }
+
+    if (typeof ctx.inject === "function") {
+        ctx.inject(["sessionController"], (sub) => {
+            const controller = sub.sessionController;
+            sub.effect?.(() => controller && attachDshSessionPrewarm(controller, () => register.base ?? state.origin), "bili: prewarm opened session");
         });
     }
 

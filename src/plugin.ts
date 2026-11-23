@@ -1571,6 +1571,23 @@ export function forkParentRevisionLegacy(session: Session): string {
 // must ride the SAME async seam: a sync getSession after an async probe would
 // mint an EMPTY resident ghost for a DB-only id, and that ghost then poisons
 // every later getSessionAsync of the id for the process lifetime.
+let prewarmingSession = false;
+
+export async function prewarmDshSession(id: string): Promise<204 | 404 | 429> {
+    if (!/^session-[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(id)) return 404;
+    if (peekSession(id)) return 204;
+    if (prewarmingSession) return 429;
+    prewarmingSession = true;
+    try {
+        const stored = await getStore().loadAsync(id);
+        if (stored === null || stored.id !== id) return 404;
+        await getSessionAsync(id, undefined, stored);
+        return 204;
+    } finally {
+        prewarmingSession = false;
+    }
+}
+
 async function resolveForkConversation(id: string): Promise<Session | undefined> {
     if (peekSession(id)) return peekSession(id);
     const direct = await getStore().loadAsync(id);

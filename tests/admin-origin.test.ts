@@ -26,10 +26,12 @@ function close(server: http.Server): Promise<void> {
 function request(
     port: number,
     headers: Record<string, string>,
+    route = "/__bili/config",
+    method = "GET",
 ): Promise<{ status: number; body: string }> {
     const { promise, resolve, reject } = Promise.withResolvers<{ status: number; body: string }>();
     const req = http.request(
-        { host: "127.0.0.1", port, path: "/__bili/config", headers },
+        { host: "127.0.0.1", port, path: route, method, headers },
         (res) => {
             let body = "";
             res.on("data", (c: Buffer) => { body += c.toString("utf8"); });
@@ -100,6 +102,9 @@ test("admin endpoints: DNS-rebinding Host is rejected with and without Origin (#
         // Cross-site Origin on a trusted Host (another site's JS talking to us).
         const crossOrigin = await request(actualPort, { host: trusted, origin: "http://evil.com:8080" });
         assert.equal(crossOrigin.status, 403, "Origin not in trusted hosts must be rejected");
+        const prewarm = "/__bili/plugin/status?conversationId=session-01234567-89ab-4cde-8123-456789abcdef";
+        assert.equal((await request(actualPort, { host: trusted, origin: "http://evil.com:8080" }, prewarm, "HEAD")).status, 403);
+        assert.deepEqual(await request(actualPort, { host: trusted }, prewarm, "HEAD"), { status: 404, body: "" });
     } finally {
         process.env.BILI_CONFIG_FILE = prevConfig;
         proxy.closeAllConnections?.();

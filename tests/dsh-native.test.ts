@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import http from "node:http";
 import { pathToFileURL } from "node:url";
-import { apply, installDshIntercepts, planNativeDsh, shouldBootstrapNativeDsh, persistClientEvent, mediaBytesOfWireBody, bodyOverWindowDetail, _attributionHealthForTest, _resetAttributionHealthForTest, _registerStateForTest, _resetRegisterForTest, _setModelInfoForTest, _nativeStateForTest, _setSpawnForTest, _setThrewRetryForTest, _settleNativeForTest, _stateHeadersForTest, _stateRespawnForTest, _stateTakeoverGateForTest, _stateToolsReadyForTest, _stateBeforeSendForTest, _stateOnResponseForTest, _noteRoutedForTest, _resetRoutedForTest, _resetWebProfileWarningForTest, _resetNonWebTraceForTest, _resetTitlesForTest, _resetBodyParseStatsForTest, _bodyParseStatsForTest, _parsedBodyOnceForTest, type PluginContext } from "../src/agent/dsh-native.ts";
+import { apply, attachDshSessionPrewarm, installDshIntercepts, planNativeDsh, shouldBootstrapNativeDsh, persistClientEvent, mediaBytesOfWireBody, bodyOverWindowDetail, _attributionHealthForTest, _resetAttributionHealthForTest, _registerStateForTest, _resetRegisterForTest, _setModelInfoForTest, _nativeStateForTest, _setSpawnForTest, _setThrewRetryForTest, _settleNativeForTest, _stateHeadersForTest, _stateRespawnForTest, _stateTakeoverGateForTest, _stateToolsReadyForTest, _stateBeforeSendForTest, _stateOnResponseForTest, _noteRoutedForTest, _resetRoutedForTest, _resetWebProfileWarningForTest, _resetNonWebTraceForTest, _resetTitlesForTest, _resetBodyParseStatsForTest, _bodyParseStatsForTest, _parsedBodyOnceForTest, type PluginContext } from "../src/agent/dsh-native.ts";
 import { nativeInterceptInstalled, _resetForTest as _resetFetchInterceptForTest, type NativeInterceptState } from "../src/agent/native-intercept.ts";
 import { nativeWebSocketInterceptInstalled, _resetForTest as _resetWsInterceptForTest } from "../src/agent/native-ws-intercept.ts";
 import { __resetIncrementalClientForTests } from "../src/agent/incremental-client.ts";
@@ -13,6 +13,60 @@ import { isDshCompactionActive, _resetDshCompactionVerdictForTest } from "../src
 import { once } from "node:events";
 import { startServer } from "../src/server.ts";
 import { defaultConfig } from "acp-kernel";
+
+test("opening one DSH history page schedules prewarm without waiting for BC", async () => {
+    const sid = "session-01234567-89ab-4cde-8123-456789abcdef";
+    const expected = Promise.resolve("history");
+    const address = { kind: "session", sessionId: sid };
+    const signal = new AbortController().signal;
+    const calls: URL[] = [];
+    const send: typeof fetch = async (target, init) => {
+        calls.push(new URL(String(target)));
+        assert.equal(init?.method, "HEAD");
+        assert.equal(init?.redirect, "error");
+        return new Response(null, { status: 204 });
+    };
+    const page = (_request: unknown, _signal: AbortSignal) => expected;
+    const controller = { page, events: page, follow: page };
+    const dispose = attachDshSessionPrewarm(controller, () => "http://127.0.0.1:8787", send);
+    try {
+        assert.equal(controller.page({ address, beforeSeq: 0 }, signal), expected);
+        assert.equal(controller.page({ address, throughSeq: 2 }, signal), expected);
+        assert.equal(controller.page({ address: { ...address, kind: "fork-preview" } }, signal), expected);
+        assert.equal(controller.page({ address: { ...address, sessionId: "malformed" } }, signal), expected);
+        assert.equal(controller.page({ address }, AbortSignal.abort()), expected);
+        assert.equal(controller.follow({ address, activate: false }, signal), expected);
+        assert.equal(calls.length, 0);
+        assert.equal(controller.follow({ address, activate: true }, signal), expected);
+        assert.equal(controller.events({ address }, signal), expected);
+        assert.equal(controller.page({ address }, signal), expected);
+        assert.deepEqual(calls.map(url => [url.pathname, url.searchParams.get("conversationId")]), [["/__bili/plugin/status", sid]]);
+        await expected;
+    } finally {
+        dispose();
+    }
+    assert.equal(controller.page, page);
+    assert.equal(controller.events, page);
+    assert.equal(controller.follow, page);
+    assert.equal(controller.page({ address }, signal), expected);
+    assert.equal(calls.length, 1);
+});
+
+test("DSH history prewarm never calls a non-loopback proxy", () => {
+    const page = (_request: unknown, _signal: AbortSignal) => "history";
+    const controller = { page };
+    let calls = 0;
+    const dispose = attachDshSessionPrewarm(controller, () => "http://example.invalid", async () => {
+        calls++;
+        return new Response(null, { status: 204 });
+    });
+    try {
+        assert.equal(controller.page({ address: { kind: "session", sessionId: "session-01234567-89ab-4cde-8123-456789abcdef" } }, new AbortController().signal), "history");
+        assert.equal(calls, 0);
+    } finally {
+        dispose();
+    }
+});
 
 for (const support of [true, false]) {
     test(`DSH only retouches a moved cache mark if capability is advertised (${String(support)})`, async () => {

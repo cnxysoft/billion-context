@@ -141,6 +141,10 @@ Forwarding a new model request replaces the previous observation with an estimat
 
 `compressibleRanges` is the live kernel recommendation as structured `{startRef, endRef, count, ...}` entries for `sessionRevision`, or `null` if it cannot be computed. An empty list means there is no recommended range. Read the exact conversation without `fallback=latest`, match the snapshot revision and ordered refs, and submit manual `compress` with `expectedRevision`; never parse the human panel or guess a fixed prefix. Hosts must exclude their retained first-user anchor from summaries: kernel pruning retains it even if a recommendation spans it. A concurrent mutation is rejected by the revision guard.
 
+`HEAD /__bili/plugin/status?conversationId=<id>` preloads an exact DSH session into memory under the same local management gate. It returns `204` for a resident or loaded session, `404` for a missing or unsupported id, and `429` if another cold load is already in progress. It returns no response body and skips status panel generation. The DSH plugin lets the current history page proceed while issuing this request. It skips older pages and treats a failure as a cache miss.
+
+`HEAD` 请求仅预读指定 DSH 会话，沿用管理接口的本地访问限制。插件打开会话时并行预读，翻旧页跳过。预读失败时，下一条消息按正常流程加载历史。
+
 ### 5. `POST /__bili/plugin/compact`
 
 Notify the proxy that the agent performed an **in-session native compaction** (e.g. omp's `/compact` or its auto threshold): the next model request re-sends a shortened history (compaction summary + retained tail) under the SAME conversation id. Fire-and-forget is fine — a failed notification must never break the agent's compaction.

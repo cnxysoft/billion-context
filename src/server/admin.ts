@@ -16,7 +16,7 @@ import { fetchWithTimeout } from "../fetch-util.js";
 import { log as loggerLog, getLogPath, logRetentionStatus } from "../logger.js";
 import { logGenerations } from "../log-retention.js";
 import { getBlindTunnelStats } from "../mitm.js";
-import { handlePluginAttribution, handlePluginCompact, handlePluginFork, handlePluginManifest, handlePluginRegister, handlePluginRuntimeInfo, handlePluginSessionName, handlePluginSnapshot, handlePluginStatus, handlePluginTool } from "../plugin.js";
+import { handlePluginAttribution, handlePluginCompact, handlePluginFork, handlePluginManifest, handlePluginRegister, handlePluginRuntimeInfo, handlePluginSessionName, handlePluginSnapshot, handlePluginStatus, handlePluginTool, prewarmDshSession } from "../plugin.js";
 import { parseAgentProviderReport, recordAgentProviders, agentProviderRecipes, sanitizeAgentProviderField } from "../agent-providers.js";
 import { configDir, defaultLogFile } from "../paths.js";
 import { getUpdateVisibility, updateBannerPayload } from "../update-notes.js";
@@ -537,6 +537,14 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
             res.end(JSON.stringify({ ok: false, code: "INVALID_REQUEST", error: String(err) }));
             return;
         }
+    }
+    if (req.method === "HEAD" && req.url?.split("?")[0] === "/__bili/plugin/status") {
+        const id = new URLSearchParams(req.url.split("?", 2)[1]).get("conversationId") ?? "";
+        let status = 503;
+        try { status = await prewarmDshSession(id); } catch { /* serving the next turn is independent of prefetch */ }
+        res.writeHead(status, { "Cache-Control": "no-store" });
+        res.end();
+        return;
     }
     if (req.method === "GET" && req.url?.startsWith("/__bili/plugin/status")) {
         const query = req.url.slice(req.url.indexOf("?") + 1);
