@@ -421,10 +421,27 @@ function serializeBlockView(view: BlockView): { json: string; hash: string } {
 }
 
 const refRowsCache = new WeakMap<Record<string, string>, RefRow[]>();
+const refRowsBySessionCache = new Map<string, RefRow[]>();
+const MAX_REF_ROWS_SESSIONS = 64;
 
-export function buildRefRows(byRawRef: Record<string, string>): RefRow[] {
+function rememberRefRows(
+    byRawRef: Record<string, string>,
+    rows: RefRow[],
+    sessionId?: string,
+): void {
+    refRowsCache.set(byRawRef, rows);
+    if (!sessionId) return;
+    if (refRowsBySessionCache.has(sessionId)) refRowsBySessionCache.delete(sessionId);
+    refRowsBySessionCache.set(sessionId, rows);
+    if (refRowsBySessionCache.size > MAX_REF_ROWS_SESSIONS) {
+        const oldest = refRowsBySessionCache.keys().next().value;
+        if (oldest !== undefined) refRowsBySessionCache.delete(oldest);
+    }
+}
+
+export function buildRefRows(byRawRef: Record<string, string>, sessionId?: string): RefRow[] {
     const keys = Object.keys(byRawRef);
-    const prev = refRowsCache.get(byRawRef);
+    const prev = refRowsCache.get(byRawRef) ?? (sessionId ? refRowsBySessionCache.get(sessionId) : undefined);
     if (prev !== undefined && keys.length >= prev.length) {
         let prefixOk = true;
         for (let i = 0; i < prev.length; i++) {
@@ -436,14 +453,17 @@ export function buildRefRows(byRawRef: Record<string, string>): RefRow[] {
             }
         }
         if (prefixOk) {
-            if (keys.length === prev.length) return prev.slice();
+            if (keys.length === prev.length) {
+                rememberRefRows(byRawRef, prev, sessionId);
+                return prev.slice();
+            }
             const next = prev.slice();
             for (let ord = prev.length; ord < keys.length; ord++) {
                 const rawId = keys[ord]!;
                 const ref = byRawRef[rawId]!;
                 next.push({ ord, rawId, ref, refNum: refToIndex(ref) });
             }
-            refRowsCache.set(byRawRef, next);
+            rememberRefRows(byRawRef, next, sessionId);
             return next.slice();
         }
     }
@@ -453,7 +473,7 @@ export function buildRefRows(byRawRef: Record<string, string>): RefRow[] {
         const ref = byRawRef[rawId]!;
         rows[ord] = { ord, rawId, ref, refNum: refToIndex(ref) };
     }
-    refRowsCache.set(byRawRef, rows);
+    rememberRefRows(byRawRef, rows, sessionId);
     return rows.slice();
 }
 
@@ -551,7 +571,7 @@ function finishPlan(
 ): IngestPlan {
     // Ref ledger: verbatim, ordered by the persisted map's key order.
     // Ghost ids (dead refs) have rows here and nowhere else — by design.
-    const refs: RefRow[] = buildRefRows(byRawRef);
+    const refs: RefRow[] = buildRefRows(byRawRef, session.id);
 
     const messages: MessageRow[] = log.map((e) => ({
         seq: e.seq,
