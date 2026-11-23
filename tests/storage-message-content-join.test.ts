@@ -57,11 +57,16 @@ function countSelects(t: TestContext, store: UnifiedStore) {
     let count = 0;
     let maxPayloadRows = 0;
     t.mock.method(db, "prepare", (sql: string) => {
-        if (/^SELECT\b/.test(sql.trim())) count++;
+        const isSelect = /^SELECT\b/.test(sql.trim());
         const statement = prepare(sql);
         return {
-            get: statement.get.bind(statement), run: statement.run.bind(statement),
+            get(...args: unknown[]) {
+                if (isSelect) count++;
+                return statement.get(...args);
+            },
+            run: statement.run.bind(statement),
             all(...args: unknown[]) {
+                if (isSelect) count++;
                 const rows = statement.all(...args);
                 const payloadRows = rows.filter((row) => row !== null && typeof row === "object" && ("bytes" in row || "content_bytes" in row)).length;
                 maxPayloadRows = Math.max(maxPayloadRows, payloadRows);

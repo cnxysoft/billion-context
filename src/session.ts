@@ -1529,7 +1529,7 @@ export function getSession(id: string, meta?: SessionMeta): Session {
  *  of silently starting a fresh session and losing every folded block at each
  *  restart. On sqlite this is loadSync plus a microtask: identical behavior.
  *  Concurrent first-touches of the same id share ONE load (single-flight). */
-export async function getSessionAsync(id: string, meta?: SessionMeta): Promise<Session> {
+export async function getSessionAsync(id: string, meta?: SessionMeta, preloaded?: Session): Promise<Session> {
     // #5044 publication race ported to the async seam: a request landing on a
     // child id while its fork is mid-publication must fail loudly instead of
     // adopting a fresh empty session that would wedge the publication.
@@ -1543,7 +1543,7 @@ export async function getSessionAsync(id: string, meta?: SessionMeta): Promise<S
     makeResidentRoom();
     let pending = pendingSessionLoads.get(id);
     if (!pending) {
-        pending = (async () => adoptOrCreate(id, meta, await store.loadAsync(id, meta)))()
+        pending = (async () => adoptOrCreate(id, meta, preloaded ?? await store.loadAsync(id, meta)))()
             .finally(() => { pendingSessionLoads.delete(id); });
         pendingSessionLoads.set(id, pending);
     }
@@ -1920,6 +1920,22 @@ export function reserveRefsThrough(session: Session, index: number): boolean {
     if (index <= highestUsedIndex(session.state.messageRefs)) return false;
     session.state.messageRefs.byRaw[REF_FLOOR_RAW_ID] = indexToRef(index);
     return true;
+}
+
+export function recoveredMessageRef(session: Session, ref: string): { rawId: string; contentHash: string; identity: string } | undefined {
+    if (!/^m[0-9]{5,7}$/.test(ref)) return undefined;
+    const { byRaw, byRef } = session.state.messageRefs;
+    if (Object.hasOwn(byRef, ref)) return undefined;
+    const aliases = session.metadata?.recoveredMessageRefAliases;
+    if (aliases === null || typeof aliases !== "object" || Array.isArray(aliases) || !Object.hasOwn(aliases, ref)) return undefined;
+    const alias = (aliases as Record<string, unknown>)[ref];
+    if (!alias || typeof alias !== "object" || Array.isArray(alias)) return undefined;
+    const { rawId, contentHash, identity } = alias as Record<string, unknown>;
+    if (typeof rawId !== "string" || !Object.hasOwn(byRaw, rawId)) return undefined;
+    if (typeof contentHash !== "string" || !/^[0-9a-f]{64}$/.test(contentHash)) return undefined;
+    if (typeof identity !== "string" || !/^[0-9a-f]{64}$/.test(identity)) return undefined;
+    const canonical = byRaw[rawId];
+    return canonical && /^m[0-9]{5,7}$/.test(canonical) && byRef[canonical] === rawId ? { rawId, contentHash, identity } : undefined;
 }
 
 export function applyCompactionArchive(

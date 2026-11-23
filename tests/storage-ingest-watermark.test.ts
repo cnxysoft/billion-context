@@ -739,3 +739,135 @@ test("watermark: completeLog sweep skips lane-owned sessions (#3248/#3285)", () 
         rmBestEffort(dir);
     }
 });
+
+for (const size of [2, 4096]) test(`full replay skips refcount writes only for already stored messages (${size} rows)`, (t) => {
+    const dir = tmpdir("bili-wm-replay-noop-");
+    const store = UnifiedStore.open(path.join(dir, "index.db"));
+    try {
+        const db = (store as unknown as { db: ReturnType<typeof openSqliteDatabase>["db"] }).db;
+        const id = "replay-noop";
+        const history = Array.from({ length: size }, (_, i) => msg(i));
+        const save = (tail: CoreMessage[]) => store.ingestSession(planIngest(mkLegacy(id, tail)), undefined, { completeLog: true });
+        const cas = () => db.prepare("SELECT hash, refcount FROM content ORDER BY hash").all();
+        assert.equal(save(history), true);
+        const rows = store.getMessages(id);
+        const before = cas();
+        const prepare = db.prepare.bind(db);
+        const writes: string[] = [];
+        let batchQueries = 0;
+        t.mock.method(db, "prepare", (sql: string) => {
+            const statement = prepare(sql);
+            if (sql.includes("FROM json_each(?) AS j")) {
+                const all = statement.all.bind(statement);
+                t.mock.method(statement, "all", (...args: unknown[]) => {
+                    batchQueries++;
+                    return all(...args);
+                });
+            }
+            if (/^(?:INSERT INTO content|UPDATE content SET refcount|INSERT OR IGNORE INTO messages)/.test(sql)) {
+                const run = statement.run.bind(statement);
+                t.mock.method(statement, "run", (...args: unknown[]) => {
+                    writes.push(sql);
+                    return run(...args);
+                });
+            }
+            return statement;
+        });
+        assert.equal(save(history), true);
+        assert.equal(writes.length, 0);
+        assert.equal(batchQueries, size === 4096 ? 8 : 0);
+        assert.deepEqual(store.getMessages(id), rows);
+        assert.deepEqual(cas(), before);
+
+        assert.equal(save([...history, msg(size)]), true);
+        assert.equal(writes.filter(sql => sql.startsWith("INSERT OR IGNORE INTO messages")).length, 1);
+        assert.equal(store.getMessages(id).length, size + 1);
+        assert.equal(cas().length, before.length + 1);
+    } finally {
+        store.close();
+        rmBestEffort(dir);
+    }
+});
+
+test("bounded remaps restore retired media at its old seq and append past omitted history", (t) => {
+    const dir = tmpdir("bili-wm-bounded-remap-");
+    const store = UnifiedStore.open(path.join(dir, "index.db"));
+    try {
+        const id = "wm-bounded-remap";
+        const photo = { ...msg(1), imageBase64: "QUJD".repeat(700) };
+        const initial = Array.from({ length: 180 }, (_, i) => i === 1 ? photo : msg(i));
+        const save = (messages: CoreMessage[], completeLog: boolean) => {
+            assert.equal(store.ingestSession(planIngest(mkLegacy(id, messages)), undefined, { completeLog }), true);
+        };
+        save(initial, true);
+        const before = store.getMessages(id);
+        assert.match(before[1].content, /QUJD/);
+
+        const db = (store as unknown as { db: ReturnType<typeof openSqliteDatabase>["db"] }).db;
+        const prepare = db.prepare.bind(db);
+        const queries: string[] = [];
+        t.mock.method(db, "prepare", (sql: string) => {
+            queries.push(sql);
+            return prepare(sql);
+        });
+        const latest = initial.at(-1)!;
+        save([latest], true);
+        assert.equal(queries.some((sql) => sql.includes("INDEXED BY idx_messages_msg_id")), false);
+        assert.ok(queries.some((sql) => sql.includes("FROM messages WHERE session_id = ? ORDER BY seq")));
+        assert.deepEqual(store.getMessages(id).map(({ seq }) => seq), [179]);
+
+        queries.length = 0;
+        const appended = msg(180);
+        save([photo, appended], false);
+        assert.ok(queries.some((sql) => sql.includes("INDEXED BY idx_messages_msg_id")));
+        assert.equal(queries.some((sql) => sql.includes("FROM messages WHERE session_id = ? ORDER BY seq")), false);
+        const after = store.getMessages(id);
+        assert.deepEqual(after.map(({ seq }) => seq), [1, 179, 180]);
+        assert.equal(after[0].content, before[1].content);
+        assert.equal(after[0].contentHash, before[1].contentHash);
+        assert.deepEqual(store.ingestWatermark(id), { seq: 180, tailSeqs: [1, 180] });
+        assert.equal(store.getMessages(id, { includeRetired: true }).length, 181);
+    } finally {
+        store.close();
+        rmBestEffort(dir);
+    }
+});
+
+test("large ref ledgers compare the whole stored prefix and fall back for edits and pruning", (t) => {
+    const dir = tmpdir("bili-wm-ref-prefix-");
+    const store = UnifiedStore.open(path.join(dir, "index.db"));
+    try {
+        const db = (store as unknown as { db: ReturnType<typeof openSqliteDatabase>["db"] }).db;
+        const prepare = db.prepare.bind(db);
+        const queries: string[] = [];
+        t.mock.method(db, "prepare", (sql: string) => {
+            queries.push(sql);
+            return prepare(sql);
+        });
+        const legacy = mkLegacy("large-ref-ledger", [msg(0)]);
+        const byRaw = legacy.state.messageRefs.byRaw;
+        for (let i = 1; i <= 8200; i++) byRaw[`ref-${i}`] = `m${String(i).padStart(5, "0")}`;
+        byRaw['special "\\😀'] = "BLOCKED";
+        const save = (expectFallback: boolean) => {
+            const plan = planIngest(legacy);
+            queries.length = 0;
+            assert.equal(store.ingestSession(plan), true);
+            assert.ok(queries.some((sql) => sql.includes("json_group_array(json_array(ord")));
+            assert.equal(queries.some((sql) => sql.includes("SELECT raw_id, ord, ref, ref_num FROM refs")), expectFallback);
+            assert.deepEqual(store.getRefs(legacy.id), plan.refs);
+        };
+
+        save(true);
+        save(false);
+        byRaw.appended = "m08201";
+        save(false);
+        prepare("UPDATE refs SET ref = ?, ref_num = NULL WHERE session_id = ? AND raw_id = ?").run("BLOCKED", legacy.id, "ref-4100");
+        save(true);
+        delete byRaw["ref-3000"];
+        save(true);
+        save(false);
+    } finally {
+        store.close();
+        rmBestEffort(dir);
+    }
+});

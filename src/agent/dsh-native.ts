@@ -69,7 +69,7 @@ import { runOutsideFetchChain } from "./fetch-chain/index.js";
 import { installNativeWebSocketIntercept } from "./native-ws-intercept.js";
 import { asciiHeaderValue, fetchManifest, fetchProxyVersion, fetchStatus, fetchStatusLatest, forwardTool, reportAttributionHealth, reportRuntimeInfo, waitForProxyVersion, type ManifestTool } from "./shared.js";
 import { createForkAdopter, sideShapedBody } from "./fork-adopt.js";
-import { clearIncrementalProbe, createPrepareDirectSend, INCREMENTAL_TURN_MARKER_HEADER, INCREMENTAL_TURN_ID_HEADER, newIncrementalTurnId, noteIncrementalRejection, noteIncrementalAck, planIncrementalTurn, probeIncrementalTurns, rememberOriginalBody, sweepStale, wireMessagesLookAnthropic, type IncrementalWireMessage } from "./incremental-client.js";
+import { clearIncrementalProbe, createPrepareDirectSend, INCREMENTAL_TURN_MARKER_HEADER, INCREMENTAL_TURN_ID_HEADER, incrementalCacheRetouchEnabled, newIncrementalTurnId, noteIncrementalRejection, noteIncrementalAck, planIncrementalTurn, probeIncrementalTurns, rememberOriginalBody, sweepStale, wireMessagesLookAnthropic, type IncrementalWireMessage } from "./incremental-client.js";
 import { compactionCoverageText, declareDshCompactionActive, detectCompactionOverlayGap } from "./dsh-compaction-disable.js";
 import { maskUrlForDiagnostics } from "../log-mask.js";
 import { mediaBytesOfWireBody } from "./media-bytes.js";
@@ -2750,6 +2750,7 @@ export async function apply(ctx: PluginContext): Promise<void> {
         const scopedIds = dispatchScope.getStore()?.msgIds;
         const msgIds = scopedIds !== undefined && scopedIds.length === (parsed.messages as unknown[]).length ? scopedIds : undefined;
         const plan = planIncrementalTurn({
+            cacheControlRetouch: incrementalCacheRetouchEnabled(base),
             conversationId: sid,
             path: "/v1/messages", // placeholder — the marker divert uses the ORIGINAL routed URL
             messages: parsed.messages as IncrementalWireMessage[],

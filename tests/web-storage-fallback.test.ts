@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { DatabaseSync } from "node:sqlite";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -58,6 +59,19 @@ test("#4738: messages pruned from the resident window hydrate previews + full te
         seed.close();
     }
     s.lastMessages = [{ id: "rm1", role: "user", contentType: "text", text: "hello   there\nworld" }];
+    const db = new DatabaseSync(dbPath);
+    const row = db.prepare("SELECT content_hash, identity FROM messages WHERE session_id = ? AND msg_id = ?").get(s.id, "rm2");
+    db.close();
+    assert.ok(row && typeof row.content_hash === "string" && typeof row.identity === "string");
+    const alias = { rawId: "rm2", contentHash: row.content_hash, identity: row.identity };
+    s.metadata.recoveredMessageRefAliases = {
+        m00001: alias,
+        m00008: alias,
+        m00009: { ...alias, rawId: "rm3" },
+        m00010: { ...alias, rawId: "unregistered" },
+        m00011: { ...alias, identity: "0".repeat(64) },
+        m00012: { ...alias, contentHash: "0".repeat(64) },
+    };
     _resetDiskCacheForTest();
     try {
         const d = await buildSessionDetail("fallback-msgs");
@@ -75,6 +89,20 @@ test("#4738: messages pruned from the resident window hydrate previews + full te
         assert.equal(one.role, "assistant");
         assert.equal(one.text, "stored answer");
         assert.equal(one.totalBytes, Buffer.byteLength("stored answer"));
+
+        assert.deepEqual(await buildMessageContent("fallback-msgs", "m00008"), { ...one, ref: "m00008" });
+        assert.deepEqual(await buildMessageContent("fallback-msgs", "m00009"), { ok: false, reason: "unknown-message" });
+        assert.deepEqual(await buildMessageContent("fallback-msgs", "m00010"), { ok: false, reason: "unknown-message" });
+        assert.deepEqual(await buildMessageContent("fallback-msgs", "m00011"), { ok: false, reason: "unknown-message" });
+        assert.deepEqual(await buildMessageContent("fallback-msgs", "m00012"), { ...one, ref: "m00012" });
+        const update = new DatabaseSync(dbPath);
+        try {
+            update.prepare("UPDATE messages SET retired_at = 1 WHERE session_id = ? AND msg_id = ?").run(s.id, "rm2");
+        } finally {
+            update.close();
+        }
+        assert.deepEqual(await buildMessageContent("fallback-msgs", "m00008"), { ...one, ref: "m00008" });
+        assert.equal(s.state.messageRefs.byRef.m00008, undefined);
 
         const resident = await buildMessageContent("fallback-msgs", "m00001");
         assert.ok(resident.ok);

@@ -218,6 +218,30 @@ test("#7190: registerCompactionDisable installs the wrap alongside the load-time
     }
 });
 
+test("#7190: Cordis can supply the preset registry after the gate has activated", () => {
+    _resetDshCompactionGateTelemetryForTest();
+    try {
+        let gateProvided = false;
+        const pending: Array<() => void> = [];
+        registerCompactionDisable({
+            reflect: { provide: () => { gateProvided = true; } },
+            get agentPresets(): never { throw new Error('cannot get property "agentPresets" without inject'); },
+            inject: (services, apply) => {
+                assert.deepEqual(services, ["agentPresets"]);
+                assert.equal(gateProvided, true);
+                pending.push(() => apply({ agentPresets: { register: async (definition) => definition } }));
+            },
+        });
+        assert.equal(gateProvided, true);
+        assert.equal(dshCompactionGateTelemetry()?.runtimeWrapped, undefined);
+        assert.equal(pending.length, 1);
+        pending[0]!();
+        assert.equal(dshCompactionGateTelemetry()?.runtimeWrapped, true);
+    } finally {
+        _resetDshCompactionGateTelemetryForTest();
+    }
+});
+
 test("#7190: telemetry — runtime entries dedup on max rows; the coverage text states the wrap state, not a false gap", () => {
     try {
         _resetDshCompactionVerdictForTest();

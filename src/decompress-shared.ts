@@ -22,13 +22,13 @@ import { existsSync, mkdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve as resolvePath } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
-import { markDirty, preCompactionArchiveOf, peekSession, findSessionByCanonicalId, type Session } from "./session.js";
+import { markDirty, preCompactionArchiveOf, peekSession, findSessionByCanonicalId, recoveredMessageRef, type Session } from "./session.js";
 import { getStore } from "./persist.js";
 import { ccrEnabled, contentStoreOf } from "./store.js";
 import { safePrefix } from "./text-safe.js";
 import { decompressTmpCap as knobDecompressTmpCap } from "./knobs.js";
 import { toolFail, toolOk, type ProxyToolResult } from "./proxy-tool-result.js";
-import { describeRestorable } from "./image-restore.js";
+import { describeRestorable, messageImageBytes, writeRestoredImage } from "./image-restore.js";
 
 /** Bounded retention for large-decompress temp files. Each decompress with
  *  body > 10000 writes one file under tmpdir(); the reaper unlinks oldest past
@@ -169,6 +169,10 @@ function hasRangeArgs(args: Record<string, unknown>): boolean {
     return start !== "" || end !== "";
 }
 
+export function hasDecompressImageRef(args: Record<string, unknown>): boolean {
+    return typeof args.imageRef === "string" && args.imageRef.trim() !== "";
+}
+
 export function resolveDecompress(
     args: Record<string, unknown>,
     ctx: ProxyToolCtx,
@@ -186,7 +190,7 @@ export function resolveDecompress(
     if (ir != null && typeof ir !== "string") {
         return toolFail('[decompress FAILED: imageRef must be a string (an mNNNNN ref or "list") — omit it to restore a text block]');
     }
-    if (typeof ir === "string" && ir.trim() !== "") {
+    if (hasDecompressImageRef(args)) {
         return resolveImageRestore(args, ctx);
     }
     const rawBlockId = args.blockId;
@@ -284,35 +288,51 @@ export function resolveDecompress(
     return toolOk(`${header}\n${body}\n\n${refoldHint(blockId, marked.result)}`);
 }
 
-// #1995: restore the original pixels of a stripped/folded image by ref. Delivery
-// is file-first — images are spilled under <stateDir>/retrieve/img/ at index time
-// and their paths returned for the model to open with its read tool — uniform
-// across all four wires (no per-protocol inline-image rendering). "list" enumerates
-// what is currently restorable instead of writing anything.
+function restoreStoredImagePaths(ref: string, session: Session): { paths: string[]; missing: number } | null {
+    if (!/^m[0-9]+$/.test(ref)) return null;
+    const refs = session.state.messageRefs;
+    const canonicalRawId = refs.byRef[ref];
+    const recovered = recoveredMessageRef(session, ref);
+    const rawId = recovered?.rawId ?? (canonicalRawId && refs.byRaw[canonicalRawId] === ref ? canonicalRawId : undefined);
+    if (!rawId) return null;
+    const stored = recovered
+        ? getStore().unifiedRecoveredMessageContent(session.id, rawId, recovered.contentHash, recovered.identity)
+        : getStore().unifiedUniqueLiveMessageContent(session.id, rawId);
+    if (stored === null) return null;
+    let message: CoreMessage & { imageBase64?: unknown };
+    try {
+        message = JSON.parse(stored);
+    } catch {
+        return null;
+    }
+    if (message?.id !== rawId || (message.imageBase64 !== undefined && typeof message.imageBase64 !== "string")) return null;
+    const images = messageImageBytes(message);
+    if (images.length === 0 || images.some((img) =>
+        typeof img.mediaType !== "string" || !img.mediaType.startsWith("image/") ||
+        img.bytes === 0 || !/^[A-Za-z0-9+/]+={0,2}$/.test(img.b64))) return null;
+    const paths = images.flatMap((image, i) => writeRestoredImage(ref, i, image, session.id) ?? []);
+    return { paths, missing: images.length - paths.length };
+}
+
 function resolveImageRestore(args: Record<string, unknown>, ctx: ProxyToolCtx): ProxyToolResult {
     const index = ctx.session.incomingImageIndex;
     const raw = typeof args.imageRef === "string" ? args.imageRef.trim() : "";
     if (raw === "" || raw.toLowerCase() === "list") {
         if (!index || index.size === 0) {
-            return toolOk("[No restorable images right now — this request carries no indexed historical images (the client must resend history bytes for them to be indexed).]");
+            return toolOk("[No restorable images right now in this request's index. Pass an individual image ref to check stored history.]");
         }
         const lines = describeRestorable(index);
-        return toolOk(`[Restorable images (${lines.length}):]\n${lines.join("\n")}\nRestore one with decompress({ imageRef: "<ref>" }); it is written to a file you open with the read tool.`);
+        return toolOk(`[Images indexed in this request (${lines.length}):]\n${lines.join("\n")}\nRestore one with decompress({ imageRef: "<ref>" }); it is written to a file you open with the read tool.`);
     }
-    if (!index) {
-        return toolFail(`[decompress FAILED: no image history is indexed for this request — cannot restore "${raw}".]`);
+    const indexed = index?.get(raw) ?? [];
+    const archived = indexed.length === 0 ? restoreStoredImagePaths(raw, ctx.session) : null;
+    const paths = archived?.paths ?? indexed.map((image) => image.path).filter((path) => existsSync(path));
+    const missing = archived?.missing ?? indexed.length - paths.length;
+    if (paths.length === 0 && indexed.length === 0 && archived === null) {
+        return toolFail(`[decompress FAILED: no restorable image for ref "${raw}" in this request or stored history. Call decompress({ imageRef: "list" }) to see images indexed in this request.]`);
     }
-    const imgs = index.get(raw);
-    if (!imgs || imgs.length === 0) {
-        return toolFail(`[decompress FAILED: no restorable image for ref "${raw}" (it carries no image, is URL-sourced with no stored bytes, or is not in this request's history). Call decompress({ imageRef: "list" }) to see what is available.]`);
-    }
-    // Files were spilled at index-time, so restoring is a pure lookup: return the
-    // stored paths (verifying presence), never re-decoding or re-writing bytes.
-    const paths: string[] = [];
-    let missing = 0;
-    for (const im of imgs) {
-        if (existsSync(im.path)) paths.push(im.path);
-        else missing++;
+    if (paths.length === 0 && archived !== null) {
+        return toolFail(`[decompress FAILED: could not write the stored image(s) for "${raw}" to disk.]`);
     }
     if (paths.length === 0) {
         return toolFail(`[decompress FAILED: the restored image(s) for "${raw}" are no longer on disk (evicted/cleaned since indexing). They will be re-spilled automatically on the next request.]`);

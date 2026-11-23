@@ -21,7 +21,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { UnifiedStore } from "../src/storage/store.ts";
 import { UnifiedShadow } from "../src/storage/shadow.ts";
-import type { LegacySessionLike } from "../src/storage/ingest.ts";
+import { planIngest, type LegacySessionLike } from "../src/storage/ingest.ts";
 import type { CoreMessage, CompressionBlock } from "acp-kernel";
 import type { BlockView } from "../src/session.js";
 
@@ -164,4 +164,27 @@ test("#3407: full blockContents reordered vs state.blocks must not trip the pari
     } finally {
         rmBestEffort(dir);
     }
+});
+
+test("ingest completes a large sparse block map once and preserves stored views", () => {
+    class CountedBlockContents extends Map<string, BCEntry> {
+        sizeReads = 0;
+
+        override get size(): number {
+            this.sizeReads++;
+            return super.size;
+        }
+    }
+    const blocks = Array.from({ length: 618 }, (_, i) => mkBlock(`b${i + 1}`, `summary ${i + 1}`));
+    const original = { one: { text: "nested", count: 1 }, full: { text: "original", count: 2 } };
+    const blockContents = new CountedBlockContents([["b2", original]]);
+    const plan = planIngest(mkBlocksLegacy("bc-large-sparse", blocks, blockContents));
+
+    assert.equal(blockContents.sizeReads, 1);
+    assert.equal(plan.blocks.length, blocks.length);
+    assert.equal(plan.blocks[0].summary, JSON.stringify({ text: "summary 1", count: 0 }));
+    assert.equal(plan.blocks[0].one, null);
+    assert.equal(plan.blocks[1].summary, JSON.stringify(original.full));
+    assert.equal(plan.blocks[1].one, JSON.stringify(original.one));
+    assert.deepEqual([...blockContents.keys()], ["b2"]);
 });

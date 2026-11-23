@@ -8,7 +8,7 @@ import { join } from "node:path";
 import { defaultConfig, DEFAULT_CCR_CONFIG } from "acp-kernel";
 import { startServer } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
-import { SessionStore, _setStoreForTest } from "../src/persist.ts";
+import { SessionStore, _setStoreForTest, getStore } from "../src/persist.ts";
 import { _resetPluginStateForTest, resolveConversation } from "../src/plugin.ts";
 import { _resetSessionsForTest } from "../src/session.ts";
 import { _setForTest } from "../src/registry.ts";
@@ -262,4 +262,31 @@ test("HTTP status sessionRevision is cache-stable while unchanged and moves afte
         const stale = await fetch(`${h.origin}/__bili/plugin/tool`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ conversationId: "provenance", tool: "acp_status", args: {}, expectedRevision: first.sessionRevision }) });
         assert.equal(stale.status, 409, "stale cached revision must fail closed");
     } finally { await h.close(); }
+});
+
+
+test("imageRef decompress skips redundant plugin saves but persists new binding and text restores", async (t) => {
+    const h = await harness();
+    try {
+        const session = resolveConversation("provenance").session!;
+        assert.equal(session.metadata.pluginAgent, "test");
+        const save = t.mock.method(getStore(), "scheduleSave");
+        const start = session.revisionEpoch;
+        assert.match((await h.tool("decompress", { imageRef: "list" })).result, /in this request's index/);
+        assert.match((await h.tool("decompress", { imageRef: "m99999" })).result, /no restorable image for ref/);
+        assert.equal(save.mock.callCount(), 0);
+        assert.equal(session.revisionEpoch, start);
+
+        delete session.metadata.pluginAgent;
+        await h.tool("decompress", { imageRef: "list" });
+        assert.equal(session.metadata.pluginAgent, "mcp");
+        assert.equal(save.mock.callCount(), 1);
+
+        await h.tool("compress", h.compressArgs);
+        const beforeRestore = save.mock.callCount();
+        assert.match((await h.tool("decompress", { blockId: "b1", imageRef: " ", full: true })).result, /first original/);
+        assert.ok(save.mock.callCount() > beforeRestore);
+    } finally {
+        await h.close();
+    }
 });

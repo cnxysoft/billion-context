@@ -136,7 +136,7 @@ test("plugin session-name endpoint: validation, set/rename/clear, display preced
 
         const before = new Set(listSessions().map((s) => s.id));
         await register(rig, "name-conv");
-        await postModel(rig, "hello world from the first message");
+        await (await postModel(rig, "hello world from the first message")).text();
         const session = listSessions().find((s) => !before.has(s.id));
         assert.ok(session, "the model request created a new session");
         assert.ok(session.meta.title, "derived title set from the first user message");
@@ -153,9 +153,15 @@ test("plugin session-name endpoint: validation, set/rename/clear, display preced
         const stats = await (await fetch(rig.proxyUrl("/__bili/stats"))).json() as { sessions?: Array<{ id: string; title?: string }> };
         assert.equal(stats.sessions?.find((x) => x.id === session.id)?.title, "Fix auth bug", "/__bili/stats prefers hostTitle (#2322 follow-up)");
 
-        // Rename: latest-wins.
+        const setRevision = session.revisionEpoch;
+        assert.ok(setRevision !== undefined);
+        res = await post(JSON.stringify({ conversationId: "name-conv", name: " Fix  auth\n bug " }));
+        assert.equal(res.status, 200);
+        assert.equal(session.revisionEpoch, setRevision, "same normalized title does not schedule a session save");
+
         await post(JSON.stringify({ conversationId: "name-conv", name: "renamed" }));
         assert.equal(session.meta.hostTitle, "renamed");
+        assert.equal(session.revisionEpoch, setRevision + 1, "rename still schedules a save");
 
         // Whitespace normalization + length cap.
         await post(JSON.stringify({ conversationId: "name-conv", name: "  lots\n  of   space  " }));
@@ -166,6 +172,10 @@ test("plugin session-name endpoint: validation, set/rename/clear, display preced
         // Clear: empty string removes hostTitle; display falls back to derived.
         await post(JSON.stringify({ conversationId: "name-conv", name: "" }));
         assert.equal(session.meta.hostTitle, undefined, "empty name clears hostTitle");
+        const clearedRevision = session.revisionEpoch;
+        res = await post(JSON.stringify({ conversationId: "name-conv", name: "  " }));
+        assert.equal(res.status, 200);
+        assert.equal(session.revisionEpoch, clearedRevision, "clearing an already absent title is a no-op");
         row = (await webSessions(rig)).sessions.find((s) => s.id === session.id);
         assert.equal(row?.title, derived, "display falls back to the derived title after clear");
     } finally {

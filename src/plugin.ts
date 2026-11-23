@@ -18,6 +18,7 @@ import { salvageCompressArgs } from "./plugin-compress-salvage.js";
 import { absorbEnabled, effectiveAbsorbConfig, isProxyToolFor } from "./absorb.js";
 import { effectiveRulesEnabled, rulesEnabled } from "./rules-feature.js";
 import { executeProxyToolAsync } from "./loop/core.js";
+import { hasDecompressImageRef } from "./decompress-shared.js";
 import type { ProxyToolResult } from "./proxy-tool-result.js";
 import { normalizeSseLineEndings, finalizeSseLineEndings } from "./sse-util.js";
 import { composeStreamFilters, containsBiliInternalText, containsEchoResidue, containsMarkerLineText, containsRenderTagText, containsToolCallEmissionText, containsToolCallXmlFragment, createBiliArtifactFilter, createIdentityStreamFilter, createMarkerLineFilter, createTagEchoFilter, isOrphanMarkupText, mayStartBiliInternal, mayStartDegenerateRenderTag, mayStartMarkerLine, mayStartRenderTag, mayStartToolCallEmission, stripAcpTags, stripAnthropicText, stripOpenaiChatText, stripResponsesText, type TagEchoFilter } from "./loop/tag-echo-filter.js";
@@ -1093,9 +1094,11 @@ export function handlePluginSessionName(payload: string, res: import("node:http"
     }
     let name = parsed.name.replace(/\s+/g, " ").trim();
     if (name.length > HOST_TITLE_MAX) name = name.slice(0, HOST_TITLE_MAX);
-    if (name) session.meta.hostTitle = name;
-    else delete session.meta.hostTitle;
-    markDirty(session);
+    if (session.meta.hostTitle !== (name || undefined)) {
+        if (name) session.meta.hostTitle = name;
+        else delete session.meta.hostTitle;
+        markDirty(session);
+    }
     if (entry) entry.lastSeen = Date.now();
     res.end(JSON.stringify({ ok: true, conversationId }));
 }
@@ -1570,12 +1573,13 @@ export function forkParentRevisionLegacy(session: Session): string {
 // every later getSessionAsync of the id for the process lifetime.
 async function resolveForkConversation(id: string): Promise<Session | undefined> {
     if (peekSession(id)) return peekSession(id);
-    if (await getStore().loadAsync(id)) return getSessionAsync(id);
+    const direct = await getStore().loadAsync(id);
+    if (direct) return getSessionAsync(id, undefined, direct);
     const { session, entry } = resolveConversation(id);
     if (session) return session;
     const persistedId = entry?.sessionId ?? id;
-    if (!(await getStore().loadAsync(persistedId))) return undefined;
-    return getSessionAsync(persistedId);
+    const persisted = persistedId === id ? null : await getStore().loadAsync(persistedId);
+    return persisted ? getSessionAsync(persistedId, undefined, persisted) : undefined;
 }
 
 /** #2601 freshness window for persona-lineage following — same family as
@@ -2559,10 +2563,9 @@ export async function handlePluginTool(
     // (sticky) — the next model request stops injecting the duplicate ephemeral wire
     // tools. Guarded: only flips a session with NO existing agent binding, never
     // overriding a pi/omp/opencode plugin or a launcher-registered agent.
-    if (typeof session.metadata.pluginAgent !== "string" && tool !== retrieveToolName(session)) {
-        session.metadata.pluginAgent = "mcp";
-    }
-    markDirty(session);
+    const bindsPlugin = typeof session.metadata.pluginAgent !== "string" && tool !== retrieveToolName(session);
+    if (bindsPlugin) session.metadata.pluginAgent = "mcp";
+    if (bindsPlugin || tool !== "decompress" || !hasDecompressImageRef(args)) markDirty(session);
     deps.log("info", `[${session.id}] [plugin] tool ${tool} executed via plugin (routed by ${routedBy}, #1685) (${result.text.length} chars, outcome=${result.outcome ?? "n/a"}${result.reason ? `, reason=${result.reason}` : ""})`);
     // Same deep link on the /acp-cache display surfaces: clients wrap this text in
     // [acp-cache]/[/acp-cache] markers and strip it from model context by marker
@@ -5045,11 +5048,10 @@ export async function pipePluginResponsesWithStrip(
                             captureHandoffJson(reply, "responses", { ...response, output });
                             replyCompleted = true;
                         } else reply?.discard();
-                        // Hosts finish on this frame, before EOF settles billing and late usage.
+                        // Publish live context before the host sees this frame. The usage settlement saves it on stream exit.
                         if (session && acc.inputTokens !== undefined && acc.inputTokens > 0) {
                             const credit = session.stats.compressCreditTokens ?? 0;
                             recordContextObservation(session, Math.max(0, acc.inputTokens - credit), credit > 0 ? "estimate" : "usage");
-                            markDirty(session);
                         }
                         await write(rebuild ? rebuildEvent(rawEvent, evOut) : rawEvent + "\n\n");
                         continue;

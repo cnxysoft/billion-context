@@ -46,6 +46,12 @@ async function harness(terminal: Record<string, unknown>, late = "") {
     resetToolRingForTest();
     const store = new SessionStore({ dir: join(root, "sessions"), enabled: false });
     _setStoreForTest(store);
+    const revisions: number[] = [];
+    const scheduleSave = store.scheduleSave.bind(store);
+    store.scheduleSave = (session) => {
+        revisions.push(session.revisionEpoch ?? 0);
+        scheduleSave(session);
+    };
     _setForTest({});
     const sendTerminal = barrier();
     const endStream = barrier();
@@ -103,6 +109,7 @@ async function harness(terminal: Record<string, unknown>, late = "") {
     };
     return {
         status, session: resolveConversation("terminal-usage").session!,
+        saves: () => revisions.length,
         terminal: async () => { sendTerminal.release(); await readThrough(terminalFrame); },
         finish: async () => { endStream.release(); await drain(); assert.equal(wire, initial + terminalFrame + late); },
         upstreamEnded: () => upstreamEnded,
@@ -122,6 +129,7 @@ test("HTTP Responses terminal usage is observable before upstream EOF without do
     try {
         const pending = await h.status();
         assert.equal(pending.contextTokensSource, "estimate");
+        const savesBeforeTerminal = h.saves();
         await h.terminal();
         assert.equal(h.upstreamEnded(), false);
         const terminal = await h.status();
@@ -133,7 +141,9 @@ test("HTTP Responses terminal usage is observable before upstream EOF without do
         assert.equal(typeof terminal.contextTokensAt, "number");
         assert.equal((await h.status()).contextGeneration, terminal.contextGeneration);
         assert.deepEqual([terminal.inputTokens, terminal.cachedTokens, h.session.stats.outputTokens], [0, 0, 0], "observation does not book the request before its final usage settles");
+        assert.equal(h.saves(), savesBeforeTerminal, "the terminal observation does not schedule a separate save");
         await h.finish();
+        assert.ok(h.saves() > savesBeforeTerminal, "stream settlement schedules the save");
         const final = await h.status();
         assert.equal(final.contextTokensSource, "usage");
         assert.equal(final.contextTokens, 8971);

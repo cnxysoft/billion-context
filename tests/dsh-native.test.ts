@@ -14,6 +14,51 @@ import { once } from "node:events";
 import { startServer } from "../src/server.ts";
 import { defaultConfig } from "acp-kernel";
 
+for (const support of [true, false]) {
+    test(`DSH only retouches a moved cache mark if capability is advertised (${String(support)})`, async () => {
+        const proxy = await startMockProxy([], undefined, undefined, undefined, support ? "retouch" : true);
+        const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-retouch-"));
+        try {
+            await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin, XDG_STATE_HOME: home, BILI_PROVIDER_REWRITES: undefined, BILI_NATIVE_DSH: undefined, BILLION_CONTEXT_PLUGIN: undefined }, async () => {
+                _resetRegisterForTest(proxy.origin);
+                __resetIncrementalClientForTests();
+                const ctx = mockCtx();
+                ctx.setInitiator({ session: { id: "dsh-marked-text" } });
+                apply(ctx);
+                await waitFor(() => ctx.registeredTools.length === 1, "manifest tool registration");
+                await _stateToolsReadyForTest();
+                const beforeSend = _stateBeforeSendForTest();
+                const onResponse = _stateOnResponseForTest();
+                assert.ok(beforeSend && onResponse);
+                const url = `${proxy.origin}/v1/messages`;
+                const wire = { model: "claude-test", max_tokens: 64 };
+                const first = { role: "user", content: "first" };
+                const seed: RequestInit = { method: "POST", body: JSON.stringify({ ...wire, messages: [{ ...first, content: [{ type: "text", text: "first", cache_control: { type: "ephemeral" } }] }] }) };
+                await beforeSend(url, seed);
+                const turnId = new Headers(seed.headers).get("x-bili-turn-id");
+                assert.ok(turnId);
+                onResponse(url, new Response("{}", { headers: { "x-bili-applied-seq": "1" } }), { "x-bili-turn-id": turnId });
+                const delta = [{ role: "assistant", content: "answer" }, { role: "user", content: "next" }];
+                const original = JSON.stringify({ ...wire, messages: [first, ...delta] });
+                const init: RequestInit = { method: "POST", body: original };
+                await beforeSend(url, init);
+                if (support) {
+                    assert.equal(new Headers(init.headers).get("x-bili-plugin-turn"), "1");
+                    const body = JSON.parse(init.body as string) as { sinceSeq: number; messages: unknown[]; retouch: unknown[] };
+                    assert.equal(body.sinceSeq, 1);
+                    assert.deepEqual(body.messages, delta);
+                    assert.deepEqual(body.retouch, [{ index: 0, message: first }]);
+                } else {
+                    assert.equal(new Headers(init.headers).get("x-bili-plugin-turn"), null);
+                    assert.equal(init.body, original);
+                }
+            });
+        } finally {
+            proxy.close();
+        }
+    });
+}
+
 // #3370: the incremental-turn conversion must stamp the marker header on the
 // SAME init as the body swap (atomic, omp pattern) — the old arms-a-flag /
 // consume-in-headersFor split raced concurrent sessions across the awaited
@@ -485,7 +530,7 @@ type NameCall = { conversationId: string; name: string };
 
 type MockAttributionCall = { agent: string; state: string; refusals: number; since: number; error?: string; endpoint?: string };
 
-function mockBiliHandler(toolCalls: Array<{ conversationId: string; tool: string; args: unknown; nativeCaller?: boolean }>, statusResponder?: (url: string) => unknown | undefined, nameCalls?: NameCall[], nameStatus?: number, turnEnabled?: boolean, attributionCalls?: MockAttributionCall[], holdManifest?: () => Promise<void> | void): (req: http.IncomingMessage, res: http.ServerResponse) => void {
+function mockBiliHandler(toolCalls: Array<{ conversationId: string; tool: string; args: unknown; nativeCaller?: boolean }>, statusResponder?: (url: string) => unknown | undefined, nameCalls?: NameCall[], nameStatus?: number, turnEnabled?: boolean | "retouch", attributionCalls?: MockAttributionCall[], holdManifest?: () => Promise<void> | void): (req: http.IncomingMessage, res: http.ServerResponse) => void {
     const manifestTools: MockTool[] = [
         {
             name: "compress",
@@ -539,7 +584,7 @@ function mockBiliHandler(toolCalls: Array<{ conversationId: string; tool: string
             // #3370: the incremental-turn feature probe (GET) — mocked so
             // suites can drive the conversion seams without a real lane.
             res.writeHead(200, { "content-type": "application/json" });
-            res.end(JSON.stringify({ enabled: turnEnabled === true }));
+            res.end(JSON.stringify({ enabled: turnEnabled === true || turnEnabled === "retouch", cacheControlRetouch: turnEnabled === "retouch" }));
             return;
         }
         if (url.startsWith("/__bili/plugin/status")) {
@@ -580,7 +625,7 @@ function mockBiliHandler(toolCalls: Array<{ conversationId: string; tool: string
     };
 }
 
-function startMockProxy(toolCalls: Array<{ conversationId: string; tool: string; args: unknown; nativeCaller?: boolean }>, statusResponder?: (url: string) => unknown | undefined, nameCalls?: NameCall[], nameStatus?: number, turnEnabled?: boolean, attributionCalls?: MockAttributionCall[], holdManifest?: () => Promise<void> | void): Promise<{ origin: string; close: () => void }> {
+function startMockProxy(toolCalls: Array<{ conversationId: string; tool: string; args: unknown; nativeCaller?: boolean }>, statusResponder?: (url: string) => unknown | undefined, nameCalls?: NameCall[], nameStatus?: number, turnEnabled?: boolean | "retouch", attributionCalls?: MockAttributionCall[], holdManifest?: () => Promise<void> | void): Promise<{ origin: string; close: () => void }> {
     const server = http.createServer(mockBiliHandler(toolCalls, statusResponder, nameCalls, nameStatus, turnEnabled, attributionCalls, holdManifest));
     return new Promise((resolve) => {
         server.listen(0, "127.0.0.1", () => {

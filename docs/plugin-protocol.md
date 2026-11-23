@@ -226,8 +226,10 @@ or unadvertised server must receive the original full request when marks move.
 A delta can include `retouch: [{ index, message }]`, where `index` is the
 zero-based ordinal in the acknowledged **wire** history and `message` is that
 complete Anthropic wire message with its current block-level `cache_control`.
-Only those decorations may differ. Tool arguments, thinking signatures and
-opaque media bytes must remain identical. The server validates every update
+Only those decorations may differ. DSH can also send an unmarked user string
+in place of the single text block it used to carry the mark. The underlying
+text must be identical. Tool arguments, thinking signatures and opaque media
+bytes must remain identical. The server validates every update
 before applying either the delta or its marks. A changed payload, unknown span,
 or cold canonical returns 409; the client recovers with its existing full-resync
 path. Retouches do not append messages or advance the acknowledgement sequence.

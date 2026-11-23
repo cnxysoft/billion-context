@@ -2547,6 +2547,24 @@ export class SessionStore {
         }
     }
 
+    unifiedRecoveredMessageContent(sessionId: string, msgId: string, contentHash: string, identity: string): string | null {
+        if (!this.enabled) return null;
+        try {
+            return this.shadow?.recoveredMessageContent(sessionId, msgId, contentHash, identity) ?? null;
+        } catch {
+            return null;
+        }
+    }
+
+    unifiedUniqueLiveMessageContent(sessionId: string, msgId: string): string | null {
+        if (!this.enabled) return null;
+        try {
+            return this.shadow?.uniqueLiveMessageContent(sessionId, msgId) ?? null;
+        } catch {
+            return null;
+        }
+    }
+
     /** #D5-5 render windowing: identity-only rows (seq + msg_id). Null when
      *  the unified store is unavailable — the render lane degrades, never
      *  guesses. */

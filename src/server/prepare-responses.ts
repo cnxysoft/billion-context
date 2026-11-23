@@ -1,6 +1,7 @@
 import http from "node:http";
 import type { AbsorbConfig, CompressionCore, Config, CoreMessage, NudgeDecision, PackSurface, Prompts } from "acp-kernel";
 import { defaultCountTokens, buildBlockOpsSystemPrompt, renderNudgeText, viableRanges } from "acp-kernel";
+import { collectIncomingImageCandidates, type IncomingImageCandidate } from "../image-restore.js";
 import { recordNudgeInject } from "../cache-ledger.js";
 import { injectResponsesDeveloperMessage, type BiliMessage, type ResponseInputItem, type ResponsesProjection, type ResponsesRequestBody } from "acp-kernel/wire";
 import type { CompressReasoningConfig } from "../reasoning-drop.js";
@@ -69,6 +70,7 @@ export async function prepareResponses(
     visibilityMarkers: boolean,
     billingUpstream?: string,
     decide?: DecideConfig,
+    onIncomingImages?: (images: IncomingImageCandidate[]) => void,
 ): Promise<Prepared> {
     const sessionId = session.id;
     const inboundMessageCount = Array.isArray(parsed.input) ? parsed.input.length : 1;
@@ -217,6 +219,7 @@ export async function prepareResponses(
         // client, not just plugin/codex; the head prefix still hoists into
         // systemParts for strict single-system upstreams (#377).
         const projection = responsesToCore(parsed);
+        if (onIncomingImages) onIncomingImages(collectIncomingImageCandidates(projection.msgs));
         if (checkpoint && checkpoint !== session.metadata.codexNativeCompactionKey) {
             const covered = coveredRealHistoryIds(session.state.blocks);
             const gap = foldCoverage(covered, projection.msgs.map(message => message.id));

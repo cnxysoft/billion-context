@@ -29,7 +29,7 @@ import type { CoreMessage, CompressionBlock } from "../../kernel/src/types.js";
 import type { BlockView } from "../session.js";
 import { refToIndex } from "../../kernel/src/refs.js";
 import { sha256Hex, type BlockRow, type CcrEntryRow, type IngestSessionInput, type MessageRow, type RefRow, type SessionRow } from "./store.js";
-import { splitMediaContent, identityOfStoredContent } from "./identity.js";
+import { describeMessageContent, splitMediaContent } from "./identity.js";
 
 /**
  * Field order of the hydration merge output — DERIVED from mergeState itself
@@ -203,15 +203,14 @@ export interface HandoffReplyStashRow {
 export function planStoredMessageRow(m: CoreMessage): HandoffReplyStashRow {
     const raw = serializeForStore(m);
     ingestSerializations.count++;
-    const parsed = JSON.parse(raw) as { role?: unknown; contentType?: unknown };
-    const split = splitMediaContent(raw);
+    const split = describeMessageContent(raw);
     return {
         msgId: m.id,
         content: split.content,
         hash: split.hash,
-        identity: identityOfStoredContent(split.content),
-        role: typeof parsed.role === "string" ? parsed.role : "assistant",
-        kind: typeof parsed.contentType === "string" ? parsed.contentType : "message",
+        identity: split.identity,
+        role: typeof split.role === "string" ? split.role : "assistant",
+        kind: typeof split.contentType === "string" ? split.contentType : "message",
         ...(split.media.length > 0 ? { media: split.media } : {}),
         ...(typeof m.ts === "number" ? { ts: m.ts } : {}),
     };
@@ -233,19 +232,17 @@ export function planIngest(session: LegacySessionLike): IngestPlan {
     const intern = (m: CoreMessage): number => {
         const raw = serializeForStore(m);
         ingestSerializations.count++;
-        const parsed = JSON.parse(raw) as { role: string; contentType?: string };
-        const split = splitMediaContent(raw);
-        const entry = { msgId: m.id, content: split.content, hash: split.hash, role: parsed.role, kind: parsed.contentType ?? "message", media: split.media };
+        const entry = describeMessageContent(raw);
         // #4390: the cross-save JOIN key is the POSITION-INDEPENDENT identity
         // (stored-bytes serialization minus id/wireIndex). content_hash stays
         // the byte-faithful CAS key; only the join moves to identity.
-        const identity = identityOfStoredContent(entry.content);
+        const { identity } = entry;
         const key = `${m.id}\u0000${identity}`;
         const existing = seqByIdentity.get(key);
         if (existing !== undefined) return existing;
         const seq = log.length;
         seqByIdentity.set(key, seq);
-        log.push({ seq, msgId: m.id, content: entry.content, hash: entry.hash, identity, role: entry.role, kind: entry.kind, ref: byRawRef[m.id] ?? null, ...(entry.media.length > 0 ? { media: entry.media } : {}), ...(typeof m.ts === "number" ? { ts: m.ts } : {}) });
+        log.push({ seq, msgId: m.id, content: entry.content, hash: entry.hash, identity, role: entry.role, kind: entry.contentType ?? "message", ref: byRawRef[m.id] ?? null, ...(entry.media.length > 0 ? { media: entry.media } : {}), ...(typeof m.ts === "number" ? { ts: m.ts } : {}) });
         return seq;
     };
     // #3301: import payload first — its rows must sit below the snapshot/tail
@@ -367,8 +364,7 @@ export function planIngestDelta(
         const m = tail[i];
         const raw = serializeForStore(m);
         ingestSerializations.count++;
-        const parsed = JSON.parse(raw) as { role: string; contentType?: string };
-        const split = splitMediaContent(raw);
+        const split = describeMessageContent(raw);
         // Placeholder seqs under the aligned assumption (no rows above the
         // watermark); ingestSession renumbers from max(seq)+1 inside the
         // transaction when a fold left rows above the trusted tip.
@@ -379,9 +375,9 @@ export function planIngestDelta(
             msgId: m.id,
             content: split.content,
             hash: split.hash,
-            identity: identityOfStoredContent(split.content),
-            role: parsed.role,
-            kind: parsed.contentType ?? "message",
+            identity: split.identity,
+            role: split.role,
+            kind: split.contentType ?? "message",
             ref: byRawRef[m.id] ?? null,
             ...(split.media.length > 0 ? { media: split.media } : {}),
             ...(typeof m.ts === "number" ? { ts: m.ts } : {}),
@@ -442,8 +438,9 @@ function finishPlan(
     const seqById = new Map<string, number>();
     for (const e of log) if (!seqById.has(e.msgId)) seqById.set(e.msgId, e.seq);
 
+    const blockContents = completeBlockContents(session.blockContents, session.state.blocks);
     const blocks: BlockRow[] = session.state.blocks.map((b, ord) => {
-        const views = completeBlockContents(session.blockContents, session.state.blocks).get(b.blockId);
+        const views = blockContents.get(b.blockId);
         const full = views?.full ?? { text: b.summary, count: 0 };
         const one = views?.one ?? null;
         const summaryJson = JSON.stringify(full);

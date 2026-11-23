@@ -294,15 +294,41 @@ export function buildIncomingImageIndex(
         return index;
     }
     const msgs = coreMsgsOf(result);
-    if (!msgs) return index;
-    for (const m of msgs) {
-        const ref = m.id ? byRaw[m.id] : undefined;
+    return msgs ? indexImageCandidates(collectIncomingImageCandidates(msgs, byRaw), state, sessionId) : index;
+}
+
+export interface IncomingImageCandidate {
+    rawId: string;
+    images: RestorableImage[];
+}
+
+export function collectIncomingImageCandidates(
+    messages: readonly CoreMessage[],
+    byRaw?: CompressionState["messageRefs"]["byRaw"],
+): IncomingImageCandidate[] {
+    const candidates: IncomingImageCandidate[] = [];
+    for (const message of messages) {
+        if (!message.id || (byRaw && !byRaw[message.id])) continue;
+        const images = messageImageBytes(message);
+        if (images.length > 0) candidates.push({ rawId: message.id, images });
+    }
+    return candidates;
+}
+
+function indexImageCandidates(
+    candidates: readonly IncomingImageCandidate[],
+    state: CompressionState,
+    sessionId: string,
+): Map<string, IndexedImage[]> {
+    const index = new Map<string, IndexedImage[]>();
+    const byRaw = state?.messageRefs?.byRaw;
+    if (!byRaw) return index;
+    for (const { rawId, images } of candidates) {
+        const ref = byRaw[rawId];
         if (!ref) continue;
-        const imgs = messageImageBytes(m);
-        if (imgs.length === 0) continue;
         const arr = index.get(ref) ?? [];
         if (!index.has(ref)) index.set(ref, arr);
-        imgs.forEach((im, i) => {
+        images.forEach((im, i) => {
             // #1995 review: spill at index-time so the session retains only
             // metadata + path (never base64). Skip-if-exists keeps the steady
             // state to one stat per image per turn, not a full decode + write.
@@ -323,19 +349,20 @@ export function buildIncomingImageIndex(
 /** #2607: post-prepare refresh of the incoming-image index. prepare assigns
  *  numeric refs to this turn's NEW messages — and archivable media now folds by
  *  default — so their pixels must be archived BEFORE preflight or the model can
- *  fold them away unrecoverably. Re-indexes the same raw body against the
- *  post-prepare state and MERGES into the existing index (union by on-disk
- *  path): the entry-time pass already spilled files, and merging guards against
- *  any future ref pruning inside prepare. writeRestoredImage's skip-if-exists
- *  keeps the second pass to one stat per known image. */
+ *  fold them away unrecoverably. Use the prepare projection's image candidates
+ *  when available and otherwise re-index the raw body. Resolve refs from the
+ *  post-prepare state and merge by path to retain the entry-time spills. */
 export function refreshIncomingImageIndex(
     parsed: unknown,
     protocol: WireProtocol,
     state: CompressionState,
     sessionId: string,
     existing: Map<string, IndexedImage[]> | undefined,
+    candidates?: readonly IncomingImageCandidate[],
 ): Map<string, IndexedImage[]> {
-    const fresh = buildIncomingImageIndex(parsed, protocol, state, sessionId);
+    const fresh = candidates === undefined
+        ? buildIncomingImageIndex(parsed, protocol, state, sessionId)
+        : indexImageCandidates(candidates, state, sessionId);
     if (fresh.size === 0) return existing ?? new Map();
     const merged = existing ? new Map(existing) : new Map<string, IndexedImage[]>();
     const seen = new Set<string>();

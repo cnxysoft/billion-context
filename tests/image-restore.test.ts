@@ -1,12 +1,17 @@
 import test from "node:test";
+import { identityOfStoredContent } from "../src/storage/identity.ts";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
+import { DatabaseSync } from "node:sqlite";
 import { existsSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { anthropicToCore, googleToCore, openaiToCore, responsesToCore } from "acp-kernel/wire";
+import { anthropicToCore, googleToCore, openaiToCore, responsesToCore, type ResponsesRequestBody } from "acp-kernel/wire";
 import { createInitialState } from "acp-kernel";
 import {
     buildIncomingImageIndex,
+    collectIncomingImageCandidates,
+    refreshIncomingImageIndex,
     describeRestorable,
     messageImageBytes,
     writeRestoredImage,
@@ -14,8 +19,10 @@ import {
     type RestorableImage,
 } from "../src/image-restore.ts";
 import { resolveDecompress, type ProxyToolCtx } from "../src/decompress-shared.ts";
+import { responsesToCoreWithToolImages } from "../src/responses-tool-output.ts";
 import { imagePlaceholdersForSummary } from "../src/image-note.ts";
 import type { WireProtocol } from "../src/util.js";
+import { SessionStore, _resetStoreForTest, _setStoreForTest } from "../src/persist.ts";
 
 // Isolate stateDir() (hence restoreExportDir()) under a throwaway dir before any
 // write. node --test gives each file its own process, so the env mutation is safe.
@@ -61,9 +68,7 @@ function buildIndex(proto: WireProtocol, body: unknown, excludeImaged = false, s
     return buildIncomingImageIndex(body, proto, state, sessionId);
 }
 function ctxWith(index: Map<string, IndexedImage[]> | undefined): ProxyToolCtx {
-    // Only the imageRef branch of resolveDecompress is exercised here; it touches
-    // nothing but session.incomingImageIndex and log, so a minimal ctx suffices.
-    return { session: { incomingImageIndex: index }, log: () => undefined } as unknown as ProxyToolCtx;
+    return { session: { incomingImageIndex: index, state: createInitialState(), metadata: {} }, log: () => undefined } as unknown as ProxyToolCtx;
 }
 
 test("messageImageBytes: extracts base64 across all four wire sidecars", () => {
@@ -219,7 +224,7 @@ test("resolveDecompress({ imageRef }): lists, restores to file, and reports miss
     const p = writeRestoredImage("m00042", 0, pngImg, "sess-A")!;
     const idx = new Map<string, IndexedImage[]>([["m00042", [{ mediaType: "image/png", bytes: Buffer.byteLength(PNG, "base64"), width: 1, height: 1, path: p }]]]);
     const list = resolveDecompress({ imageRef: "list" }, ctxWith(idx)).text;
-    assert.match(list, /\[Restorable images \(1\):\]/);
+    assert.match(list, /\[Images indexed in this request \(1\):\]/);
     assert.match(list, /m00042/);
 
     const restored = resolveDecompress({ imageRef: "m00042" }, ctxWith(idx)).text;
@@ -403,4 +408,109 @@ test("Responses unsplit carriers keep all images, including tool-result carriers
         assert.equal(index.size, 1, label);
         assert.deepEqual([...index.values()][0].map(image => readFileSync(image.path).toString("base64")), [RED_PNG, BLUE_PNG], label);
     }
+});
+
+
+test("Responses post-prepare image candidates retain new refs, duplicate images, and tool output bytes", () => {
+    const red = { type: "input_image" as const, image_url: `data:image/png;base64,${RED_PNG}` };
+    const blue = { type: "input_image" as const, image_url: `data:image/png;base64,${BLUE_PNG}` };
+    const body: ResponsesRequestBody = {
+        model: "test-model",
+        input: [
+            { type: "message", role: "user", content: [red, red, blue] },
+            { type: "function_call", call_id: "c1", name: "image_tool", arguments: "{}" },
+            { type: "function_call_output", call_id: "c1", output: [{ type: "input_text", text: "two images" }, blue, red] },
+        ],
+    };
+    const state = createInitialState();
+    const projected = responsesToCoreWithToolImages(body).msgs;
+    const candidates = collectIncomingImageCandidates(projected);
+    assert.equal(candidates.length, 4);
+    state.messageRefs.byRaw[candidates[0].rawId] = "m00001";
+    const existing = buildIncomingImageIndex(body, "responses", state, "reuse-coverage");
+    assert.equal(existing.size, 1);
+    candidates.forEach((entry, i) => { state.messageRefs.byRaw[entry.rawId] = `m0000${i + 1}`; });
+    const fallback = refreshIncomingImageIndex(body, "responses", state, "reuse-coverage", existing);
+    const reused = refreshIncomingImageIndex(undefined, "responses", state, "reuse-coverage", existing, candidates);
+    assert.equal(reused.size, 4);
+    assert.deepEqual(reused, fallback);
+    assert.deepEqual(reused.get("m00004")?.map(image => readFileSync(image.path).toString("base64")), [BLUE_PNG, RED_PNG]);
+    assert.deepEqual(refreshIncomingImageIndex(body, "responses", state, "reuse-coverage", existing, []), existing);
+});
+
+
+test("imageRef storage fallback uses the current ref and one complete live message within the session", (t) => {
+    const dir = mkdtempSync(join(tmpdir(), "bili-img-restore-store-"));
+    const oldConfig = process.env.BILI_CONFIG_FILE;
+    const oldStorage = process.env.BILI_STORAGE_UNIFIED;
+    process.env.BILI_CONFIG_FILE = join(dir, "unused.json");
+    process.env.BILI_STORAGE_UNIFIED = "full";
+    t.after(() => {
+        _resetStoreForTest();
+        if (oldConfig === undefined) delete process.env.BILI_CONFIG_FILE;
+        else process.env.BILI_CONFIG_FILE = oldConfig;
+        if (oldStorage === undefined) delete process.env.BILI_STORAGE_UNIFIED;
+        else process.env.BILI_STORAGE_UNIFIED = oldStorage;
+    });
+    const store = new SessionStore({ dir, enabled: true });
+    _setStoreForTest(store);
+    assert.equal(store.unifiedReads(), true);
+    const db = new DatabaseSync(join(dir, "index.db"));
+    t.after(() => db.close());
+    const ref = "m00042";
+    const id = "host-01";
+    const sessionId = "restore-store";
+    const ctx = ctxWith(undefined);
+    ctx.session.id = sessionId;
+    const refs = ctx.session.state.messageRefs;
+    refs.byRef[ref] = id;
+    refs.byRaw[id] = ref;
+    let seq = 0;
+    function putContent(bytes: string): string {
+        const hash = createHash("sha256").update(bytes).digest("hex");
+        db.prepare("INSERT OR IGNORE INTO content (hash, byte_len, bytes) VALUES (?, ?, ?)")
+            .run(hash, Buffer.byteLength(bytes), Buffer.from(bytes));
+        return hash;
+    }
+    function putMessage(sid: string, body: object, retiredAt: number | null = null): string {
+        const contentHash = putContent(JSON.stringify({ id, ...body }));
+        db.prepare(`INSERT INTO messages (session_id, seq, msg_id, ref, role, content_hash, retired_at)
+                    VALUES (?, ?, ?, 'm00001', 'tool', ?, ?)`)
+            .run(sid, ++seq, id, contentHash, retiredAt);
+        return contentHash;
+    }
+    const alias = "m00088";
+    const restore = (imageRef = ref) => resolveDecompress({ imageRef }, ctx);
+    putMessage("foreign-session", { imageBase64: PNG, imageMediaType: "image/png" });
+    putMessage(sessionId, { imageBase64: PNG, imageMediaType: "image/png", retired: true }, 1);
+    assert.equal(restore().outcome, "failure");
+    const red = putContent(RED_PNG);
+    const blue = createHash("sha256").update(BLUE_PNG).digest("hex");
+    const contentHash = putMessage(sessionId, { rawResponsesItem: {
+        type: "function_call_output", output: [red, blue].map((hash) => ({
+            type: "input_image", image_url: `data:image/png;base64,{$media:${hash}}`,
+        })),
+    } });
+    const stored = db.prepare("SELECT bytes FROM content WHERE hash = ?").get(contentHash);
+    assert.ok(stored?.bytes instanceof Uint8Array);
+    const identity = identityOfStoredContent(Buffer.from(stored.bytes).toString("utf8"));
+    ctx.session.metadata.recoveredMessageRefAliases = { [alias]: { rawId: id, contentHash, identity } };
+    assert.equal(restore().outcome, "failure", "missing media must not return an incomplete set");
+    assert.equal(restore(alias).outcome, "failure");
+    putContent(BLUE_PNG);
+    const result = restore();
+    assert.match(result.text, /Restored 2 image\(s\)/);
+    const paths = result.text.split("\n").filter((line) => line.startsWith("  ")).map((line) => line.trim());
+    assert.deepEqual(paths.map((path) => readFileSync(path, "base64")), [RED_PNG, BLUE_PNG]);
+    assert.match(restore(alias).text, /Restored 2 image\(s\)/);
+    assert.equal(refs.byRef[alias], undefined);
+    assert.equal(resolveDecompress({ imageRef: "m00001" }, ctx).outcome, "failure", "stored row ref may be stale");
+    putMessage(sessionId, { imageBase64: PNG, imageMediaType: "image/png" });
+    assert.equal(restore().outcome, "failure", "two live rows are ambiguous");
+    db.prepare("UPDATE messages SET retired_at = 2 WHERE session_id = ? AND content_hash = ?").run(sessionId, contentHash);
+    const recovered = restore(alias);
+    assert.match(recovered.text, /Restored 2 image\(s\)/);
+    const recoveredPaths = recovered.text.split("\n").filter((line) => line.startsWith("  ")).map((line) => line.trim());
+    assert.deepEqual(recoveredPaths.map((path) => readFileSync(path, "base64")), [RED_PNG, BLUE_PNG]);
+    assert.match(resolveDecompress({ imageRef: "list" }, ctx).text, /in this request's index/);
 });

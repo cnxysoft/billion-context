@@ -83,18 +83,15 @@ export function splitMediaContent(content: string): { content: string; hash: str
  *  late (#4316 PR2/3 stamps the in-memory canonical during the wrap-up),
  *  not logical content — keeping it would re-mint the row identity on
  *  every turn and re-append the whole view as fresh rows. */
-function identityInputOf(raw: string): string {
-    let parsed: { id?: unknown; wireIndex?: unknown; ledgerSeq?: unknown } | null;
-    try {
-        parsed = JSON.parse(raw) as { id?: unknown; wireIndex?: unknown; ledgerSeq?: unknown } | null;
-    } catch {
-        return raw;
-    }
+type PositionFields = { id?: unknown; wireIndex?: unknown; ledgerSeq?: unknown };
+
+function identityInputOf(raw: string, parsed: unknown): string {
     if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return raw;
-    if (parsed.id === undefined && parsed.wireIndex === undefined && parsed.ledgerSeq === undefined) return raw;
-    delete parsed.id;
-    delete parsed.wireIndex;
-    delete parsed.ledgerSeq;
+    const fields = parsed as PositionFields;
+    if (fields.id === undefined && fields.wireIndex === undefined && fields.ledgerSeq === undefined) return raw;
+    delete fields.id;
+    delete fields.wireIndex;
+    delete fields.ledgerSeq;
     return JSON.stringify(parsed);
 }
 
@@ -104,5 +101,21 @@ function identityInputOf(raw: string): string {
  *  the same message — the migration backfill and the direct-caller
  *  fallbacks in store.ts rely on that equivalence. */
 export function identityOfStoredContent(content: string): string {
-    return sha256Hex(identityInputOf(content));
+    let parsed: unknown;
+    try {
+        parsed = JSON.parse(content);
+    } catch {
+        return sha256Hex(content);
+    }
+    return sha256Hex(identityInputOf(content, parsed));
+}
+
+export function describeMessageContent(raw: string) {
+    const parsed = JSON.parse(raw) as { role: string; contentType?: string };
+    const { role, contentType } = parsed;
+    const split = splitMediaContent(raw);
+    const identity = split.content === raw
+        ? sha256Hex(identityInputOf(raw, parsed))
+        : identityOfStoredContent(split.content);
+    return { ...split, role, contentType, identity };
 }

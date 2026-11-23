@@ -137,7 +137,7 @@ function messageBreakpoints(body: Record<string, unknown>): number {
 const CONV = "ses_rolling_marks";
 const laneHeaders = { "x-bili-plugin": "opencode", "x-bili-plugin-conversation": CONV, "x-acp-session": CONV };
 
-async function runIncremental(h: H, requests: Wire[][], opts: { restartBefore?: number } = {}) {
+async function runIncremental(h: H, requests: IncrementalWireMessage[][], opts: { restartBefore?: number } = {}) {
     const modes: string[] = [];
     const sizes: { full: number; sent: number }[] = [];
     for (const [i, messages] of requests.entries()) {
@@ -161,7 +161,7 @@ async function runIncremental(h: H, requests: Wire[][], opts: { restartBefore?: 
     return { modes, sizes };
 }
 
-async function runFullResend(h: H, requests: Wire[][]) {
+async function runFullResend(h: H, requests: IncrementalWireMessage[][]) {
     for (const messages of requests) {
         const r = await h.post("/v1/messages", JSON.stringify({ model: "claude-test", max_tokens: 1024, system: SYSTEM, messages }), laneHeaders);
         assert.equal(r.status, 200);
@@ -187,6 +187,29 @@ test("rolling cache_control: deltas after the seed, upstream bodies identical to
         }
         const last = sizes[sizes.length - 1];
         assert.ok(last.sent * 3 < last.full, `delta (${last.sent} B) is a fraction of the full body (${last.full} B)`);
+    } finally {
+        await inc.close();
+    }
+});
+
+test("DSH user strings regain their original shape when a rolling mark moves", async () => {
+    const first = { role: "user", content: "first" };
+    const next = { role: "user", content: "next" };
+    const mark = (m: typeof first) => ({ ...m, content: [{ type: "text", text: m.content, cache_control: MARK }] });
+    const reply = { role: "assistant", content: "reply" };
+    const requests = [[mark(first)], [first, reply, mark(next)], [first, reply, { ...next, content: "edited" }, reply, mark(first)]];
+    const base = await harness();
+    try {
+        await runFullResend(base, requests);
+    } finally {
+        await base.close();
+    }
+    const inc = await harness();
+    try {
+        const { modes } = await runIncremental(inc, requests);
+        assert.deepEqual(modes, ["seed", "delta", "resync"]);
+        assert.equal(canonMessages(inc.forwarded[1].messages), canonMessages(base.forwarded[1].messages));
+        assert.equal(messageBreakpoints(inc.forwarded[1]), 1);
     } finally {
         await inc.close();
     }

@@ -1,5 +1,5 @@
 import { defaultCountTokens, orderedRefPair, type CompressionBlock } from "acp-kernel";
-import { listSessions, displayContextBest, type ContextBest, type Session, type BlockContent } from "../session.js";
+import { listSessions, displayContextBest, recoveredMessageRef, type ContextBest, type Session, type BlockContent } from "../session.js";
 import { conflictClientOf, conflictEventsOf } from "../conflict-watch.js";
 import { isDisplayOnlyConflictDetail, isSiblingConflictDetail } from "../thirdparty-scan.js";
 import { fileNameMatchesId, getStore, isValidRecord, _resetStoreForTest, relPathFor } from "../persist.js";
@@ -1953,6 +1953,33 @@ export type MessageContentLookup =
 export async function buildMessageContent(id: string, ref: string): Promise<MessageContentLookup> {
     const session = await sessionForContent(id);
     if (!session) return { ok: false, reason: "unknown-session" };
+    const recovered = recoveredMessageRef(session, ref);
+    if (recovered !== undefined) {
+        const stored = getStore().unifiedRecoveredMessageContent(id, recovered.rawId, recovered.contentHash, recovered.identity);
+        if (stored !== null) {
+            let message: { id?: unknown; role?: unknown; text?: unknown } | null;
+            try {
+                message = JSON.parse(stored) as typeof message;
+            } catch {
+                return { ok: false, reason: "unknown-message" };
+            }
+            if (message?.id === recovered.rawId && typeof message.role === "string") {
+                const text = typeof message.text === "string" ? message.text : "";
+                const totalBytes = utf8Bytes(text);
+                const truncated = totalBytes > BLOCK_CONTENT_MAX_BYTES;
+                return {
+                    ok: true,
+                    ref,
+                    role: message.role,
+                    bytes: truncated ? BLOCK_CONTENT_MAX_BYTES : totalBytes,
+                    totalBytes,
+                    truncated,
+                    text: truncated ? sliceUtf8(text, BLOCK_CONTENT_MAX_BYTES) : text,
+                };
+            }
+        }
+        return { ok: false, reason: "unknown-message" };
+    }
     const raw = session.state.messageRefs.byRef[ref];
     const msg = typeof raw === "string" ? (session.lastMessages || []).find((m) => m.id === raw) : undefined;
     if (!msg) {

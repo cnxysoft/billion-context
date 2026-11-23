@@ -280,6 +280,7 @@ export function installRuntimePresetCoverage(ctx: CompactionDisableHost): void {
 }
 
 export type CompactionDisableHost = {
+    inject?: (services: string[], callback: (ctx: CompactionDisableHost) => void) => unknown;
     on?: (event: string, listener: (raw: unknown, next: () => unknown) => unknown, options?: { global?: boolean }) => void;
     reflect?: { provide?: (name: string, value: unknown) => void } | undefined;
     // #7190: dsh's preset registry (service 'agentPresets') — present only on
@@ -324,12 +325,9 @@ export function registerCompactionDisable(ctx: CompactionDisableHost): void {
     }
     // Publish only after the middleware is registered; the host owns both lifetimes.
     ctx.reflect?.provide?.(BILI_COMPACTION_DISABLE_SERVICE, Object.freeze({ owner: "billion-context", issue: "#3354" }));
-    // #7190: the register() wrap covers the one row population no config layer
-    // can reach — runtime preset definitions. Bundles apply in composition
-    // order (this entry is inserted before profile plugins), so the wrap is in
-    // place before a plugin's register() runs; the verdict is honored per call,
-    // and the wrap is idempotent across re-apply.
-    installRuntimePresetCoverage(ctx);
+    // Wait for the optional preset registry in a child so the gate can activate without it.
+    if (typeof ctx.inject === "function") ctx.inject(["agentPresets"], installRuntimePresetCoverage);
+    else installRuntimePresetCoverage(ctx);
 }
 
 type CompactionOverlayGap = "no-config-hook" | "no-service-provide";

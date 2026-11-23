@@ -37,6 +37,7 @@ import type { BlockView } from "../session.js";
 import { effectiveJsonWriterOff, resolveStorageMode, resolveStorageWalJournalSizeLimit, unifiedSelectionIsSqlite, type StorageMode } from "../knobs.ts";
 import { UnifiedStore, StorageIntegrityError, type CheckpointRow, type SessionSummaryRow, type WebSummaryRow } from "./store.ts";
 import path from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import { resolveBackendName, backendSelectionNotice, selectedBackendRaw, openBackend, type StorageBackend } from "./backend.ts";
 import { canonicalDigest, canonicalize, sha256 } from "./canonical.ts";
 import { sqliteCorruptionDetail } from "./sqlite-errors.ts";
@@ -1190,6 +1191,16 @@ export class UnifiedShadow {
         return this.sync.messageContentByMsgIds(sessionId, msgIds);
     }
 
+    recoveredMessageContent(sessionId: string, msgId: string, contentHash: string, identity: string): string | null {
+        if (!this.readsUnified || this.stats.disabled) return null;
+        return this.sync?.recoveredMessageContent(sessionId, msgId, contentHash, identity) ?? null;
+    }
+
+    uniqueLiveMessageContent(sessionId: string, msgId: string): string | null {
+        if (!this.readsUnified || this.stats.disabled) return null;
+        return this.sync?.uniqueLiveMessageContent(sessionId, msgId) ?? null;
+    }
+
     sessionSummaries(): SessionSummaryRow[] {
         if (this.sync === null) return [];
         return this.sync.sessionSummaries();
@@ -1653,6 +1664,34 @@ function shadowDigest(view: unknown): string {
     return canonicalDigest(view);
 }
 
+type ReadBackHeader = Pick<LegacySessionLike, "metadata"> & { state: Record<string, unknown> };
+
+function matchingReadBackHeader(expect: ReadBackHeader, got: ReadBackHeader): boolean {
+    const liveMetadata = expect.metadata;
+    const storedMetadata = got.metadata;
+    let liveRemainder = liveMetadata;
+    let storedRemainder = storedMetadata;
+    if (liveMetadata && storedMetadata && Object.getPrototypeOf(liveMetadata) === Object.prototype &&
+        Object.getPrototypeOf(storedMetadata) === Object.prototype) {
+        liveRemainder = { ...liveMetadata };
+        storedRemainder = { ...storedMetadata };
+        // The stored values come from JSON, so exact equality also preserves canonical equality.
+        for (const key of Object.keys(storedMetadata)) {
+            if (Object.hasOwn(liveMetadata, key) && isDeepStrictEqual(liveMetadata[key], storedMetadata[key])) {
+                delete liveRemainder[key];
+                delete storedRemainder[key];
+            }
+        }
+    }
+    const equalRefs = isDeepStrictEqual(expect.state.messageRefs, got.state.messageRefs);
+    const remainder = (view: ReadBackHeader, metadata: ReadBackHeader["metadata"]) => ({
+        ...view,
+        metadata,
+        state: equalRefs ? { ...view.state, messageRefs: undefined } : view.state,
+    });
+    return shadowDigest(remainder(expect, liveRemainder)) === shadowDigest(remainder(got, storedRemainder));
+}
+
 interface DriftSlotFingerprint {
     id: string;
     role: string;
@@ -1671,16 +1710,14 @@ interface DriftDiagnostics {
     tailSlot?: { index: number; expect: DriftSlotFingerprint; got: DriftSlotFingerprint; /** #5677: top-level field names whose values disagree (names only). */ fields?: string[] };
 }
 
-/** Compare the replay by component, retaining only message fingerprints across batches. */
+/** Compare the replay by component, reading messages and blocks in batches. */
 class BatchedViewVerification {
     readonly messageSeqs: number[];
     private readonly tail: { tailSeqs: number[] | null; pluginSnapshotSeqs: number[] | null };
     private readonly remainingContents: LegacySessionLike["blockContents"];
     private readonly orphans: LegacySessionLike["blockContents"];
-    // #5677: the parsed row rides along with its signature so the FIRST
-    // divergent slot can be field-diffed without re-reading the store; the
-    // verifier is per-sample and short-lived, so the extra retention is bounded.
-    private readonly messages = new Map<number, { sig: ReturnType<typeof messageSignature>; raw: unknown }>();
+    // Retain parsed rows for exact comparison and first-divergent-slot forensics.
+    private readonly messages = new Map<number, { raw: unknown; sig?: ReturnType<typeof messageSignature> }>();
     private readonly keys = new Set<string>();
     private headerDiag: DriftDiagnostics | null = null;
     private drift = false;
@@ -1704,7 +1741,7 @@ class BatchedViewVerification {
         });
         const expect = withoutBulk(legacy);
         const got = withoutBulk(header);
-        if (shadowDigest(expect) !== shadowDigest(got)) {
+        if (!matchingReadBackHeader(expect, got)) {
             this.drift = true;
             try {
                 const diag = describeViewDivergence(expect, got);
@@ -1722,7 +1759,9 @@ class BatchedViewVerification {
         for (const row of rows) {
             const payload = JSON.parse(row.payloadJson);
             if (payload?.active === true) this.activeBlocks++;
-            if (this.blockCount >= this.legacy.state.blocks.length || shadowDigest(payload) !== shadowDigest(this.legacy.state.blocks[this.blockCount])) this.changed("state");
+            const expected = this.legacy.state.blocks[this.blockCount];
+            if (this.blockCount >= this.legacy.state.blocks.length ||
+                (!isDeepStrictEqual(expected, payload) && shadowDigest(expected) !== shadowDigest(payload))) this.changed("state");
             this.blockCount++;
             this.compareContents(row.blockId, { one: row.one === null ? null : JSON.parse(row.one), full: JSON.parse(row.summary) });
             // A current block wins over an identically named journal entry.
@@ -1733,7 +1772,7 @@ class BatchedViewVerification {
     addMessages(rows: MessageRow[]): void {
         for (const row of rows) {
             const raw = JSON.parse(row.content);
-            this.messages.set(row.seq, { sig: messageSignature(raw), raw });
+            this.messages.set(row.seq, { raw });
         }
     }
 
@@ -1743,7 +1782,9 @@ class BatchedViewVerification {
     }
 
     private compareContents(id: string, view: unknown): void {
-        if (!this.remainingContents.has(id) || shadowDigest(this.remainingContents.get(id)) !== shadowDigest(view)) this.changed("blockContents");
+        const expected = this.remainingContents.get(id);
+        if (!this.remainingContents.has(id) ||
+            (!isDeepStrictEqual(expected, view) && shadowDigest(expected) !== shadowDigest(view))) this.changed("blockContents");
         this.remainingContents.delete(id);
     }
 
@@ -1786,14 +1827,20 @@ class BatchedViewVerification {
                 continue;
             }
             const wantIndex = index - offset;
-            const want = expected !== undefined && wantIndex >= 0 && wantIndex < expected.length ? messageSignature(expected[wantIndex]) : undefined;
-            if (want !== undefined && want.digest !== rec.sig.digest) {
-                this.changed(key);
-                if (key === "lastMessages" && expected && !this.tailSlot) {
-                    const fields = diffFieldNames(expected[wantIndex], rec.raw);
-                    this.tailSlot = fields === undefined
-                        ? { index, expect: want.slot, got: rec.sig.slot }
-                        : { index, expect: want.slot, got: rec.sig.slot, fields };
+            if (expected !== undefined && wantIndex >= 0 && wantIndex < expected.length) {
+                const wantRaw = expected[wantIndex];
+                if (!isDeepStrictEqual(wantRaw, rec.raw)) {
+                    const want = messageSignature(wantRaw);
+                    const got = rec.sig ??= messageSignature(rec.raw);
+                    if (want.digest !== got.digest) {
+                        this.changed(key);
+                        if (key === "lastMessages" && !this.tailSlot) {
+                            const fields = diffFieldNames(wantRaw, rec.raw);
+                            this.tailSlot = fields === undefined
+                                ? { index, expect: want.slot, got: got.slot }
+                                : { index, expect: want.slot, got: got.slot, fields };
+                        }
+                    }
                 }
             }
             index++;

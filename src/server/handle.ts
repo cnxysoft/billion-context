@@ -17,7 +17,7 @@ import { recordClientUa } from "../client-ua-registry.js";
 import { codexAlignedWindow, codexWindowNetsOutputHeadroom } from "../codex-models.js";
 import { DecodedRequestAdmission, DecodedRequestBusyError } from "../request-body-budget.js";
 import { hostIdForLog, maskHeadersForLog, maskUrlForLog, maskUrlsInText } from "../log-mask.js";
-import { bodyMightCarryImages, buildIncomingImageIndex, pruneRetrieveImgExports, refreshIncomingImageIndex, type IndexedImage } from "../image-restore.js";
+import { bodyMightCarryImages, buildIncomingImageIndex, pruneRetrieveImgExports, refreshIncomingImageIndex, type IncomingImageCandidate, type IndexedImage } from "../image-restore.js";
 import { durableMessageToolPaths, withDurableProtection } from "../durable-message-guards.js";
 import { biliToolsDeclaredOnWire, countBiliToolUses, declaresMcpBiliToolsOnWire, evaluateSelfHealRound, pluginLaneDegraded, pluginLaneRestore } from "../session-self-heal.js";
 import { acquireInFlight, getSessionAsync, hasProcessedState, markDirty, peekSession, releaseInFlight, storeEffectiveConfig, tickPostRebuildAnchor, withSessionLock, type Session } from "../session.js";
@@ -198,7 +198,7 @@ export async function handle(
                 return;
             }
             await handleIncrementalTurn(req, res, log, (syntheticReq, synRes) =>
-                handleRequest(syntheticReq, synRes, opts, core, config, log, instanceId, instanceStartedAt, proxyWatchers, initialWatcherPid, adminCtx, new DecodedRequestAdmission(), new AbortController().signal));
+                handleRequest(syntheticReq, synRes, opts, core, config, log, instanceId, instanceStartedAt, proxyWatchers, initialWatcherPid, adminCtx, admission, decodingAbort.signal));
             return;
         }
         // #3248 capabilities probe: GET on the turn path (loopback-gated like
@@ -290,7 +290,7 @@ export async function handle(
                     return;
                 }
                 await handleIncrementalTurn(req, res, log, (syntheticReq, synRes) =>
-                    handleRequest(syntheticReq, synRes, opts, core, config, log, instanceId, instanceStartedAt, proxyWatchers, initialWatcherPid, adminCtx, new DecodedRequestAdmission(), new AbortController().signal), (req.url ?? "/v1/messages").split("?", 2)[0], raw);
+                    handleRequest(syntheticReq, synRes, opts, core, config, log, instanceId, instanceStartedAt, proxyWatchers, initialWatcherPid, adminCtx, admission, decodingAbort.signal), (req.url ?? "/v1/messages").split("?", 2)[0], raw);
                 return;
             }
             // Marker'd but full-resend: replay through the normal pipeline with
@@ -3160,7 +3160,9 @@ async function handleRequest(
                 respondFailFast: boolean,
                 overflowWindow?: number,
             ) => Promise<{ body: string | Buffer; prepared: Prepared | null } | null>) | undefined = async (respondFailFast, overflowWindow) => {
+                let projectedIncomingImages: IncomingImageCandidate[] | undefined;
                 const runPrepareInner = async (): Promise<Prepared> => {
+                    projectedIncomingImages = undefined;
                     // #1820: this prepare consumes one unit of post-rebuild anchor
                     // validity (the last one deletes it — see session.ts).
                     tickPostRebuildAnchor(session);
@@ -3272,7 +3274,7 @@ async function handleRequest(
                             // prepareResponsesCompact falls back to the raw bodyBuffer —
                             // forward it unchanged (byte-identical passthrough).
                             ? prepareResponsesCompact(bodyBuffer, work as ResponsesRequestBody, session, req, core, reqConfig, log)
-                            : await prepareResponses(work as ResponsesRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, responsesIdentity!, pluginMode, upstreamOrigin, nativeWindow, reasoningCfg, visibilityMarkers, route?.rewrittenUrl, decide);
+                            : await prepareResponses(work as ResponsesRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, responsesIdentity!, pluginMode, upstreamOrigin, nativeWindow, reasoningCfg, visibilityMarkers, route?.rewrittenUrl, decide, bodyMayCarryImages ? images => { projectedIncomingImages = images; } : undefined);
                     // The resolved model rides with the prepared request: on the
                     // Anthropic-on-Vertex wire the body carries none, and the
                     // relay's compress-loop rebuild reads it from here.
@@ -3375,7 +3377,7 @@ async function handleRequest(
                 // would find nothing regardless of which refs prepare just
                 // assigned (refs gate indexing; they cannot create images).
                 if (!countTokens && !responsesCompact && protocol && prepared && bodyMayCarryImages) {
-                    session.incomingImageIndex = refreshIncomingImageIndex(parsed, protocol, session.state, session.id, session.incomingImageIndex);
+                    session.incomingImageIndex = refreshIncomingImageIndex(parsed, protocol, session.state, session.id, session.incomingImageIndex, projectedIncomingImages);
                 }
                 // #2155 self-heal round: one evaluation per request, on the
                 // nudge-carrying prepared result (bypass lanes have nudge

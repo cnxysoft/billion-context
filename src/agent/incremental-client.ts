@@ -339,17 +339,19 @@ function contentWithoutCacheControl(content: unknown): unknown {
     return changed ? out : content;
 }
 
-/** One pass per message: the raw wire hash plus, ONLY when cache_control
- *  decorations are actually present, the stripped alignment hash. Without
- *  decorations both formulas feed byte-identical input to sha256, so the
- *  pair is (h, h) and undecorated messages pay one hash instead of two.
- *  contentWithoutCacheControl returns the ORIGINAL reference when nothing
- *  changed, which is the cheap "decorated?" probe. */
 function wireHashPair(m: IncrementalWireMessage): { raw: string; align: string } {
     const raw = wireHash(m);
-    const stripped = contentWithoutCacheControl(m.content);
-    if (stripped === m.content) return { raw, align: raw };
-    return { raw, align: createHash("sha256").update(`${m.role}\u0000${JSON.stringify(stripped)}`).digest("hex").slice(0, 16) };
+    let content = contentWithoutCacheControl(m.content);
+    // DSH promotes a marked user string to a single text block. Both forms
+    // convert to the same core text, but the raw hash still drives retouch.
+    if (m.role === "user" && Array.isArray(content) && content.length === 1) {
+        const block: unknown = content[0];
+        if (block !== null && typeof block === "object" && Object.keys(block).length === 2
+            && "type" in block && block.type === "text" && "text" in block && typeof block.text === "string") {
+            content = block.text;
+        }
+    }
+    return { raw, align: content === m.content ? raw : wireHash({ role: m.role, content }) };
 }
 
 /** Public twin of the internal wire hash for boundary comparisons. The

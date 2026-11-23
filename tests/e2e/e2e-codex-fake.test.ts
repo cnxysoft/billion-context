@@ -676,10 +676,10 @@ test("#2195: two sequential bili launches keep every thread in the real home", {
 		"http_proxy", "https_proxy", "all_proxy", "no_proxy",
 	]) delete childEnv[k];
 
-	const launcherRun = (label: string, prompt: string): Promise<void> => new Promise((resolve, reject) => {
+	const launcherRun = (label: string, prompt: string): Promise<void> => freePort().then((port) => new Promise((resolve, reject) => {
 		const lastFile = path.join(work, `${label}.last`);
 		const logFile = path.join(work, `${label}.log`);
-		const child = spawn(process.execPath, [DIST, "codex", "exec", "--skip-git-repo-check", "--output-last-message", lastFile, prompt], {
+		const child = spawn(process.execPath, [DIST, "--port", String(port), "codex", "exec", "--skip-git-repo-check", "--output-last-message", lastFile, prompt], {
 			cwd: codexCwd,
 			env: {
 				...childEnv,
@@ -705,7 +705,7 @@ test("#2195: two sequential bili launches keep every thread in the real home", {
 			else if (!fs.existsSync(lastFile) || !/收到#/.test(fs.readFileSync(lastFile, "utf8"))) reject(new Error(`${label}: the fake upstream never answered\nlauncher stderr:\n${tail}`));
 			else resolve();
 		});
-	});
+	}));
 
 	const threadCountOf = (p: string): number => {
 		assert.ok(sqliteMod, "node:sqlite unavailable for db assertions");
@@ -1019,10 +1019,10 @@ test("#2222: shared state — the live db stays in the real home across bili and
 		"BILI_CODEX_STATE_MODE", "CODEX_SQLITE_HOME",
 	]) delete childEnv[k];
 
-	const launcherRun = (label: string, prompt: string): Promise<void> => new Promise((resolve, reject) => {
+	const launcherRun = (label: string, prompt: string): Promise<void> => freePort().then((port) => new Promise((resolve, reject) => {
 		const lastFile = path.join(work, `${label}.last`);
 		const logFile = path.join(work, `${label}.log`);
-		const child = spawn(process.execPath, [DIST, "codex", "exec", "--skip-git-repo-check", "--output-last-message", lastFile, prompt], {
+		const child = spawn(process.execPath, [DIST, "--port", String(port), "codex", "exec", "--skip-git-repo-check", "--output-last-message", lastFile, prompt], {
 			cwd: codexCwd,
 			env: {
 				...childEnv,
@@ -1048,7 +1048,7 @@ test("#2222: shared state — the live db stays in the real home across bili and
 			else if (!fs.existsSync(lastFile) || !/收到#/.test(fs.readFileSync(lastFile, "utf8"))) reject(new Error(`${label}: the fake upstream never answered\nlauncher stderr:\n${tail}`));
 			else resolve();
 		});
-	});
+	}));
 
 	const assertNoSqliteInOverlay = (): void => {
 		// #3203: shared-mode overlays are per-session slots (<home>-bili-s<N>)
@@ -1177,10 +1177,10 @@ test("#3203: two concurrent bili codex sessions on ONE CODEX_HOME both run and k
 		"BILI_CODEX_STATE_MODE", "CODEX_SQLITE_HOME",
 	]) delete childEnv[k];
 
-	const launcherRun = (label: string, prompt: string): Promise<void> => new Promise((resolve, reject) => {
+	const launcherRun = (label: string, prompt: string): Promise<void> => freePort().then((port) => new Promise((resolve, reject) => {
 		const lastFile = path.join(work, `${label}.last`);
 		const logFile = path.join(work, `${label}.log`);
-		const child = spawn(process.execPath, [DIST, "codex", "exec", "--skip-git-repo-check", "--output-last-message", lastFile, prompt], {
+		const child = spawn(process.execPath, [DIST, "--port", String(port), "codex", "exec", "--skip-git-repo-check", "--output-last-message", lastFile, prompt], {
 			cwd: codexCwd,
 			env: {
 				...childEnv,
@@ -1206,7 +1206,7 @@ test("#3203: two concurrent bili codex sessions on ONE CODEX_HOME both run and k
 			else if (!fs.existsSync(lastFile) || !/收到#/.test(fs.readFileSync(lastFile, "utf8"))) reject(new Error(`${label}: the fake upstream never answered\nlauncher stderr:\n${tail}`));
 			else resolve();
 		});
-	});
+	}));
 
 	const assertNoSqliteInOverlay = (): void => {
 		const parent = path.dirname(codexHome);

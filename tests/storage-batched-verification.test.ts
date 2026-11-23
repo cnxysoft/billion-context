@@ -113,11 +113,38 @@ for (const asyncLane of [false, true]) {
     });
 }
 
+test("read-back header detects reference and metadata drift while preserving canonical equality", (t) => {
+    for (const change of ["canonical-equal", "metadata", "missing", "null-metadata", "ref"] as const) {
+        const { store, shadow, dbPath, view } = fixture(t);
+        view.metadata.foldPositions = ["first", "second"];
+        view.metadata.cacheLedger = { runs: [{ n: 2, at: 1_700_000_000_000 }] };
+        changeBeforeRead(t, store, dbPath, (db) => {
+            if (change === "ref") {
+                db.prepare("UPDATE refs SET ref = ?, ref_num = ? WHERE session_id = ? AND raw_id = ?")
+                    .run("m00002", 2, view.id, "ghost");
+                return;
+            }
+            const metadata: Record<string, unknown> = {
+                cacheLedger: { runs: [{ at: 1_700_000_000_001, n: 2 }] },
+                foldPositions: change === "metadata" ? ["second", "first"] : ["first", "second"],
+            };
+            if (change === "missing") delete metadata.foldPositions;
+            db.prepare("UPDATE sessions SET metadata_json = ? WHERE session_id = ?")
+                .run(JSON.stringify(change === "null-metadata" ? null : metadata), view.id);
+        });
+        shadow.record(view);
+        const matched = change === "canonical-equal";
+        assert.equal(shadow.stats.verifyOk, Number(matched), change);
+        assert.equal(shadow.stats.verifyDrift, Number(!matched), change);
+        assert.equal(store.ingestWatermark(view.id) !== null, matched, change);
+    }
+});
+
 test("a changed message beyond the first batch trips drift and clears the watermark", (t) => {
     const { store, shadow, dbPath, view } = fixture(t);
     changeBeforeRead(t, store, dbPath, (db) => {
         const row = db.prepare("SELECT content_hash FROM messages WHERE session_id = ? AND msg_id = ?").get(view.id, "raw-70") as { content_hash: string };
-        db.prepare("UPDATE content SET bytes = ? WHERE hash = ?").run(Buffer.from(JSON.stringify({ ...message(70), text: "changed" })), row.content_hash);
+        db.prepare("UPDATE content SET bytes = ? WHERE hash = ?").run(Buffer.from(JSON.stringify({ ...message(70), text: "altered 70" })), row.content_hash);
     });
     shadow.record(view);
     assert.equal(shadow.stats.verifyDrift, 1, shadow.stats.lastError ?? "changed content must drift");

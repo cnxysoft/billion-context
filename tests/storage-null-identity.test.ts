@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { openSqliteDatabase } from "../src/storage/driver.ts";
-import { identityOfStoredContent } from "../src/storage/identity.ts";
+import { describeMessageContent, identityOfStoredContent, splitMediaContent } from "../src/storage/identity.ts";
 import { migrateSchema } from "../src/storage/schema.ts";
 import { rmrf } from "./tmp-rm.ts";
 
@@ -24,6 +24,26 @@ test("message identities still exclude positional metadata and retain content", 
     const second = JSON.stringify({ id: "new", wireIndex: 7, ledgerSeq: 8, role: "user", content: "hello" });
     assert.equal(identityOfStoredContent(first), identityOfStoredContent(second));
     assert.notEqual(identityOfStoredContent(first), identityOfStoredContent(second.replace("hello", "changed")));
+});
+
+test("planned message content agrees with the stored identity on plain and media rows", () => {
+    const message = {
+        id: "row", wireIndex: 3, ledgerSeq: 9, role: "assistant", contentType: "text",
+        rawOpenaiContentParts: [{ type: "thinking", thinking: "原文", signature: "signed\r\nbytes" }],
+    };
+    const base64 = "YWJj".repeat(600);
+    for (const row of [
+        message,
+        { ...message, imageBase64: base64 },
+        { ...message, rawOpenaiContentParts: [{ type: "image_url", image_url: { url: `data:image/png;base64,${base64}` } }] },
+    ]) {
+        const raw = JSON.stringify(row);
+        const split = splitMediaContent(raw);
+        assert.deepEqual(describeMessageContent(raw), {
+            ...split, role: row.role, contentType: row.contentType,
+            identity: identityOfStoredContent(split.content),
+        });
+    }
 });
 
 test("v8 identity migration can finish with a JSON-null content row", () => {

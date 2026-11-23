@@ -135,7 +135,7 @@ async function getSnapshot(h: Handle, id: string): Promise<{ status: number; bod
     return { status: r.status, body: (await r.json()) as Snapshot };
 }
 
-test("#5140 shadow: non-retained parent forks from the intact unified raw tail after a cold restart", async () => {
+test("#5140 shadow: non-retained parent forks from the intact unified raw tail after a cold restart", async (t) => {
     // Phase 1 — build a NON-retained parent on an isolated shadow data root.
     const h1 = await harness("shadow");
     const dir = h1.dir;
@@ -163,12 +163,21 @@ test("#5140 shadow: non-retained parent forks from the intact unified raw tail a
     // Phase 2 — process death + cold restore onto the SAME data root.
     const h2 = await harness("shadow", dir);
     try {
+        const loads = t.mock.method(h2.store, "loadAsync");
         const cold = await getSnapshot(h2, PARENT);
+        assert.equal(loads.mock.calls.filter((call) => call.arguments[0] === parentId).length, 1);
         assert.equal(cold.status, 200, `cold snapshot must be served from the intact raw tail, got ${JSON.stringify(cold.body)}`);
         assert.equal(cold.body.orderedMessages!.length, expectedCount, "reconstructed tail covers the full history");
         const coldSession = listSessions().find((s) => s.id === cold.body.sessionId)!;
         assert.equal(coldSession.pluginSnapshot, undefined, "GET must not establish permanent raw retention");
         assert.equal(coldSession.metadata.publicSnapshotRetained, undefined, "GET must not mark the parent retained");
+
+        const missingId = "missing-fork-parent";
+        const missing = await getSnapshot(h2, missingId);
+        assert.equal(missing.status, 404);
+        assert.equal(missing.body.code, "PARENT_NOT_FOUND");
+        assert.equal(loads.mock.calls.filter((call) => call.arguments[0] === missingId).length, 1);
+        assert.ok(listSessions().every((session) => session.id !== missingId));
 
         const ordered = cold.body.orderedMessages!;
         const fork = await fetch(`${h2.origin}/__bili/plugin/fork`, {

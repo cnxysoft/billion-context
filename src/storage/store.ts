@@ -41,10 +41,16 @@ const WAL_CHECKPOINT_EVERY_INGESTS = 20;
 /** PR #4725 N3: covered-seq span point queries chunk the msg_id IN (…) list
  *  to stay under SQLite's 999 bound-parameter limit (1 session id + 500). */
 const SEQ_SPAN_QUERY_BATCH = 500;
+const MESSAGE_READ_STATEMENT_LIMIT = 64;
+const REPLAY_PROOF_MIN_ROWS = 4096;
+const REPLAY_PROOF_BATCH = 512;
+const SPARSE_REMAP_MAX_ROWS = 128;
 /** Max bound parameters per generated statement (refs batching, #5744).
  *  Well under the conservative 999-parameter default some SQLite builds
  *  still ship with — see sqlite3.MAX_BIND_PARAMS. */
 const REF_STMT_MAX_PARAMS = 700;
+const REF_PREFIX_MIN_ROWS = 8192;
+const REF_PREFIX_MAX_ROWS = 65536;
 
 /** #4796: rows per batch of gc()'s zero-ref CAS sweep. Sized so one batch's
  *  page churn stays modest even when the store is dominated by multi-MB
@@ -492,6 +498,7 @@ export class UnifiedStore {
      * prepared once stays valid until close(). */
     private releaseDecrement: ReturnType<SqliteDatabase["prepare"]> | null = null;
     private releaseDelete: ReturnType<SqliteDatabase["prepare"]> | null = null;
+    private readonly messageReadStatements = new Map<string, ReturnType<SqliteDatabase["prepare"]>>();
 
     private constructor(db: SqliteDatabase, engine: SqliteEngineName, engineSource: SqliteEngineSource, lockPath: string | null, foreignLockHolder: { pid: number } | null, dbPath: string) {
         this.db = db;
@@ -822,6 +829,7 @@ export class UnifiedStore {
         } else {
             loggerLog("info", `[storage] skipping the WAL checkpoint (TRUNCATE) on close for ${this.dbPath}: live foreign writer pid ${foreignAtClose} present (#7156) — the WAL is left for the peer's next clean pass to converge`);
         }
+        this.messageReadStatements.clear();
         this.db.close();
         // #4609: a clean close of a VERIFIED store refreshes the PASS memo onto
         // post-checkpoint stats so the next boot skips the rescan. FAIL verdicts
@@ -1112,7 +1120,7 @@ export class UnifiedStore {
                 });
                 watermark = messages.length > 0 ? messages[messages.length - 1].seq : delta.trustedSeq;
             } else {
-                const full = this.remapPlanToAbsolute(input);
+                const full = this.remapPlanToAbsolute(input, opts?.completeLog !== true);
                 messages = full.messages;
                 watermark = full.watermark;
                 // #3285: authoritative-set discipline for messages — same as
@@ -1292,37 +1300,40 @@ export class UnifiedStore {
             // #4313: one wall-clock sample per save batch — rows without a
             //  per-message first-sight stamp all carry the same second.
             const batchTs = Date.now();
-            for (const m of messages) {
-                const hash = this.putContent(m.content, m.contentHash);
-                const res = this.db
-                    .prepare(
-                        "INSERT OR IGNORE INTO messages (session_id, seq, msg_id, ref, ref_num, role, kind, content_hash, identity, ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    )
-                    .run(s.sessionId, m.seq, m.msgId, m.ref, m.refNum, m.role, m.kind, hash, m.identity ?? identityOfStoredContent(m.content), typeof m.ts === "number" ? m.ts : batchTs);
-                if (res.changes === 0) {
-                    // Idempotent re-receipt: the CAS row is still referenced
-                    // by the existing message row — undo our refcount bump.
-                    this.releaseContent(hash);
-                    // #4506: an existing row may be a tombstone REACTIVATING
-                    // (its message_media mappings were released at retire).
-                    // The same idempotent upsert below restores mapping +
-                    // refcount; for ordinary re-ingests (mapping still there)
-                    // the release-on-no-change undoes the bump — net zero.
-                    if (m.media && m.media.length > 0) {
-                        for (const md of m.media) {
-                            this.putContent(md.bytes, md.hash);
-                            const mmr = this.db
-                                .prepare("INSERT OR IGNORE INTO message_media (session_id, seq, media_hash) VALUES (?, ?, ?)")
-                                .run(s.sessionId, m.seq, md.hash);
-                            if (mmr.changes === 0) this.releaseContent(md.hash);
-                        }
+            if (messages.length > 0) {
+                // An exact replay with a live CAS reference makes the legacy bump and release cancel out.
+                const existingMessage = delta ? undefined : this.db.prepare(
+                    "SELECT 1 FROM messages m JOIN content c ON c.hash = m.content_hash " +
+                    "WHERE m.session_id = ? AND m.seq = ? AND m.msg_id = ? AND m.content_hash = ? " +
+                    "AND typeof(c.refcount) = 'integer' AND c.refcount > 0 AND c.refcount < 9223372036854775807",
+                );
+                const insertMessage = this.db.prepare(
+                    "INSERT OR IGNORE INTO messages (session_id, seq, msg_id, ref, ref_num, role, kind, content_hash, identity, ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                );
+                const batchProof = !delta && messages.length >= REPLAY_PROOF_MIN_ROWS ? this.db.prepare(`
+                    SELECT j.key AS offset
+                    FROM json_each(?) AS j CROSS JOIN messages AS m CROSS JOIN content AS c
+                    WHERE m.session_id = ? AND m.seq = json_extract(j.value, '$[0]')
+                      AND m.msg_id = json_extract(j.value, '$[1]') AND m.content_hash = json_extract(j.value, '$[2]')
+                      AND c.hash = m.content_hash AND typeof(c.refcount) = 'integer' AND c.refcount BETWEEN 1 AND 2147483647
+                `) : undefined;
+                let provenOffsets: Set<number> | undefined;
+                for (let i = 0; i < messages.length; i++) {
+                    const offset = i % REPLAY_PROOF_BATCH;
+                    if (batchProof && offset === 0) {
+                        const keys = messages.slice(i, i + REPLAY_PROOF_BATCH).map(m => [m.seq, m.msgId, m.contentHash]);
+                        const matches = batchProof.all(JSON.stringify(keys), s.sessionId) as { offset: number }[];
+                        provenOffsets = new Set(matches.map(row => row.offset));
                     }
-                } else if (m.media && m.media.length > 0) {
-                    // #3762: put the media bytes + mapping rows; refcount per
-                    // message row that actually landed (INSERT OR IGNORE on
-                    // the mapping keeps re-ingest of the same (seq, hash)
-                    // from double-bumping).
-                    for (const md of m.media) {
+                    const m = messages[i]!;
+                    if (m.contentHash === undefined || (!provenOffsets?.has(offset) && !existingMessage?.get(s.sessionId, m.seq, m.msgId, m.contentHash))) {
+                        const hash = this.putContent(m.content, m.contentHash);
+                        const res = insertMessage.run(s.sessionId, m.seq, m.msgId, m.ref, m.refNum, m.role, m.kind, hash,
+                            m.identity ?? identityOfStoredContent(m.content), typeof m.ts === "number" ? m.ts : batchTs);
+                        if (res.changes === 0) this.releaseContent(hash);
+                    }
+                    // A reactivated row can have exact text but need its media mappings back (#4506).
+                    for (const md of m.media ?? []) {
                         this.putContent(md.bytes, md.hash);
                         const mm = this.db
                             .prepare("INSERT OR IGNORE INTO message_media (session_id, seq, media_hash) VALUES (?, ?, ?)")
@@ -1389,6 +1400,7 @@ export class UnifiedStore {
             // and suppress the seq-0 message (PR #4725 N1); -1 keeps the
             // #4608 CASE guard honest (unknown < 0 → preserve stored bounds).
             const seqSpanById = new Map<string, [number, number]>();
+            const coverageByBlock = new Map<BlockRow, string[]>();
             if (!skipIncomingBlocks && input.blocks.length > 0) {
                 // point query over the covered ids only (PR #4725 N3): a
                 // full-session scan per save taxed every session with blocks.
@@ -1396,7 +1408,9 @@ export class UnifiedStore {
                 for (const b of input.blocks) {
                     try {
                         const cov = JSON.parse(b.payloadJson) as { effectiveMessageIds?: string[]; directMessageIds?: string[] };
-                        for (const id of [...(cov.effectiveMessageIds ?? []), ...(cov.directMessageIds ?? [])]) wanted.add(id);
+                        const ids = [...(cov.effectiveMessageIds ?? []), ...(cov.directMessageIds ?? [])];
+                        coverageByBlock.set(b, ids);
+                        for (const id of ids) wanted.add(id);
                     } catch { /* malformed payload: no covered ids to resolve */ }
                 }
                 // LIVE rows only (#4801 review): block bounds describe what is
@@ -1423,18 +1437,15 @@ export class UnifiedStore {
                     }
                 }
             }
-            const boundsForCovered = (payloadJson: string): [number, number] => {
+            const boundsForCovered = (block: BlockRow): [number, number] => {
                 let lo = Number.POSITIVE_INFINITY;
                 let hi = -1;
-                try {
-                    const cov = JSON.parse(payloadJson) as { effectiveMessageIds?: string[]; directMessageIds?: string[] };
-                    for (const id of [...(cov.effectiveMessageIds ?? []), ...(cov.directMessageIds ?? [])]) {
-                        const sp = seqSpanById.get(id);
-                        if (!sp) continue;
-                        if (sp[0] < lo) lo = sp[0];
-                        if (sp[1] > hi) hi = sp[1];
-                    }
-                } catch { /* malformed payload: keep the no-claim sentinel */ }
+                for (const id of coverageByBlock.get(block) ?? []) {
+                    const sp = seqSpanById.get(id);
+                    if (!sp) continue;
+                    if (sp[0] < lo) lo = sp[0];
+                    if (sp[1] > hi) hi = sp[1];
+                }
                 return hi < 0 ? [-1, -1] : [lo, hi];
             };
             const blocksUpsert = this.db.prepare(
@@ -1453,7 +1464,7 @@ export class UnifiedStore {
             );
             for (const b of input.blocks) {
                 if (skipIncomingBlocks) continue;
-                const [bStartSeq, bEndSeq] = boundsForCovered(b.payloadJson);
+                const [bStartSeq, bEndSeq] = boundsForCovered(b);
                 // #5744: steady-state saves re-send every block byte-identical.
                 // When the effective post-upsert row equals the stored row the
                 // whole write (and its CAS bump/release dance, which nets to
@@ -1565,23 +1576,7 @@ export class UnifiedStore {
             // mid-batch and rolls the whole ingest back. If a future producer
             // can reorder survivors upward, add a delete-all fallback around
             // the write phase below.
-            const oldRefs = new Map<string, { ord: number; ref: string; refNum: number | null }>();
-            for (const row of this.db
-                .prepare("SELECT raw_id, ord, ref, ref_num FROM refs WHERE session_id = ?")
-                .all(s.sessionId) as Array<{ raw_id: string; ord: number; ref: string; ref_num: number | null }>) {
-                oldRefs.set(row.raw_id, { ord: row.ord, ref: row.ref, refNum: row.ref_num });
-            }
-            const goneRefIds: string[] = [];
-            const touchedRefs: RefRow[] = [];
-            for (const r of input.refs) {
-                const o = oldRefs.get(r.rawId);
-                if (!o || o.ord !== r.ord || o.ref !== r.ref || o.refNum !== r.refNum) {
-                    touchedRefs.push(r);
-                } else {
-                    oldRefs.delete(r.rawId); // matched and unmodified — consume it
-                }
-            }
-            for (const rawId of oldRefs.keys()) goneRefIds.push(rawId);
+            const { goneRefIds, touchedRefs } = this.diffRefs(s.sessionId, input.refs);
             if (goneRefIds.length > 0) {
                 const perChunk = REF_STMT_MAX_PARAMS - 1; // reserve the leading session_id slot
                 for (let i = 0; i < goneRefIds.length; i += perChunk) {
@@ -1661,6 +1656,42 @@ export class UnifiedStore {
         return ok;
     }
 
+    private diffRefs(sessionId: string, refs: RefRow[]): { goneRefIds: string[]; touchedRefs: RefRow[] } {
+        // Compare the complete ordered prefix inside the write transaction.
+        // One aggregate avoids allocating a JS object for every unchanged row.
+        if (refs.length >= REF_PREFIX_MIN_ROWS && refs.length <= REF_PREFIX_MAX_ROWS) {
+            const proof = this.db.prepare(
+                `SELECT count(*) AS n, json_group_array(json_array(ord, raw_id, ref, ref_num)) AS prefix
+                 FROM (SELECT ord, raw_id, ref, ref_num FROM refs WHERE session_id = ? ORDER BY ord LIMIT ?)`,
+            ).get(sessionId, refs.length + 1) as { n: number; prefix: string };
+            if (proof.n > 0 && proof.n <= refs.length) {
+                const prefix = refs.slice(0, proof.n);
+                if (prefix.every((r) => r.refNum === null || Number.isSafeInteger(r.refNum)) &&
+                    JSON.stringify(prefix.map((r) => [r.ord, r.rawId, r.ref, r.refNum])) === proof.prefix) {
+                    return { goneRefIds: [], touchedRefs: refs.slice(proof.n) };
+                }
+            }
+        }
+        const oldRefs = new Map<string, { ord: number; ref: string; refNum: number | null }>();
+        for (const row of this.db
+            .prepare("SELECT raw_id, ord, ref, ref_num FROM refs WHERE session_id = ?")
+            .all(sessionId) as Array<{ raw_id: string; ord: number; ref: string; ref_num: number | null }>) {
+            oldRefs.set(row.raw_id, { ord: row.ord, ref: row.ref, refNum: row.ref_num });
+        }
+        const goneRefIds: string[] = [];
+        const touchedRefs: RefRow[] = [];
+        for (const r of refs) {
+            const o = oldRefs.get(r.rawId);
+            if (!o || o.ord !== r.ord || o.ref !== r.ref || o.refNum !== r.refNum) {
+                touchedRefs.push(r);
+            } else {
+                oldRefs.delete(r.rawId); // matched and unmodified — consume it
+            }
+        }
+        for (const rawId of oldRefs.keys()) goneRefIds.push(rawId);
+        return { goneRefIds, touchedRefs };
+    }
+
     /** #3250: cadence-tick WAL reclamation (see WAL_CHECKPOINT_EVERY_INGESTS).
      *  Never throws into the ingest path — a failed checkpoint just leaves the
      *  WAL longer than ideal until the next tick. */
@@ -1705,7 +1736,7 @@ export class UnifiedStore {
     /** Full-ingest path of ingestSession, extracted for readability: the
      *  absolute-seq remap plus the #3133 watermark alignment decision.
      *  Mutates input.session.tailJson (pointer sequences become absolute). */
-    private remapPlanToAbsolute(input: IngestSessionInput): { messages: MessageRow[]; watermark: number | null } {
+    private remapPlanToAbsolute(input: IngestSessionInput, allowSparseLookup: boolean): { messages: MessageRow[]; watermark: number | null } {
         const s = input.session;
         // Absolute-seq remap (#2671 soak finding): planIngest assigns seq
         // RELATIVE to the current snapshot's log (pluginSnapshot first,
@@ -1716,14 +1747,24 @@ export class UnifiedStore {
         // forever and tail pointers resolve to stale turns. Remap to
         // stable absolute seqs: same identity (msgId + content hash)
         // keeps its old seq; new identities continue after max(seq).
-        const existing = this.db
-            .prepare("SELECT seq, msg_id, identity, content_hash, retired_at, ref FROM messages WHERE session_id = ?")
-            .all(s.sessionId) as { seq: number; msg_id: string; identity: string; content_hash: string; retired_at: number | null; ref: string | null }[];
+        const messageIds = allowSparseLookup && input.messages.length <= SPARSE_REMAP_MAX_ROWS
+            ? [...new Set(input.messages.map((message) => message.msgId))]
+            : undefined;
+        const select = "SELECT seq, msg_id, identity, content_hash, retired_at, ref FROM messages";
+        const existing = (messageIds === undefined
+            ? this.db.prepare(`${select} WHERE session_id = ? ORDER BY seq`).all(s.sessionId)
+            : messageIds.length === 0 ? [] : this.db.prepare(
+                `${select} INDEXED BY idx_messages_msg_id WHERE session_id = ? AND msg_id IN (${messageIds.map(() => "?").join(", ")}) ORDER BY seq`,
+            ).all(s.sessionId, ...messageIds)
+        ) as { seq: number; msg_id: string; identity: string; content_hash: string; retired_at: number | null; ref: string | null }[];
         const seqByIdentity = new Map<string, number>();
         const hashBySeq = new Map<number, string>();
         const storedRefBySeq = new Map<number, string | null>();
         const retiredSeqs: number[] = [];
-        let nextSeq = 0;
+        const max = messageIds?.length
+            ? this.db.prepare("SELECT MAX(seq) AS seq FROM messages WHERE session_id = ?").get(s.sessionId) as { seq: number | null }
+            : undefined;
+        let nextSeq = (max?.seq ?? -1) + 1;
         for (const row of existing) {
             // #4390: identity join — same logical message keeps its seq even
             // when its bytes were re-minted with shifted wire positions.
@@ -2053,6 +2094,31 @@ export class UnifiedStore {
             }
         }
         return out;
+    }
+
+    recoveredMessageContent(sessionId: string, msgId: string, contentHash: string, identity: string): string | null {
+        const rows = this.db.prepare(`
+            SELECT content_hash FROM messages
+            WHERE session_id = ? AND msg_id = ? AND (content_hash = ? OR identity = ?)
+            ORDER BY CASE WHEN content_hash = ? THEN 0 ELSE 1 END, seq
+        `).all(sessionId, msgId, contentHash, identity, contentHash) as { content_hash: string }[];
+        for (const row of rows) {
+            const body = this.getContent(row.content_hash);
+            if (body !== null && sha256Hex(body) === row.content_hash && identityOfStoredContent(body) === identity) {
+                return this.hydrateMedia(body);
+            }
+        }
+        return null;
+    }
+
+    uniqueLiveMessageContent(sessionId: string, msgId: string): string | null {
+        const rows = this.db.prepare(`
+            SELECT content_hash FROM messages
+            WHERE session_id = ? AND msg_id = ? AND retired_at IS NULL LIMIT 2
+        `).all(sessionId, msgId) as { content_hash: string }[];
+        if (rows.length !== 1) return null;
+        const body = this.getContent(rows[0]!.content_hash);
+        return body === null ? null : this.hydrateMedia(body);
     }
 
     /** #3841 reap journal: targeted update for the orphan shape (#2695 reap —
@@ -3494,6 +3560,16 @@ export class UnifiedStore {
         }));
     }
 
+    private prepareMessageRead(sql: string): ReturnType<SqliteDatabase["prepare"]> {
+        const cached = this.messageReadStatements.get(sql);
+        if (cached) return cached;
+        const statement = this.db.prepare(sql);
+        if (this.messageReadStatements.size < MESSAGE_READ_STATEMENT_LIMIT) {
+            this.messageReadStatements.set(sql, statement);
+        }
+        return statement;
+    }
+
     /** Fetch bodies for captured message rows in bounded batches. Keeping
      *  the metadata query separate avoids holding a whole history's BLOBs
      *  alongside all of its decoded strings. Hashes preserve row identity. */
@@ -3502,7 +3578,7 @@ export class UnifiedStore {
         for (let i = 0; i < rows.length; i += CHUNK) {
             const chunk = rows.slice(i, i + CHUNK);
             const hashes = [...new Set(chunk.map((row) => row.content_hash as string))];
-            const contents = this.db.prepare(`SELECT hash, bytes FROM content WHERE hash IN (${hashes.map(() => "?").join(",")})`)
+            const contents = this.prepareMessageRead(`SELECT hash, bytes FROM content WHERE hash IN (${hashes.map(() => "?").join(",")})`)
                 .all(...hashes) as { hash: string; bytes: Uint8Array }[];
             const byHash = new Map(contents.map((row) => [row.hash, row.bytes]));
             for (const row of chunk) {
@@ -3525,11 +3601,9 @@ export class UnifiedStore {
         const params: unknown[] = [sessionId];
         if (opts?.seqs) params.push(...opts.seqs);
         if (!opts?.seqs && opts?.fromSeqExclusive !== undefined) params.push(opts.fromSeqExclusive);
-        const rows = this.db
-            .prepare(
-                `SELECT seq, msg_id, ref, ref_num, role, kind, content_hash, retired_at, ts FROM messages WHERE session_id = ?${retiredFilter}${seqFilter}${afterClause} ORDER BY seq`,
-            )
-            .all(...params) as Record<string, unknown>[];
+        const rows = this.prepareMessageRead(
+            `SELECT seq, msg_id, ref, ref_num, role, kind, content_hash, retired_at, ts FROM messages WHERE session_id = ?${retiredFilter}${seqFilter}${afterClause} ORDER BY seq`,
+        ).all(...params) as Record<string, unknown>[];
         return Array.from(this.messageContents(rows), ([r, content]) => {
             messageRowReads.count++;
             return {

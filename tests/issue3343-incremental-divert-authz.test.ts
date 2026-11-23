@@ -24,6 +24,7 @@ import { _resetSessionsForTest } from "../src/session.ts";
 import { _setForTest } from "../src/registry.ts";
 import { resetToolRingForTest } from "../src/tool-ring.ts";
 import { __resetIncrementalLaneForTests, handleIncrementalTurn } from "../src/incremental-lane.ts";
+import { DecodedRequestAdmission, LARGE_DECODED_ADMISSION_BYTES } from "../src/request-body-budget.ts";
 
 process.env.NODE_ENV = "test";
 const testRoot = mkdtempSync(join(tmpdir(), "bili-3343-"));
@@ -119,6 +120,33 @@ test("model-shaped paths still divert into the lane (fix is not over-blocking)",
     } finally {
         delete process.env.BILI_ROLLOUT_PLUGIN_INCREMENTAL_TURNS;
     }
+});
+
+test("both incremental entrances release decoded-body admission after each turn", async (t) => {
+    const saved = process.env.BILI_ROLLOUT_PLUGIN_INCREMENTAL_TURNS;
+    process.env.BILI_ROLLOUT_PLUGIN_INCREMENTAL_TURNS = "1";
+    t.after(() => {
+        if (saved === undefined) delete process.env.BILI_ROLLOUT_PLUGIN_INCREMENTAL_TURNS;
+        else process.env.BILI_ROLLOUT_PLUGIN_INCREMENTAL_TURNS = saved;
+    });
+    const h = await harness();
+    t.after(h.close);
+    const observe = DecodedRequestAdmission.prototype.observe;
+    const observed = t.mock.method(DecodedRequestAdmission.prototype, "observe", function (this: DecodedRequestAdmission, bytes: number) {
+        observe.call(this, bytes + LARGE_DECODED_ADMISSION_BYTES);
+    });
+    for (const path of ["/__bili/plugin/turn", "/v1/messages"]) {
+        for (let i = 0; i < 3; i++) {
+            const result = await h.markerTurn(path, {
+                conversationId: `conv-decoded-lease-${path === "/v1/messages" ? "marker" : "direct"}-${i}`,
+                sinceSeq: 0,
+                messages: [{ role: "user", content: "hi" }],
+            });
+            assert.equal(result.status, 200, `${path} turn ${i + 1} must acquire a released slot`);
+            assert.equal(result.appliedSeq, 1);
+        }
+    }
+    assert.ok(observed.mock.callCount() >= 6);
 });
 
 test("synthetic re-entry carries the caller's real socket identity (#3343)", async () => {
