@@ -269,8 +269,14 @@ export function computeIntegrityWithdrawals(
   // and any (call, result) pair that can ever fire INV2 must already have at
   // least one endpoint in initial `foldedIds`. Sorting ascending preserves
   // exact scan order over `groups` and `callMessages`.
+  // Only build candidate subsets when `remaining` is small relative to the
+  // full history (fresh units); for huge merge foldedIds (e.g., 100K covered
+  // ids) direct scan avoids allocating and sorting 15K-element index arrays.
   let candidateGroups: number[] | null = null;
-  if (groupIndexByReasoningId !== undefined) {
+  if (
+    groupIndexByReasoningId !== undefined &&
+    remaining.size * 4 < groups.length
+  ) {
     const seen = new Set<number>();
     for (const id of remaining) {
       const g = groupIndexByReasoningId.get(id);
@@ -279,7 +285,10 @@ export function computeIntegrityWithdrawals(
     candidateGroups = [...seen].sort((a, b) => a - b);
   }
   let candidatePairIndices: number[] | null = null;
-  if (pairIndicesByMsgId !== undefined) {
+  if (
+    pairIndicesByMsgId !== undefined &&
+    remaining.size * 4 < built.callMessages.length
+  ) {
     const seen = new Set<number>();
     for (const id of remaining) {
       const indices = pairIndicesByMsgId.get(id);

@@ -35,6 +35,8 @@ import {
 } from "./protected.js";
 import { countMessageTokens } from "./tokenize.js";
 import { computeIntegrityWithdrawals } from "./turn-integrity.js";
+import type { IntegrityPre } from "./turn-integrity.js";
+import { refToIndex } from "./refs.js";
 import { evaluateRefold } from "./refold.js";
 import { segmentGroups } from "./segment.js";
 import {
@@ -89,10 +91,11 @@ export function computeProtectedRefs(
   state: CompressionState,
   config: Config,
   countTokens: (text: string) => number = estimateTextTokens,
+  precomputedCovered?: Set<string>,
 ): Set<string> {
   const preserveN = config.preserveRecentMessages;
   const preserveTokens = config.preserveRecentTokens;
-  const covered = coveredMessageIds(state);
+  const covered = precomputedCovered ?? coveredMessageIds(state);
 
   const result = new Set<string>();
   const visible: { ref: string; tokens: number }[] = [];
@@ -199,6 +202,8 @@ export function computeProtectedRefs(
 
 /** Numeric part of a message ref ("m00005" → 5); null for non-m refs. */
 function refNumber(ref: string): number | null {
+  const fast = refToIndex(ref);
+  if (fast !== null) return fast;
   const m = /^m(\d+)$/i.exec(ref);
   return m ? Number(m[1]) : null;
 }
@@ -273,6 +278,8 @@ export function buildCompressibleRanges(
    *  computed on it; screening on a pruned view withdraws different messages
    *  than apply does. Defaults to `messages` for direct callers. */
   integritySource?: CoreMessage[],
+  precomputedCovered?: Set<string>,
+  precomputedIntegrityPre?: IntegrityPre,
 ): ContextRanges {
   let compressibleMsgs: {
     id: string;
@@ -292,7 +299,7 @@ export function buildCompressibleRanges(
     index: number;
   }[] = [];
 
-  const covered = coveredMessageIds(state);
+  const covered = precomputedCovered ?? coveredMessageIds(state);
 
   // Pairing: a tool-result may carry only toolCallId (no toolName). Collect the
   // callIds of protected tool-calls first, then protect matching results too.
@@ -440,7 +447,7 @@ export function buildCompressibleRanges(
   const unfoldedIds = computeIntegrityWithdrawals(
     integritySource ?? messages,
     new Set(compressibleMsgs.map((info) => info.id)),
-    undefined,
+    precomputedIntegrityPre,
     covered,
   ).withdrawn;
   if (unfoldedIds.size > 0) {
@@ -662,15 +669,23 @@ export function screenRecommendedUnits(
   state: CompressionState,
   config: Config,
   protectedRefs: Set<string>,
+  precomputedCovered?: Set<string>,
+  precomputedIntegrityPre?: IntegrityPre,
 ): CompressibleRange[] {
   if (units.length === 0) return units;
-  const coverage = collectCoverage(state);
+  const coverage = precomputedCovered ?? collectCoverage(state);
   // #5337 option A: the O(n) per-pass derivations (index map, carrier scan,
   // protected/latest/aged collectors, pair map, anchor, integrity pre) used
   // to be rebuilt INSIDE projectUnit for every screened unit — O(units x n).
   // Build them once here and share across all units in this pass; the
   // judgment itself is unchanged.
-  const shared = buildProjectionShared(source, state, config);
+  const shared = buildProjectionShared(
+    source,
+    state,
+    config,
+    coverage,
+    precomputedIntegrityPre,
+  );
   return units.filter((unit) => {
     let projection: UnitProjection | undefined;
     try {

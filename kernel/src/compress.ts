@@ -2,7 +2,8 @@ import { assignRefs, BLOCKED_REF, highestUsedIndex, indexToRef, refToIndex } fro
 import { remintCoveredLiveIds } from "./instance-reid.js";
 import { prune } from "./prune.js";
 import { syncBlocks } from "./sync.js";
-import { advanceSurvival, activeBlocks, blockById } from "./state.js";
+import { advanceSurvival, activeBlocks, blockById, coveredMessageIds } from "./state.js";
+import { buildIntegrityPre } from "./turn-integrity.js";
 import { allocateBlockId, allocateRunId, createInitialState } from "./state.js";
 import { countMessageTokens, defaultCountTokens } from "./tokenize.js";
 import { validateConfig } from "./config.js";
@@ -1460,17 +1461,20 @@ const hideCompressCallsNode: PipelineNode = {
 const recommendNode: PipelineNode = {
   name: "recommend",
   run(io, ctx) {
+    const covered = coveredMessageIds(io.state);
     const protectedRefs = computeProtectedRefs(
       io.messages,
       io.state,
       ctx.config,
       ctx.countTokens,
+      covered,
     );
     // #3236: screening must judge on the exact array class applyCompression
     // runs on — the host's applyView when provided, else the pre-prune
     // original (#2663 integritySource), else the view itself.
     const screenArray =
       io.effects.applyView ?? io.effects.originalMessages ?? io.messages;
+    const integrityPre = buildIntegrityPre(screenArray);
     const contextRanges = buildCompressibleRanges(
       io.messages,
       io.state,
@@ -1478,6 +1482,8 @@ const recommendNode: PipelineNode = {
       protectedRefs,
       ctx.countTokens,
       screenArray,
+      covered,
+      integrityPre,
     );
     const nothingToCompress = contextRanges.compressible.length === 0;
     // #3236: re-screen each merged unit through the SAME judgment
@@ -1487,16 +1493,28 @@ const recommendNode: PipelineNode = {
     // alone passed turns whose partners sit in another advertised unit, so
     // every submission of such a range threw (permanent advertise/reject
     // loop in production).
-    const recommendedRanges = screenRecommendedUnits(
-      mergeRangesToThreshold(
-        contextRanges.compressible,
-        ctx.config.compress.minCompressRange,
-      ),
-      screenArray,
-      io.state,
-      ctx.config,
-      computeProtectedRefs(screenArray, io.state, ctx.config, ctx.countTokens),
+    const mergedUnits = mergeRangesToThreshold(
+      contextRanges.compressible,
+      ctx.config.compress.minCompressRange,
     );
+    const recommendedRanges =
+      mergedUnits.length > 0
+        ? screenRecommendedUnits(
+            mergedUnits,
+            screenArray,
+            io.state,
+            ctx.config,
+            computeProtectedRefs(
+              screenArray,
+              io.state,
+              ctx.config,
+              ctx.countTokens,
+              covered,
+            ),
+            covered,
+            integrityPre,
+          )
+        : mergedUnits;
     const recommendation: Recommendation = {
       contextRanges,
       recommendedRanges,

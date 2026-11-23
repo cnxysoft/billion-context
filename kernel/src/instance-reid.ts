@@ -56,6 +56,42 @@ export function remintCoveredLiveIds(
   messages: CoreMessage[],
   state: CompressionState,
 ): CoreMessage[] {
+  // Pre-feature persisted state has no prior-pass snapshot: fall back to
+  // renumber-nothing (0.0.95 semantics) for this one pass. The snapshot is
+  // written below in processTurn, so the next pass discriminates correctly.
+  if (!state.lastPassIds) return messages;
+  if (state.blocks.length === 0) return messages;
+
+  const prior = new Set(state.lastPassIds);
+  // Fast exit: only genuinely NEW messages (absent from prior) with a content-
+  // hash root can ever be renumbered, and only when one of their bases appears
+  // in some block's effectiveMessageIds. On steady-state warm turns only a
+  // handful of tail messages are absent from prior, and almost never collide
+  // with any folded block — checking those bases against blocks avoids
+  // allocating 100K-entry coveredBases/inactiveBases sets and a 33K-entry
+  // cluster-root Map on every turn.
+  let newBases: Set<string> | null = null;
+  for (let i = 0; i < messages.length; i++) {
+    const id = messages[i]!.id;
+    if (prior.has(id)) continue;
+    if (clusterRoot(id) === null) continue;
+    if (newBases === null) newBases = new Set<string>();
+    newBases.add(baseIdOf(id));
+  }
+  if (newBases === null) return messages;
+
+  let anyCollision = false;
+  for (let b = 0; b < state.blocks.length && !anyCollision; b++) {
+    const eff = state.blocks[b]!.effectiveMessageIds;
+    for (let j = 0; j < eff.length; j++) {
+      if (newBases.has(baseIdOf(eff[j]!))) {
+        anyCollision = true;
+        break;
+      }
+    }
+  }
+  if (!anyCollision) return messages;
+
   const coveredBases = new Set<string>();
   for (const id of coveredMessageIds(state)) coveredBases.add(baseIdOf(id));
   const inactiveBases = new Set<string>();
@@ -66,11 +102,6 @@ export function remintCoveredLiveIds(
     }
   }
   if (coveredBases.size === 0 && inactiveBases.size === 0) return messages;
-  // Pre-feature persisted state has no prior-pass snapshot: fall back to
-  // renumber-nothing (0.0.95 semantics) for this one pass. The snapshot is
-  // written below in processTurn, so the next pass discriminates correctly.
-  if (!state.lastPassIds) return messages;
-  const prior = new Set(state.lastPassIds);
 
   const groups = new Map<string, number[]>();
   for (let i = 0; i < messages.length; i++) {

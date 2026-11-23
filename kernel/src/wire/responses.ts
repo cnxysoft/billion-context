@@ -7,6 +7,8 @@ import {
   canonicalToolArgs,
   deriveCanonicalMessageId,
   imageMediaFingerprint,
+  rememberCanonicalBaseId,
+  reuseCanonicalBaseId,
 } from "./identity.js";
 import type { ConversationIdentity } from "./util.js";
 import { hashId } from "./util.js";
@@ -222,9 +224,18 @@ function reasoningText(item: ResponseInputItem): string {
   );
 }
 
+export interface ResponsesToCoreOptions {
+  /** Prior turn's projected CoreMessage array (e.g. session.lastMessages).
+   *  Used purely as a positional hint to reuse canonical base ids when all
+   *  seed fields match verbatim — never alters output. */
+  prevMsgs?: readonly CoreMessage[];
+}
+
 export function responsesToCore(
   body: ResponsesRequestBody,
+  opts?: ResponsesToCoreOptions,
 ): ResponsesProjection {
+  const prevMsgs = opts?.prevMsgs;
   const msgs: BiliMessage[] = [];
   const systemParts: string[] = [];
   const preamble: ResponseInputItem[] = [];
@@ -278,16 +289,33 @@ export function responsesToCore(
         // same bytes ⇒ same id in every future pass.
         const text = reasoningText(item);
         const rid = text.length > 0 ? text : canonicalOpaqueSeed(item);
-        coreId = clusters.next(
-          deriveCanonicalMessageId("assistant", "reasoning", rid),
-        );
-        msgs.push({
+        const base =
+          text.length > 0
+            ? (reuseCanonicalBaseId(
+                prevMsgs?.[msgs.length],
+                "assistant",
+                "reasoning",
+                text,
+              ) ?? deriveCanonicalMessageId("assistant", "reasoning", text))
+            : deriveCanonicalMessageId("assistant", "reasoning", rid);
+        coreId = clusters.next(base);
+        const reasoningMsg: BiliMessage = {
           id: coreId,
           role: "assistant",
           contentType: "reasoning",
           text: rid,
           rawResponsesItem: item,
-        });
+        };
+        if (text.length > 0) {
+          rememberCanonicalBaseId(
+            reasoningMsg,
+            "assistant",
+            "reasoning",
+            text,
+            base,
+          );
+        }
+        msgs.push(reasoningMsg);
         break;
       }
       case "message": {
@@ -360,17 +388,27 @@ export function responsesToCore(
                 typeof part.text === "string" &&
                 part.text.length > 0
               ) {
-                const base = deriveCanonicalMessageId(
-                  "user",
-                  "text",
-                  part.text,
-                );
-                msgs.push({
+                const base =
+                  reuseCanonicalBaseId(
+                    prevMsgs?.[msgs.length],
+                    "user",
+                    "text",
+                    part.text,
+                  ) ?? deriveCanonicalMessageId("user", "text", part.text);
+                const splitTextMsg: BiliMessage = {
                   id: clusters.next(base),
                   role: "user",
                   contentType: "text",
                   text: part.text,
-                });
+                };
+                rememberCanonicalBaseId(
+                  splitTextMsg,
+                  "user",
+                  "text",
+                  part.text,
+                  base,
+                );
+                msgs.push(splitTextMsg);
               } else if (
                 part.type === "input_image" &&
                 typeof part.image_url === "string"
@@ -466,11 +504,18 @@ export function responsesToCore(
                   })
                   .join(",") || undefined
               : undefined;
-            coreId = clusters.next(
-              deriveCanonicalMessageId(role, "text", displayText, {
-                mediaFingerprint,
-              }),
-            );
+            const base =
+              mediaFingerprint === undefined
+                ? (reuseCanonicalBaseId(
+                    prevMsgs?.[msgs.length],
+                    role,
+                    "text",
+                    displayText,
+                  ) ?? deriveCanonicalMessageId(role, "text", displayText))
+                : deriveCanonicalMessageId(role, "text", displayText, {
+                    mediaFingerprint,
+                  });
+            coreId = clusters.next(base);
             const imageUrl = Array.isArray(message.content)
               ? message.content.find(
                   (part) =>
@@ -480,7 +525,7 @@ export function responsesToCore(
               : undefined;
             const image =
               typeof imageUrl === "string" ? parseDataUrl(imageUrl) : undefined;
-            msgs.push({
+            const textMsg: BiliMessage = {
               id: coreId,
               role,
               contentType: "text",
@@ -489,7 +534,11 @@ export function responsesToCore(
               ...(image
                 ? { imageMediaType: image.mediaType, imageBase64: image.base64 }
                 : {}),
-            });
+            };
+            if (mediaFingerprint === undefined) {
+              rememberCanonicalBaseId(textMsg, role, "text", displayText, base);
+            }
+            msgs.push(textMsg);
           }
         }
         break;
@@ -499,39 +548,66 @@ export function responsesToCore(
         // #3642: canonical args in the seed (key-sorted, compact — same
         // normalization as the other codecs); the wire call_id stays on the
         // toolCallId FIELD (pairing) but is out of the seed.
-        coreId = clusters.next(
+        const rawArgs = call.arguments ?? "";
+        const base =
+          reuseCanonicalBaseId(
+            prevMsgs?.[msgs.length],
+            "assistant",
+            "tool-call",
+            rawArgs,
+            call.name,
+          ) ??
           deriveCanonicalMessageId(
             "assistant",
             "tool-call",
-            canonicalToolArgs(call.arguments ?? ""),
+            canonicalToolArgs(rawArgs),
             { toolName: call.name },
-          ),
-        );
-        msgs.push({
+          );
+        coreId = clusters.next(base);
+        const callMsg: BiliMessage = {
           id: coreId,
           role: "assistant",
           contentType: "tool-call",
           toolName: call.name,
           toolCallId: call.call_id,
-          text: call.arguments ?? "",
+          text: rawArgs,
           rawResponsesItem: item,
-        });
+        };
+        rememberCanonicalBaseId(
+          callMsg,
+          "assistant",
+          "tool-call",
+          rawArgs,
+          base,
+          call.name,
+        );
+        msgs.push(callMsg);
         toolNames.set(call.call_id, call.name);
         break;
       }
       case "function_call_output": {
         const output = item as ResponseFunctionCallOutput;
-        const text =
-          typeof output.output === "string"
-            ? output.output
-            : JSON.stringify(output.output);
-        coreId = clusters.next(
-          deriveCanonicalMessageId("tool", "tool-result", text, {
-            toolName: toolNames.get(output.call_id),
-          }),
-        );
+        const isStringOut = typeof output.output === "string";
+        const text = isStringOut
+          ? output.output
+          : JSON.stringify(output.output);
         const name = toolNames.get(output.call_id);
-        msgs.push({
+        const base = isStringOut
+          ? (reuseCanonicalBaseId(
+              prevMsgs?.[msgs.length],
+              "tool",
+              "tool-result",
+              text,
+              name,
+            ) ??
+            deriveCanonicalMessageId("tool", "tool-result", text, {
+              toolName: name,
+            }))
+          : deriveCanonicalMessageId("tool", "tool-result", text, {
+              toolName: name,
+            });
+        coreId = clusters.next(base);
+        const outMsg: BiliMessage = {
           id: coreId,
           role: "tool",
           contentType: "tool-result",
@@ -539,7 +615,11 @@ export function responsesToCore(
           text,
           ...(name ? { toolName: name } : {}),
           rawResponsesItem: item,
-        });
+        };
+        if (isStringOut) {
+          rememberCanonicalBaseId(outMsg, "tool", "tool-result", text, base, name);
+        }
+        msgs.push(outMsg);
         break;
       }
       case "computer_call":
@@ -574,38 +654,66 @@ export function responsesToCore(
         const callId = ctc.call_id ?? `call_${idx}`;
         customToolCallIds.add(callId);
         const argText = ctc.input ?? ctc.arguments ?? "";
-        coreId = clusters.next(
+        const ctcName = ctc.name ?? "custom";
+        const base =
+          reuseCanonicalBaseId(
+            prevMsgs?.[msgs.length],
+            "assistant",
+            "tool-call",
+            argText,
+            ctcName,
+          ) ??
           deriveCanonicalMessageId("assistant", "tool-call", argText, {
-            toolName: ctc.name ?? "custom",
-          }),
-        );
-        msgs.push({
+            toolName: ctcName,
+          });
+        coreId = clusters.next(base);
+        const ctcMsg: BiliMessage = {
           id: coreId,
           role: "assistant",
           contentType: "tool-call",
-          toolName: ctc.name ?? "custom",
+          toolName: ctcName,
           toolCallId: callId,
           text: argText,
           rawResponsesItem: item,
-        });
-        toolNames.set(callId, ctc.name ?? "custom");
+        };
+        rememberCanonicalBaseId(
+          ctcMsg,
+          "assistant",
+          "tool-call",
+          argText,
+          base,
+          ctcName,
+        );
+        msgs.push(ctcMsg);
+        toolNames.set(callId, ctcName);
         break;
       }
       case "custom_tool_call_output": {
         const ctco = item as { call_id?: string; output?: string };
         const callId = ctco.call_id ?? `call_${idx}`;
         customToolCallIds.add(callId);
-        const outText =
+        const isStringOut = typeof ctco.output === "string";
+        const outText: string =
           typeof ctco.output === "string"
             ? ctco.output
             : JSON.stringify(ctco.output ?? "");
-        coreId = clusters.next(
-          deriveCanonicalMessageId("tool", "tool-result", outText, {
-            toolName: toolNames.get(callId),
-          }),
-        );
         const name = toolNames.get(callId);
-        msgs.push({
+        const base = isStringOut
+          ? (reuseCanonicalBaseId(
+              prevMsgs?.[msgs.length],
+              "tool",
+              "tool-result",
+              outText,
+              name,
+            ) ??
+            deriveCanonicalMessageId("tool", "tool-result", outText, {
+              toolName: name,
+            }))
+          : deriveCanonicalMessageId("tool", "tool-result", outText, {
+              toolName: name,
+            });
+        coreId = clusters.next(base);
+        const ctcoMsg: BiliMessage = {
           id: coreId,
           role: "tool",
           contentType: "tool-result",
@@ -613,7 +721,18 @@ export function responsesToCore(
           text: outText,
           ...(name ? { toolName: name } : {}),
           rawResponsesItem: item,
-        });
+        };
+        if (isStringOut) {
+          rememberCanonicalBaseId(
+            ctcoMsg,
+            "tool",
+            "tool-result",
+            outText,
+            base,
+            name,
+          );
+        }
+        msgs.push(ctcoMsg);
         break;
       }
       default:

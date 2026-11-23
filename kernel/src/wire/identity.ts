@@ -101,6 +101,62 @@ export function deriveCanonicalMessageId(
   return "h_" + hashId(seed);
 }
 
+interface CanonicalBaseCacheEntry {
+  role: string;
+  contentType: string;
+  toolName: string;
+  rawText: string;
+  baseId: string;
+}
+
+const canonicalBaseCache = new WeakMap<object, CanonicalBaseCacheEntry>();
+
+/** Record the canonical base id (pre-ClusterCounter) for a freshly constructed
+ *  non-media CoreMessage so full-resend follow-up turns can verify exact seed
+ *  field equality against the prior turn's message object and reuse its base
+ *  id without re-running canonicalToolArgs or SHA-256. */
+export function rememberCanonicalBaseId(
+  msg: object,
+  role: string,
+  contentType: string,
+  rawText: string,
+  baseId: string,
+  toolName?: string,
+): void {
+  if (idSalt !== null) return;
+  canonicalBaseCache.set(msg, {
+    role,
+    contentType,
+    toolName: toolName ?? "",
+    rawText,
+    baseId,
+  });
+}
+
+/** Reuse the cached canonical base id from `prevMsg` when every hash-seed input
+ *  matches verbatim (role, contentType, toolName, rawText) and no test salt is
+ *  active. Returns null on any mismatch or absence. */
+export function reuseCanonicalBaseId(
+  prevMsg: object | undefined,
+  role: string,
+  contentType: string,
+  rawText: string,
+  toolName?: string,
+): string | null {
+  if (idSalt !== null || prevMsg === undefined) return null;
+  const cached = canonicalBaseCache.get(prevMsg);
+  if (
+    cached !== undefined &&
+    cached.role === role &&
+    cached.contentType === contentType &&
+    cached.toolName === (toolName ?? "") &&
+    cached.rawText === rawText
+  ) {
+    return cached.baseId;
+  }
+  return null;
+}
+
 /** #3751 — media fingerprint for image-bearing cores.
  *
  * Pre-#3751 every image core shared the same canonical text ("[image]"), so

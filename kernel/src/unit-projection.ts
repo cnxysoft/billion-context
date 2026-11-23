@@ -447,7 +447,7 @@ export function projectUnit(input: UnitProjectionInput): UnitProjection {
     let survivingCoverage = new Set<string>();
     if (isMerge) {
       const consumedSet = new Set(consumedBlockIds);
-      for (const block of activeBlocks(input.state)) {
+      for (const block of shared?.activeBlocksList ?? activeBlocks(input.state)) {
         const target = consumedSet.has(block.blockId)
           ? consumedCoverage
           : survivingCoverage;
@@ -878,6 +878,8 @@ export function buildProjectionShared(
   messages: CoreMessage[],
   state: CompressionState,
   config: Config,
+  precomputedCovered?: Set<string>,
+  precomputedIntegrityPre?: IntegrityPre,
 ): ProjectionShared {
   const byId = buildIndexByMessageId(messages);
   const activeBlocksList = activeBlocks(state);
@@ -916,8 +918,12 @@ export function buildProjectionShared(
     baseProtectedCallIds,
     pairByCallId: buildPairMap(messages),
     toolPairExtremes: buildToolPairExtremes(messages),
-    anchorMessage: lastUserAnchor(messages, coveredMessageIds(state), config),
-    integrityPre: buildIntegrityPre(messages),
+    anchorMessage: lastUserAnchor(
+      messages,
+      precomputedCovered ?? coveredMessageIds(state),
+      config,
+    ),
+    integrityPre: precomputedIntegrityPre ?? buildIntegrityPre(messages),
     activeBlocksList,
     blockEarliestIndex,
   };

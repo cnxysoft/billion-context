@@ -1,4 +1,4 @@
-import { orderedRefPair } from "./refs.js";
+import { orderedRefPair, refToIndex } from "./refs.js";
 import type {
   BlockSpan,
   CompressionBlock,
@@ -7,6 +7,8 @@ import type {
 } from "./types.js";
 
 function refNum(ref: string): number {
+  const fast = refToIndex(ref);
+  if (fast !== null) return fast;
   const m = ref.match(/\d+/);
   return m ? parseInt(m[0], 10) : 0;
 }
@@ -34,12 +36,34 @@ export function resolveBlockSpan(
     const [startRef, endRef] = orderedRefPair(block.startRef, block.endRef);
     return { startRef, endRef };
   }
-  const refs = block.effectiveMessageIds
-    .map((id) => byRaw[id])
-    .filter((r): r is string => typeof r === "string" && r !== "BLOCKED");
-  if (refs.length === 0) return null;
-  const sorted = [...refs].sort((a, b) => refNum(a) - refNum(b));
-  return { startRef: sorted[0]!, endRef: sorted[sorted.length - 1]! };
+  const ids = block.effectiveMessageIds;
+  let startRef: string | null = null;
+  let endRef: string | null = null;
+  let minNum = Infinity;
+  let maxNum = -Infinity;
+  for (let i = 0; i < ids.length; i++) {
+    const r = byRaw[ids[i]!];
+    if (typeof r !== "string" || r === "BLOCKED") continue;
+    const n = refNum(r);
+    // Strict `<` keeps first minimum; `>=` keeps last maximum — matches stable sort[0] / sort[last].
+    if (startRef === null) {
+      startRef = r;
+      endRef = r;
+      minNum = n;
+      maxNum = n;
+    } else {
+      if (n < minNum) {
+        minNum = n;
+        startRef = r;
+      }
+      if (n >= maxNum) {
+        maxNum = n;
+        endRef = r;
+      }
+    }
+  }
+  if (startRef === null || endRef === null) return null;
+  return { startRef, endRef };
 }
 
 export function activeBlockSpans(state: CompressionState): BlockSpan[] {
