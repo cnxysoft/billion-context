@@ -950,6 +950,7 @@ export function planReconciliation(
      *  the missing computation so their permanent absence never triggers the
      *  multi-channel alignment (the O(full-history) tax of #5139). */
     expectedAbsent?: ReadonlySet<string>,
+    preBuiltById?: ReadonlyMap<string, CoreMessage>,
 ): ReconciliationPlan {
     const plan: ReconciliationPlan = { claims: new Map(), byPos: 0, byTool: 0, byTwin: 0, bySim: 0, byOrder: 0, byNorm: 0, byTurn: 0, byImage: 0, unmatched: [], idRewriteSuspects: 0, newOrder: [], nextCanon: undefined, resyncs: 0, byShape: 0, absentEverywhere: [], nearDupResidual: [] };
     // #2480: the positional copy is built on EVERY pass, so the first pass
@@ -958,12 +959,10 @@ export function planReconciliation(
     // same bytes = same fingerprint, wherever the message now sits — steady
     // state pays zero projections even when positions shift (head deletion,
     // truncation), not just when the array is byte-identical.
-    const canonById = new Map<string, string>();
-    if (positions !== undefined) {
-        const pids = positions.ids;
-        const pcanon = positions.canon;
-        for (let i = 0; i < pids.length && i < pcanon.length; i++) canonById.set(pids[i], pcanon[i]);
-    }
+    const posIds = positions?.ids;
+    const posCanon = positions?.canon;
+    const posLen = posIds !== undefined && posCanon !== undefined ? Math.min(posIds.length, posCanon.length) : 0;
+    let canonById: Map<string, string> | undefined;
     // Pass 0's old-side coordinate system is only valid when the stored copy's
     // ids align 1:1 with the order backbone. Self-contained storage makes the
     // check exact: a desync (backbone semantics drift, partial write) disables
@@ -979,13 +978,33 @@ export function planReconciliation(
     }
     const canon: string[] = [];
     const newOrder: string[] = [];
-    const byId = new Map<string, CoreMessage>();
+    const ownById = preBuiltById === undefined ? new Map<string, CoreMessage>() : undefined;
+    const byId: ReadonlyMap<string, CoreMessage> = preBuiltById ?? ownById!;
+    let posPrefixAligned = posLen > 0;
     for (const m of msgs) {
         if (m.id === undefined) continue;
         const i = newOrder.length;
         newOrder.push(m.id);
-        byId.set(m.id, m);
-        const priorCanon = canonById.get(m.id);
+        if (ownById !== undefined) ownById.set(m.id, m);
+        if (i < posLen) {
+            if (posIds![i] === m.id) {
+                canon.push(posCanon![i]!);
+                continue;
+            }
+            posPrefixAligned = false;
+        } else if (posPrefixAligned) {
+            // Every stored position already matched 1:1 at its own index; any
+            // appended tail item is either brand new or a rare duplicate whose
+            // deterministic fingerprint equals the stored one without paying
+            // an O(history) Map build.
+            canon.push(positionalFingerprint(m));
+            continue;
+        }
+        if (canonById === undefined && posLen > 0) {
+            canonById = new Map<string, string>();
+            for (let j = 0; j < posLen; j++) canonById.set(posIds![j]!, posCanon![j]!);
+        }
+        const priorCanon = canonById?.get(m.id);
         canon.push(priorCanon !== undefined ? priorCanon : positionalFingerprint(m));
     }
     plan.newOrder = newOrder;
@@ -1879,7 +1898,8 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
     }
     let expectedSize = Object.keys(expected).length;
 
-    const plan = planReconciliation(oldOrder, anchors, msgs, covered, positions, new Set(Object.keys(expected)));
+    const expectedKeys = expectedSize > 0 ? new Set(Object.keys(expected)) : undefined;
+    const plan = planReconciliation(oldOrder, anchors, msgs, covered, positions, expectedKeys, byId);
     if (plan.pass0Desync) {
         loggerLog("warn", `[fold-reconcile] Pass 0 disabled: stored positional copy desynced from order backbone (session=${session.id}, copyIds=${positions?.ids.length ?? -1}, backbone=${oldOrder.length})`);
     }
@@ -2001,98 +2021,123 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
         message !== undefined && message.id !== undefined && message.role === "assistant"
         && (message.toolCallId === undefined || message.toolCallId === "")
             ? ctxOf(message.id) : undefined;
-    const nextAnchors: Record<string, FoldAnchor> = {};
-    let anchorCount = 0;
-    for (const id of covered) {
-        // #2334: enforce the cap WHILE building. The old build-all-then-delete
-        // form computed a full normalization + sha256 for every covered id and
-        // discarded the overflow — and the discarded ids had no stored anchor
-        // to reuse, so EVERY subsequent pass recomputed and dropped them again
-        // (a 20k-id session paid 3616 wasted hashes per request). Capping at
-        // MAX_ANCHORS keeps exactly the old survivor set (first MAX_ANCHORS in
-        // covered order — the deletion loop removed precisely the tail) and the
-        // key order.
-        // #3752: ids PAST the cap no longer fall out entirely — tool cores get
-        // a hash-free lite anchor ({r, c, t, b}) so Pass 1's toolCallId channel
-        // reaches them at any session length. Before this, the positional scan
-        // was their only path, and it dies after MAX_RESYNC_GAPS accumulated
-        // breaks — on long sessions with weeks of genuine drift that turned
-        // bili's own identity re-key (#3658) into a mass unfold (the incident
-        // that opened #3752). Non-tool cores past the cap keep the old status
-        // quo (positional-only): their channels need text hashes, exactly the
-        // cost the window bounds.
-        const claimed = plan.claims.get(id);
-        if (claimed !== undefined) {
-            for (const nid of new Set(claimed)) {
-                if (nextAnchors[nid] !== undefined) continue;
-                const message = byId.get(nid);
-                if (message === undefined) continue;
-                if (anchorCount < MAX_ANCHORS) {
-                    nextAnchors[nid] = anchorFrom(message, turnCtxFor(message));
-                    anchorCount++;
-                } else if (message.toolCallId !== undefined && message.toolCallId !== "") {
-                    nextAnchors[nid] = liteToolAnchorFrom(message);
+    let nextAnchors: Record<string, FoldAnchor>;
+    const canReuseAnchors = (() => {
+        if (plan.claims.size > 0) return false;
+        const priorKeys = Object.keys(anchors);
+        if (priorKeys.length !== covered.size) return false;
+        let idx = 0;
+        for (const id of covered) {
+            if (priorKeys[idx] !== id) return false;
+            const prior = anchors[id];
+            if (prior === undefined) return false;
+            if (idx < MAX_ANCHORS) {
+                if ((prior.t !== undefined && prior.m === undefined)
+                    || (prior.p === undefined && prior.r === "assistant" && prior.t === undefined)
+                    || prior.c === undefined) {
+                    return false;
                 }
             }
-            continue;
+            idx++;
         }
-        // An unchanged id means unchanged bytes (kernel deriveMessageId hashes
-        // exactly the fields normalizedIdentity covers), so the stored anchor is
-        // necessarily still valid — reuse it instead of re-normalizing +
-        // re-hashing the full text every pass (#1930-2: keeps steady-state
-        // rounds near-free on 8K-message histories).
-        const prior = anchors[id];
-        if (prior !== undefined) {
-            if (anchorCount >= MAX_ANCHORS) {
-                // Reuse verbatim, no backfill: past the window the stored
-                // anchor (full or lite) already carries everything any
-                // reachable channel needs, and backfilling would pay hashes
-                // for nothing (#2334 steady-state contract, extended to the
-                // tail).
-                nextAnchors[id] = prior;
+        return idx === priorKeys.length;
+    })();
+    if (canReuseAnchors) {
+        nextAnchors = anchors;
+    } else {
+        nextAnchors = {};
+        let anchorCount = 0;
+        for (const id of covered) {
+            // #2334: enforce the cap WHILE building. The old build-all-then-delete
+            // form computed a full normalization + sha256 for every covered id and
+            // discarded the overflow — and the discarded ids had no stored anchor
+            // to reuse, so EVERY subsequent pass recomputed and dropped them again
+            // (a 20k-id session paid 3616 wasted hashes per request). Capping at
+            // MAX_ANCHORS keeps exactly the old survivor set (first MAX_ANCHORS in
+            // covered order — the deletion loop removed precisely the tail) and the
+            // key order.
+            // #3752: ids PAST the cap no longer fall out entirely — tool cores get
+            // a hash-free lite anchor ({r, c, t, b}) so Pass 1's toolCallId channel
+            // reaches them at any session length. Before this, the positional scan
+            // was their only path, and it dies after MAX_RESYNC_GAPS accumulated
+            // breaks — on long sessions with weeks of genuine drift that turned
+            // bili's own identity re-key (#3658) into a mass unfold (the incident
+            // that opened #3752). Non-tool cores past the cap keep the old status
+            // quo (positional-only): their channels need text hashes, exactly the
+            // cost the window bounds.
+            const claimed = plan.claims.get(id);
+            if (claimed !== undefined) {
+                for (const nid of new Set(claimed)) {
+                    if (nextAnchors[nid] !== undefined) continue;
+                    const message = byId.get(nid);
+                    if (message === undefined) continue;
+                    if (anchorCount < MAX_ANCHORS) {
+                        nextAnchors[nid] = anchorFrom(message, turnCtxFor(message));
+                        anchorCount++;
+                    } else if (message.toolCallId !== undefined && message.toolCallId !== "") {
+                        nextAnchors[nid] = liteToolAnchorFrom(message);
+                    }
+                }
                 continue;
             }
-            // #2396: anchors persisted before the no-toolCallId norm existed
-            // lack `m`; backfill it while the bytes are still on the wire —
-            // one extra normalization per such anchor, once (same-id means
-            // same identity fields, so recomputing from live bytes is exact).
-            if (prior.t !== undefined && prior.m === undefined) {
-                const message = byId.get(id);
-                nextAnchors[id] = message !== undefined ? anchorFrom(message) : prior;
-            } else if (prior.p === undefined && prior.r === "assistant" && prior.t === undefined) {
-                // #2636: anchor persisted before turn keys existed: backfill
-                // p/x while the bytes are still on the wire (same-id ⇒ same
-                // identity fields, so recomputing from live bytes is exact) —
-                // once per anchor, then reuse resumes (#2396 backfill
-                // pattern). Bare assistant anchors only: user/tool anchors
-                // never carry a turn key, so "p === undefined" is their
-                // steady shape — rebuilding them every pass would break the
-                // #2334 zero-work steady-state contract.
-                const message = byId.get(id);
-                nextAnchors[id] = message !== undefined ? anchorFrom(message, ctxOf(id)) : prior;
-            } else if (prior.c === undefined) {
-                // #2732 review supplement: anchors persisted before FoldAnchor.c
-                // existed carry no content-type class and would stay classified
-                // as non-reasoning forever — session state outlives the process,
-                // so pre-upgrade sessions would never reach the reasoning-drop
-                // tolerance. Same backfill pattern as #2396/#2636: recompute
-                // from live bytes once (same-id ⇒ same identity fields incl.
-                // contentType), then steady-state reuse resumes.
-                const message = byId.get(id);
-                nextAnchors[id] = message !== undefined ? anchorFrom(message, turnCtxFor(message)) : prior;
-            } else {
-                nextAnchors[id] = prior;
-            }
-            anchorCount++;
-            continue;
-        }
-        const message = byId.get(id);
-        if (message !== undefined) {
-            if (anchorCount < MAX_ANCHORS) {
-                nextAnchors[id] = anchorFrom(message, turnCtxFor(message));
+            // An unchanged id means unchanged bytes (kernel deriveMessageId hashes
+            // exactly the fields normalizedIdentity covers), so the stored anchor is
+            // necessarily still valid — reuse it instead of re-normalizing +
+            // re-hashing the full text every pass (#1930-2: keeps steady-state
+            // rounds near-free on 8K-message histories).
+            const prior = anchors[id];
+            if (prior !== undefined) {
+                if (anchorCount >= MAX_ANCHORS) {
+                    // Reuse verbatim, no backfill: past the window the stored
+                    // anchor (full or lite) already carries everything any
+                    // reachable channel needs, and backfilling would pay hashes
+                    // for nothing (#2334 steady-state contract, extended to the
+                    // tail).
+                    nextAnchors[id] = prior;
+                    continue;
+                }
+                // #2396: anchors persisted before the no-toolCallId norm existed
+                // lack `m`; backfill it while the bytes are still on the wire —
+                // one extra normalization per such anchor, once (same-id means
+                // same identity fields, so recomputing from live bytes is exact).
+                if (prior.t !== undefined && prior.m === undefined) {
+                    const message = byId.get(id);
+                    nextAnchors[id] = message !== undefined ? anchorFrom(message) : prior;
+                } else if (prior.p === undefined && prior.r === "assistant" && prior.t === undefined) {
+                    // #2636: anchor persisted before turn keys existed: backfill
+                    // p/x while the bytes are still on the wire (same-id ⇒ same
+                    // identity fields, so recomputing from live bytes is exact) —
+                    // once per anchor, then reuse resumes (#2396 backfill
+                    // pattern). Bare assistant anchors only: user/tool anchors
+                    // never carry a turn key, so "p === undefined" is their
+                    // steady shape — rebuilding them every pass would break the
+                    // #2334 zero-work steady-state contract.
+                    const message = byId.get(id);
+                    nextAnchors[id] = message !== undefined ? anchorFrom(message, ctxOf(id)) : prior;
+                } else if (prior.c === undefined) {
+                    // #2732 review supplement: anchors persisted before FoldAnchor.c
+                    // existed carry no content-type class and would stay classified
+                    // as non-reasoning forever — session state outlives the process,
+                    // so pre-upgrade sessions would never reach the reasoning-drop
+                    // tolerance. Same backfill pattern as #2396/#2636: recompute
+                    // from live bytes once (same-id ⇒ same identity fields incl.
+                    // contentType), then steady-state reuse resumes.
+                    const message = byId.get(id);
+                    nextAnchors[id] = message !== undefined ? anchorFrom(message, turnCtxFor(message)) : prior;
+                } else {
+                    nextAnchors[id] = prior;
+                }
                 anchorCount++;
-            } else if (message.toolCallId !== undefined && message.toolCallId !== "") {
-                nextAnchors[id] = liteToolAnchorFrom(message);
+                continue;
+            }
+            const message = byId.get(id);
+            if (message !== undefined) {
+                if (anchorCount < MAX_ANCHORS) {
+                    nextAnchors[id] = anchorFrom(message, turnCtxFor(message));
+                    anchorCount++;
+                } else if (message.toolCallId !== undefined && message.toolCallId !== "") {
+                    nextAnchors[id] = liteToolAnchorFrom(message);
+                }
             }
         }
     }
@@ -2135,33 +2180,32 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
     // below persists the witness when the episode actually starts, so a
     // foreign wire can never quietly become the baseline mid-episode.
     const continuityBaseline = witness ?? oldOrder;
-    let wireContinuity = false;
-    // #3724: the MIRROR of wireContinuity — TAIL truncation (host rewind/undo
-    // deletes the NEWEST turns instead of the oldest). The resent wire is a
-    // clean PREFIX-CUT of the baseline: the shared ids (commonInbound, in
-    // inbound order) form a contiguous run at the FRONT of both the baseline
-    // and the inbound wire, AND the baseline extended beyond that prefix
-    // (commonPrefix < baseline length ⇒ something was cut off the newest end).
-    // Head truncation above keeps the tail; this keeps the head. A plain
-    // append keeps the whole baseline (prefix == baseline, not strictly
-    // shorter) so it never fires; a mid-history edit or wholesale replacement
-    // breaks the contiguous-front check and stays honest drift.
-    let tailTruncated = false;
-    if (continuityBaseline.length > 0) {
-        const witness = continuityBaseline;
+    // Lazy continuity check: only drift passes with unmatched/absent ids ever
+    // consult wireContinuity or tailTruncated, so clean passes avoid building
+    // two O(history) Sets and four O(history) filtered/sliced arrays.
+    let continuityResult: { wireContinuity: boolean; tailTruncated: boolean } | undefined;
+    const getContinuity = (): { wireContinuity: boolean; tailTruncated: boolean } => {
+        if (continuityResult !== undefined) return continuityResult;
+        if (continuityBaseline.length === 0) {
+            continuityResult = { wireContinuity: false, tailTruncated: false };
+            return continuityResult;
+        }
+        const w = continuityBaseline;
         const inboundSet = new Set(plan.newOrder);
-        const witnessSet = new Set(witness);
-        const commonWitness = witness.filter((id) => inboundSet.has(id));
+        const witnessSet = new Set(w);
+        const commonWitness = w.filter((id) => inboundSet.has(id));
         const commonInbound = plan.newOrder.filter((id) => witnessSet.has(id));
-        wireContinuity = commonWitness.length > 0
-            && witness.slice(witness.length - commonWitness.length).every((id) => inboundSet.has(id))
+        const wireContinuity = commonWitness.length > 0
+            && w.slice(w.length - commonWitness.length).every((id) => inboundSet.has(id))
             && plan.newOrder.slice(0, commonInbound.length).every((id) => witnessSet.has(id));
         const commonPrefix = commonInbound;
-        tailTruncated = commonPrefix.length > 0
-            && commonPrefix.length < witness.length
-            && witness.slice(0, commonPrefix.length).every((id) => inboundSet.has(id))
+        const tailTruncated = commonPrefix.length > 0
+            && commonPrefix.length < w.length
+            && w.slice(0, commonPrefix.length).every((id) => inboundSet.has(id))
             && plan.newOrder.slice(0, commonPrefix.length).every((id) => witnessSet.has(id));
-    }
+        continuityResult = { wireContinuity, tailTruncated };
+        return continuityResult;
+    };
     // #2815: id churn explained by raw-stage marker stripping. Covered ids
     // minted BEFORE the marker engine (or by any client that keeps resending
     // the artifact-laden bytes) hash marker-laden content; once stripRawStage
@@ -2238,7 +2282,7 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
     const truncationExplained = classCarryingResidual.length > 0
         && plan.nearDupResidual.length === 0
         && classCarryingResidual.every((id) => absentSet.has(id))
-        && wireContinuity;
+        && getContinuity().wireContinuity;
     // #3724: MIRROR — every class-carrying residual absent with zero word
     // evidence AND the wire is a clean prefix-cut = host rewound/undid the
     // newest turns (deleting a freshly-folded span). Same sanctioned-deletion
@@ -2250,7 +2294,7 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
     const tailTruncationExplained = classCarryingResidual.length > 0
         && plan.nearDupResidual.length === 0
         && classCarryingResidual.every((id) => absentSet.has(id))
-        && tailTruncated;
+        && getContinuity().tailTruncated;
     // #5715: a strict majority of hard-covered ids still PRESENT VERBATIM on
     // the wire is the opposite of wholesale replacement — the fold substrate
     // is alive. The verdict classifier above only sees claims==0 + unmatched>0
@@ -2270,20 +2314,29 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
     // reasoning cores excluded); the bar is >= MIN_RESYNC_RUN and > half.
     // Genuine wholesale replacement has ~0 directly-present ACTIVE covered ids,
     // so this can never mask a real collapse.
-    let coveredHard = 0;
-    let presentHard = 0;
-    for (const id of activeCovered) {
-        if (isResponsesTurnSeparatorId(id) || expected[id] !== undefined || anchors[id]?.c === "reasoning") continue;
-        coveredHard++;
-        if (byId.has(id)) presentHard++;
-    }
-    const hardDirectMajority = presentHard >= MIN_RESYNC_RUN && 2 * presentHard > coveredHard;
+    let hardMajorityResult: { coveredHard: number; presentHard: number; hardDirectMajority: boolean } | undefined;
+    const getHardDirectMajority = (): { coveredHard: number; presentHard: number; hardDirectMajority: boolean } => {
+        if (hardMajorityResult !== undefined) return hardMajorityResult;
+        let coveredHard = 0;
+        let presentHard = 0;
+        for (const id of activeCovered) {
+            if (isResponsesTurnSeparatorId(id) || expected[id] !== undefined || anchors[id]?.c === "reasoning") continue;
+            coveredHard++;
+            if (byId.has(id)) presentHard++;
+        }
+        hardMajorityResult = {
+            coveredHard,
+            presentHard,
+            hardDirectMajority: presentHard >= MIN_RESYNC_RUN && 2 * presentHard > coveredHard,
+        };
+        return hardMajorityResult;
+    };
     // #5715: a strict direct-ID majority proves the fold substrate is alive on
     // the wire — any pending epoch-confirm latch is stale (the histories
     // realigned) and clears immediately, whether or not this pass still carries
     // residual loss (a partial restore keeps totalDrift true, so the normal
     // !totalDrift reset below would never fire for it).
-    if (hardDirectMajority && epochConfirmPending(session)) resetFoldDriftState(session);
+    if (epochConfirmPending(session) && getHardDirectMajority().hardDirectMajority) resetFoldDriftState(session);
     const totalDrift = plan.claims.size === 0 && realUnmatched.length > 0 && !reasoningOnlyDrop && !markerChurnExplained
         && !shapeExplained && !truncationExplained && !tailTruncationExplained;
     // Classify before reaping: the epoch-confirm gate promises to retain the
@@ -2291,8 +2344,10 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
     const epochProtected = session.metadata[METADATA_EPOCH_CONFIRM] === true
         || (totalDrift && nonReasoningUnmatched >= FOLD_DRIFT_ESCALATE_MIN_UNMATCHED);
     const prevCov = (session.metadata[METADATA_FOLD_COVERAGE] as Record<string, FoldBlockCoverage> | undefined) ?? {};
-    const nextCov: Record<string, FoldBlockCoverage> = {};
+    const prevCovKeys = Object.keys(prevCov);
+    let nextCov: Record<string, FoldBlockCoverage> = {};
     let covCount = 0;
+    let sameCovAsPrev = true;
     for (const block of blocks) {
         const bid = block.blockId;
         if (bid === undefined || bid === "") continue;
@@ -2303,15 +2358,29 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
         // retired them permanently) — counting them in `t` would hold the
         // zombie streak and the ledger accrual hostage to absence that will
         // never resolve.
-        const ids = (block.effectiveMessageIds ?? []).filter((id) => !isResponsesTurnSeparatorId(id) && expected[id] === undefined);
-        if (ids.length === 0) continue;
-        let p = 0, r = 0;
-        for (const id of ids) {
-            if (byId.has(id)) p++;
-            else if (plan.claims.has(id)) r++;
+        const rawIds = block.effectiveMessageIds ?? [];
+        let t = 0, p = 0, r = 0, hardCount = 0, absentHardCount = 0, absentHardAllInAbsentSet = true;
+        const hasClaims = plan.claims.size > 0;
+        for (let i = 0; i < rawIds.length; i++) {
+            const id = rawIds[i]!;
+            if (isResponsesTurnSeparatorId(id) || expected[id] !== undefined) continue;
+            t++;
+            const present = byId.has(id);
+            const claimed = !present && hasClaims && plan.claims.has(id);
+            if (present) p++;
+            else if (claimed) r++;
+            if (anchors[id]?.c !== "reasoning") {
+                hardCount++;
+                if (!present && !claimed) {
+                    absentHardCount++;
+                    if (absentHardAllInAbsentSet && !absentSet.has(id)) absentHardAllInAbsentSet = false;
+                }
+            }
         }
-        const rec: FoldBlockCoverage = { p, r, t: ids.length };
-        if (prevCov[bid]?.e === 1 || p + r > 0) rec.e = 1;
+        if (t === 0) continue;
+        const prevRec = prevCov[bid];
+        const rec: FoldBlockCoverage = { p, r, t };
+        if (prevRec?.e === 1 || p + r > 0) rec.e = 1;
         // #2695: zombie streak — strict majority of covered ids absent, only
         // for VERIFIED substrates (e === 1). Never-represent substrates keep
         // their #2202 structural-absence semantics (no streak, no reap).
@@ -2321,30 +2390,29 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
         // as substrate loss, so the majority test runs on the non-reasoning
         // covered ids only; a span with no non-reasoning ids at all never
         // reads as gone (safe side — real fold spans carry user turns).
-        const hardIds = ids.filter((id) => anchors[id]?.c !== "reasoning");
-        const gone = hardIds.length > 0 && 2 * (p + r) < hardIds.length;
-        // #3641: every absent hard id absent with ZERO word evidence anywhere
-        // while the session still carries other substrate = sanctioned
-        // truncation (client dropped old history), not zombie substrate. The
-        // #2695 reap streak would destroy the last remaining snapshot of
-        // history the host legitimately deleted from ITS view — bili keeps it
-        // (the fold IS the session's memory of the covered span).
-        const absentHard = hardIds.filter((id) => !byId.has(id) && !plan.claims.has(id));
-        // #3724: tail truncation (host rewind) is the same sanctioned-deletion
-        // class as head truncation for reap purposes — a fully-rewound span's
-        // absence is user deletion, not zombie substrate, so suppress the
-        // streak here too or the #2695 arm reaps the last snapshot of history
-        // the host legitimately rewound away. (Same global-signal residual as
-        // wireContinuity above: it self-corrects on the next stable pass.)
-        const structurallyAbsent = absentHard.length > 0 && absentHard.every((id) => absentSet.has(id)) && (wireContinuity || tailTruncated);
+        const gone = hardCount > 0 && 2 * (p + r) < hardCount;
+        // #3641/#3724: every absent hard id absent with ZERO word evidence
+        // while continuity holds = sanctioned truncation / rewind, not zombie.
+        const structurallyAbsent = gone && absentHardCount > 0 && absentHardAllInAbsentSet
+            && (getContinuity().wireContinuity || getContinuity().tailTruncated);
         if (gone && !structurallyAbsent) {
-            if (rec.e === 1) rec.z = (prevCov[bid]?.z ?? 0) + 1;
+            if (rec.e === 1) rec.z = (prevRec?.z ?? 0) + 1;
         } else {
             rec.z = 0;
         }
         if (covCount >= MAX_ANCHORS) continue;
+        if (sameCovAsPrev) {
+            if (prevCovKeys[covCount] !== bid || prevRec === undefined
+                || prevRec.p !== rec.p || prevRec.r !== rec.r || prevRec.t !== rec.t
+                || prevRec.e !== rec.e || prevRec.z !== rec.z) {
+                sameCovAsPrev = false;
+            }
+        }
         nextCov[bid] = rec;
         covCount++;
+    }
+    if (sameCovAsPrev && covCount === prevCovKeys.length) {
+        nextCov = prevCov;
     }
 
     // #2695: reap blocks whose covered substrate stayed majority-absent for
@@ -2375,6 +2443,8 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
                 // again (nextOrder is the array METADATA_POSITIONS already
                 // references — mutate in place).
                 const deadIds = new Set<string>();
+                if (nextCov === prevCov) nextCov = { ...prevCov };
+                if (nextAnchors === anchors) nextAnchors = { ...anchors };
                 for (const block of blocks) {
                     if (block.blockId === undefined || !ripe.has(block.blockId)) continue;
                     delete nextCov[block.blockId];
@@ -2491,7 +2561,7 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
         // on the wire — this is partial loss, not wholesale replacement, so the
         // terminal epoch-confirm verdict (and its compression pause) must not
         // fire even though the #2193 streak above has accrued.
-        if (!hardDirectMajority && streak >= FOLD_DRIFT_ESCALATE_PASSES && nonReasoningUnmatched >= FOLD_DRIFT_ESCALATE_MIN_UNMATCHED
+        if (!getHardDirectMajority().hardDirectMajority && streak >= FOLD_DRIFT_ESCALATE_PASSES && nonReasoningUnmatched >= FOLD_DRIFT_ESCALATE_MIN_UNMATCHED
                 && session.metadata[METADATA_DRIFT_ESCALATED] !== true) {
             session.metadata[METADATA_DRIFT_ESCALATED] = true;
             // #2709: take a ledger action at the destruction point (not just log) — attribute
@@ -2546,7 +2616,7 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
                 opts.log("info",
                     `${tag}[fold-reconcile] ${realUnmatched.length} covered id(s) missing with no anchor match${expectedNote}, but this pass stripped ${opts.markerStripped} raw marker artifact(s) — covered ids minted from marker-laden bytes churn once the strip engine cleans the resent history; benign on stateless resend (content still on the wire, re-folds re-cover), tolerated (#2815/#2789)`);
             }
-        } else if (hardDirectMajority && nonReasoningUnmatched >= FOLD_DRIFT_ESCALATE_MIN_UNMATCHED
+        } else if (getHardDirectMajority().hardDirectMajority && nonReasoningUnmatched >= FOLD_DRIFT_ESCALATE_MIN_UNMATCHED
                 && !shapeExplained && !truncationExplained && !tailTruncationExplained) {
             // #5715: a surviving direct-ID majority AT THE MASS BAR is PARTIAL
             // loss, not the "fold silently lost" the generic warn below names —
@@ -2558,6 +2628,7 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
             // print a second line mislabeling a head/tail cut as "interior"
             // loss, so they fall through to the original per-pass warn.
             if (session.metadata[METADATA_MAJORITY_LOSS_NOTED] !== true) {
+                const { presentHard, coveredHard } = getHardDirectMajority();
                 session.metadata[METADATA_MAJORITY_LOSS_NOTED] = true;
                 opts.log("info", `${tag}[fold-reconcile] ${realUnmatched.length} covered id(s) missing but ${presentHard}/${coveredHard} hard-covered id(s) still ride verbatim on the wire — partial interior loss, fold substrate healthy, no epoch confirmation (#5715)`);
             }
