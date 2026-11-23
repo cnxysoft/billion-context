@@ -112,6 +112,21 @@ test("identified fingerprints match full affinity products, including a capped a
     assert.deepEqual(edited.itemHashes, fingerprint.itemHashes);
 });
 
+test("#2824: chainFingerprintAsync matches chainFingerprint identically across chunk boundaries", async () => {
+    const resolver = new PrefixAffinityResolver();
+    const messages = [
+        { role: "system", content: "ignored system prompt" },
+        ...deepConversation("async-parity").slice(0, 140),
+        { type: "function_call_output", output: "tool output" },
+        ...Array.from({ length: 12 }, (_, i) => ({
+            type: "function_call", name: "read", arguments: JSON.stringify({ path: `file-${i}` }),
+        })),
+    ];
+    const syncFp = resolver.chainFingerprint(messages);
+    const asyncFp = await resolver.chainFingerprintAsync(messages, 17);
+    assert.deepEqual(asyncFp, syncFp);
+});
+
 test("#2824: findResumeParent / findResumeParentWithin / chainContinues compute ZERO sketches", () => {
     const r = new PrefixAffinityResolver();
     const baseId = track(r, deepConversation("resume-base").slice(0, 40));

@@ -1958,6 +1958,7 @@ async function handleRequest(
         if (parsed !== null && typeof parsed === "object") {
             session.metadata.rawInputTokens = estimateRawBodyTokens(parsed) + imageTokensInParsedBody(protocol, parsed, imageBillingFor(opts, upstreamOrigin), imageTokenCapFor(opts, upstreamOrigin));
         }
+        let deferredIdentifiedChain: unknown[] | null = null;
         if (anonAffinity) {
             prefixAffinity.note(sessionId, anonAffinity.incomingDepth, anonAffinity.tailHash, anonAffinity.itemHashes, false, anonAffinity.sketches, anonAffinity.userFlags, undefined, anonAffinity.tailFragments);
             scheduleAffinityPersist();
@@ -1982,16 +1983,21 @@ async function handleRequest(
             // /compact echo) intentionally does NOT update the chain: that
             // resume degrades to today's fresh-start behavior rather than
             // risking a side-request clobber.
-            const fp = prefixAffinity.chainFingerprint(affinityMessageList());
-            if (fp) {
-                const tracked = prefixAffinity.peekChain(sessionId);
-                // #2791: a pre-upgrade (raw-hash) entry is always
-                //  re-anchored — its depth counts raw wire messages, not
-                //  neutral turns, so the append-only comparison would
-                //  misjudge a version migration as a shrink.
-                if (!tracked || tracked.hv !== 2 || fp.depth >= tracked.depth) {
-                    prefixAffinity.note(sessionId, fp.depth, fp.tailHash, fp.itemHashes, true, undefined, undefined, fp.normTailHash, fp.tailFrags);
-                    scheduleAffinityPersist();
+            const affinityList = affinityMessageList();
+            if (affinityList.length > 512 && session.stats.requests > 0) {
+                deferredIdentifiedChain = affinityList.slice();
+            } else {
+                const fp = prefixAffinity.chainFingerprint(affinityList);
+                if (fp) {
+                    const tracked = prefixAffinity.peekChain(sessionId);
+                    // #2791: a pre-upgrade (raw-hash) entry is always
+                    //  re-anchored — its depth counts raw wire messages, not
+                    //  neutral turns, so the append-only comparison would
+                    //  misjudge a version migration as a shrink.
+                    if (!tracked || tracked.hv !== 2 || fp.depth >= tracked.depth) {
+                        prefixAffinity.note(sessionId, fp.depth, fp.tailHash, fp.itemHashes, true, undefined, undefined, fp.normTailHash, fp.tailFrags);
+                        scheduleAffinityPersist();
+                    }
                 }
             }
         }
@@ -3649,13 +3655,30 @@ async function handleRequest(
                     affinityMessagesCache = null;
                     runPreparedPipeline = undefined;
                 };
+                const startDeferredIdentifiedChain = () => {
+                    const msgs = deferredIdentifiedChain;
+                    if (!msgs) return;
+                    deferredIdentifiedChain = null;
+                    setImmediate(() => {
+                        void prefixAffinity.chainFingerprintAsync(msgs).then((fp) => {
+                            if (!fp) return;
+                            const tracked = prefixAffinity.peekChain(sessionId);
+                            if (!tracked || tracked.hv !== 2 || fp.depth >= tracked.depth) {
+                                prefixAffinity.note(sessionId, fp.depth, fp.tailHash, fp.itemHashes, true, undefined, undefined, fp.normTailHash, fp.tailFrags);
+                                scheduleAffinityPersist();
+                            }
+                        }).catch(() => {});
+                    });
+                };
                 try {
                     await forward(req, res, opts, pendingForward.body, pendingForward.prepared, core, reqConfig, log, route, instanceId, affinity, overflowRefold, v1Meta, throttleModel, (outbound) => {
                         logRequestCost(log, session.id, inboundMsgs, inboundBytes, reqT0, outbound);
+                        startDeferredIdentifiedChain();
                     }, releaseRequestInput);
                 } finally {
                     // Transport failures and locally forged replies can return
                     // before the upstream response boundary.
+                    deferredIdentifiedChain = null;
                     releaseRequestInput();
                 }
                 // Remember for ALL modes (not just plugin): wire clients (dsh,

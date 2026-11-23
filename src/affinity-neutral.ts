@@ -138,8 +138,17 @@ function sortKeys(value: unknown): unknown {
     if (Array.isArray(value)) return value.map(sortKeys);
     if (value !== null && typeof value === "object") {
         const record = value as Record<string, unknown>;
+        const keys = Object.keys(record);
+        if (keys.length <= 1) {
+            if (keys.length === 0) return Object.create(null);
+            const k = keys[0]!;
+            const out: Record<string, unknown> = Object.create(null);
+            out[k] = sortKeys(record[k]);
+            return out;
+        }
+        keys.sort();
         const out: Record<string, unknown> = Object.create(null);
-        for (const key of Object.keys(record).sort()) out[key] = sortKeys(record[key]);
+        for (const key of keys) out[key] = sortKeys(record[key]);
         return out;
     }
     return value;
@@ -279,7 +288,7 @@ export function neutralTurns(messages: unknown[], fragmentScope: "all" | "tail" 
                 asst = asst ?? { kind: "assistant", text: "", calls: [] };
                 const joined = texts.join("");
                 asst.text = (asst.text ?? "") + joined;
-                asst.calls = [...(asst.calls ?? []), ...calls];
+                if (calls.length > 0) (asst.calls ??= []).push(...calls);
                 addAssistantFragment(joined, calls);
                 continue;
             }
@@ -297,7 +306,7 @@ export function neutralTurns(messages: unknown[], fragmentScope: "all" | "tail" 
             // codex splits assistant commentary and the tool call across items —
             // merge into the pending run so it reduces like the openai render.
             asst = asst ?? { kind: "assistant", text: "", calls: [] };
-            asst.calls = [...(asst.calls ?? []), call];
+            (asst.calls ??= []).push(call);
             addAssistantFragment("", [call]);
             continue;
         }
@@ -364,7 +373,7 @@ export function neutralTurns(messages: unknown[], fragmentScope: "all" | "tail" 
                 asst = asst ?? { kind: "assistant", text: "", calls: [] };
                 const ownText = texts.join("") + (foreign ? "\u0000foreign:" + canon(m.content) : "");
                 asst.text = (asst.text ?? "") + ownText;
-                asst.calls = [...(asst.calls ?? []), ...calls];
+                if (calls.length > 0) (asst.calls ??= []).push(...calls);
                 addAssistantFragment(ownText, calls);
                 continue;
             }
@@ -413,7 +422,7 @@ export function neutralTurnCanonical(turn: NeutralTurn): string {
     // string is still wire-neutral \u2014 it is built from the extracted turn,
     // never from the raw message \u2014 so openai and anthropic renders of the
     // same conversation canonicalize identically (#2791).
-    if (turn.calls !== undefined) return canon({ calls: turn.calls, role: turn.kind });
-    return canon({ content: turn.text ?? "", role: turn.kind });
+    if (turn.calls !== undefined) return JSON.stringify({ calls: turn.calls, role: turn.kind });
+    return JSON.stringify({ content: turn.text ?? "", role: turn.kind });
 
 }

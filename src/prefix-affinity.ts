@@ -1015,6 +1015,43 @@ export class PrefixAffinityResolver {
         };
     }
 
+    async chainFingerprintAsync(
+        messages: unknown[],
+        chunkSize = 2048,
+    ): Promise<{ depth: number; tailHash: string; itemHashes: string[]; normTailHash?: string; tailFrags?: string[] } | null> {
+        if (!hasUserMessage(normalizeAffinityMessages(messages))) return null;
+        const turns = neutralTurns(messages, "tail");
+        return PrefixAffinityResolver.hashNeutralTurnsAsync(turns, chunkSize);
+    }
+
+    private static async hashNeutralTurnsAsync(
+        turns: NeutralTurn[],
+        chunkSize: number,
+    ): Promise<{ depth: number; tailHash: string; itemHashes: string[]; normTailHash?: string; tailFrags?: string[] } | null> {
+        const itemHashes: string[] = [];
+        const itemStart = Math.max(0, turns.length - MAX_STORED_ITEMS);
+        let tailHash = "v2";
+        let bytes = 0;
+        const step = Math.max(1, chunkSize);
+        for (let i = 0; i < turns.length; i++) {
+            if (i > 0 && i % step === 0) {
+                await new Promise<void>((resolve) => setImmediate(resolve));
+            }
+            const canonical = neutralTurnCanonical(turns[i]!);
+            bytes += canonical.length;
+            tailHash = sha256(`${tailHash}\u0000${canonical}`);
+            if (i >= itemStart) itemHashes.push(sha256(`v2i\u0000${canonical}`));
+        }
+        if (bytes < MIN_CANONICAL_BYTES) return null;
+        return {
+            depth: turns.length,
+            tailHash,
+            itemHashes,
+            normTailHash: neutralTailHashOf(turns),
+            ...(turns[turns.length - 1]?.frags ? { tailFrags: turns[turns.length - 1]!.frags } : {}),
+        };
+    }
+
     /** #1486: resume-fork detection for identified clients. Clients such as
      *  Claude Code fork a fresh client-provided session id on --resume while
      *  replaying the FULL transcript. Returns the tracked session whose ENTIRE
