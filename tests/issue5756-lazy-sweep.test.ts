@@ -18,13 +18,8 @@ import { UnifiedStore } from "../src/storage/store.ts";
  * bookkeeping (#5756 lane B, ~8900 of its 9653 stmts/save). The fix skips
  * already-retired rows entirely; first retirement still does the full work.
  *
- * Regression pin (issue's own metric — statements per save): save 2 pays
- * 3×N first-time-retirement statements for the N slid-out rows; save 3
- * (window slides by K on the same corpus) must NOT pay them again. The
- * assertion requires save2−save3 to exceed half the N-triple cost, leaving a
- * 2× cushion above the ~dozen-statement drift between adjacent saves.
- * Sentinel timestamps additionally pin the data-level invariant that
- * pre-existing tombstones are left byte-identical.
+ * Count retirement statement executions independently of preparation. Sentinel
+ * timestamps also pin that pre-existing tombstones are left byte-identical.
  */
 
 process.env.BILI_PERSIST_ZSTD = "0";
@@ -82,20 +77,26 @@ test("#5756: repeated completeLog saves skip already-retired rows (no re-stamp, 
         const liveCount = () => count("SELECT COUNT(*) AS n FROM messages WHERE session_id = ? AND retired_at IS NULL", SID);
         const sentinelCount = () => count("SELECT COUNT(*) AS n FROM messages WHERE session_id = ? AND retired_at = ?", SID, SENTINEL);
 
-        // Statement counter: wraps db.prepare around each save so the test
-        // measures the issue's own metric (statements per save) on whatever
-        // sqlite engine the driver picked.
         const origPrepare = raw.prepare.bind(raw);
-        let stmts = 0;
         const saveWindowCounted = (corpus: CoreMsg[]): number => {
-            stmts = 0;
-            raw.prepare = (q: string) => { stmts++; return origPrepare(q); };
+            let retirements = 0;
+            let retirePrepares = 0;
+            raw.prepare = (sql: string) => {
+                const stmt = origPrepare(sql);
+                if (sql !== "UPDATE messages SET retired_at = ? WHERE session_id = ? AND seq = ? AND retired_at IS NULL") return stmt;
+                retirePrepares++;
+                return {
+                    all: (...args) => stmt.all(...args),
+                    run: (...args) => { retirements++; return stmt.run(...args); },
+                };
+            };
             try {
                 store.ingestSession(planIngest(mkSession(SID, corpus.slice(corpus.length - W))), undefined, { completeLog: true });
+                assert.equal(retirePrepares, retirements === 0 ? 0 : 1);
+                return retirements;
             } finally {
                 raw.prepare = origPrepare;
             }
-            return stmts;
         };
 
         // Save 1: full-history baseline (e.g. initial sync).
@@ -122,17 +123,11 @@ test("#5756: repeated completeLog saves skip already-retired rows (no re-stamp, 
         assert.equal(retiredCount(), 308 - W, "exactly K new rows retired");
         assert.equal(liveCount(), W);
         assert.equal(store.mediaRefCount(IMG_B64), 0, "media accounting stable across repeat sweeps");
-        // THE regression pin: save 2 paid 3×(304-W) first-time-retirement
-        // statements; a steady-state save must not pay them again. Old code
-        // re-ran the triple for every already-retired row (save3 ≈ save2);
-        // fixed code skips them (save3 ≈ save2 − 3×N).
-        assert.ok(
-            save2 - save3 > (3 * (304 - W)) / 2,
-            `steady-state save re-paid the first-time retirement work (save2=${save2} stmts, save3=${save3} stmts)`,
-        );
+        assert.equal(save2, 304 - W);
+        assert.equal(save3, K);
 
         // Save 4: identical window, pure steady-state save — zero drift.
-        saveWindowCounted(c308);
+        assert.equal(saveWindowCounted(c308), 0);
         assert.equal(sentinelCount(), 304 - W);
         assert.equal(retiredCount(), 308 - W);
         assert.equal(liveCount(), W);

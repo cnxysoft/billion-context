@@ -71,7 +71,10 @@ jobs:
             tests/issue3343-incremental-divert-authz.test.ts \
             tests/issue3407-shadow-blockcontents-order.test.ts \
             tests/issue5140-cold-raw-tail-fork.test.ts \
+            tests/issue5756-lazy-sweep.test.ts \
+            tests/issue6947-turn-final-writeback.test.ts \
             tests/issue7190-dsh-runtime-preset-coverage.test.ts \
+            tests/media-cas.test.ts \
             tests/opencode-rolling-cache-marks.test.ts \
             tests/plugin-fork.test.ts \
             tests/plugin-status-provenance.test.ts \
@@ -80,6 +83,7 @@ jobs:
             tests/storage-ingest-watermark.test.ts \
             tests/storage-message-content-join.test.ts \
             tests/storage-null-identity.test.ts \
+            tests/unified-remap-collision.test.ts \
             tests/web-storage-fallback.test.ts
 
       - name: Run real Codex against the deterministic fake upstream

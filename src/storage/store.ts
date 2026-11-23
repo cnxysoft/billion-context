@@ -493,6 +493,9 @@ export class UnifiedStore {
      * verdict may be cached: the file moved outside this process's verified
      * writes, so every cache write site defers to the next boot's fresh scan. */
     private sawForeignWriter = false;
+    private contentRefcount?: ReturnType<SqliteDatabase["prepare"]>;
+    private contentIncrement?: ReturnType<SqliteDatabase["prepare"]>;
+    private contentInsert?: ReturnType<SqliteDatabase["prepare"]>;
     /** #5539 secondary finding: releaseContent runs once per released hash
      * (~3K/turn on busy sessions); per-call prepare() measured ~7x slower than
      * reuse in the field report (0.063 vs 0.009 ms/call). The db handle is
@@ -961,15 +964,15 @@ export class UnifiedStore {
         // over the same utf8 bytes). Only direct callers without a planner
         // pay the hash at this layer.
         const hash = precomputedHash ?? sha256Hex(bytes);
-        const existing = this.db.prepare("SELECT refcount FROM content WHERE hash = ?").get(hash) as
-            | { refcount: number }
-            | undefined;
-        if (existing) {
-            this.db.prepare("UPDATE content SET refcount = refcount + 1 WHERE hash = ?").run(hash);
+        this.contentRefcount ??= this.db.prepare("SELECT refcount FROM content WHERE hash = ?");
+        if (this.contentRefcount.get(hash)) {
+            this.contentIncrement ??= this.db.prepare("UPDATE content SET refcount = refcount + 1 WHERE hash = ?");
+            this.contentIncrement.run(hash);
         } else {
-            this.db
-                .prepare("INSERT INTO content (hash, byte_len, refcount, algo, bytes) VALUES (?, ?, 1, 'sha256', ?)")
-                .run(hash, bytes.byteLength, bytes);
+            this.contentInsert ??= this.db.prepare(
+                "INSERT INTO content (hash, byte_len, refcount, algo, bytes) VALUES (?, ?, 1, 'sha256', ?)",
+            );
+            this.contentInsert.run(hash, bytes.byteLength, bytes);
         }
         return hash;
     }
@@ -1156,14 +1159,17 @@ export class UnifiedStore {
                     const staleRows = this.db
                         .prepare("SELECT seq, msg_id, identity, retired_at FROM messages WHERE session_id = ?")
                         .all(s.sessionId) as { seq: number; msg_id: string; identity: string; retired_at: number | null }[];
+                    let reactivate: ReturnType<SqliteDatabase["prepare"]> | undefined;
+                    let retire: ReturnType<SqliteDatabase["prepare"]> | undefined;
+                    let selectMedia: ReturnType<SqliteDatabase["prepare"]> | undefined;
+                    let deleteMedia: ReturnType<SqliteDatabase["prepare"]> | undefined;
                     for (const row of staleRows) {
                         if (incomingIds.has(`${row.msg_id}\u0000${row.identity}`)) {
                             // #4390 rewind-redo: the identity came back —
                             // reactivate the tombstone at its original seq.
                             if (row.retired_at !== null) {
-                                this.db
-                                    .prepare("UPDATE messages SET retired_at = NULL WHERE session_id = ? AND seq = ?")
-                                    .run(s.sessionId, row.seq);
+                                reactivate ??= this.db.prepare("UPDATE messages SET retired_at = NULL WHERE session_id = ? AND seq = ?");
+                                reactivate.run(s.sessionId, row.seq);
                             }
                             continue;
                         }
@@ -1194,13 +1200,12 @@ export class UnifiedStore {
                         // does the full work below; later sweeps skip the
                         // row entirely.
                         if (row.retired_at !== null) continue;
-                        this.db
-                            .prepare("UPDATE messages SET retired_at = ? WHERE session_id = ? AND seq = ? AND retired_at IS NULL")
-                            .run(Date.now(), s.sessionId, row.seq);
-                        const retiredMedia = this.db
-                            .prepare("SELECT media_hash FROM message_media WHERE session_id = ? AND seq = ?")
-                            .all(s.sessionId, row.seq) as { media_hash: string }[];
-                        this.db.prepare("DELETE FROM message_media WHERE session_id = ? AND seq = ?").run(s.sessionId, row.seq);
+                        retire ??= this.db.prepare("UPDATE messages SET retired_at = ? WHERE session_id = ? AND seq = ? AND retired_at IS NULL");
+                        retire.run(Date.now(), s.sessionId, row.seq);
+                        selectMedia ??= this.db.prepare("SELECT media_hash FROM message_media WHERE session_id = ? AND seq = ?");
+                        const retiredMedia = selectMedia.all(s.sessionId, row.seq) as { media_hash: string }[];
+                        deleteMedia ??= this.db.prepare("DELETE FROM message_media WHERE session_id = ? AND seq = ?");
+                        deleteMedia.run(s.sessionId, row.seq);
                         for (const rm of retiredMedia) this.releaseContent(rm.media_hash);
                     }
                 }
@@ -1320,6 +1325,7 @@ export class UnifiedStore {
                       AND c.hash = m.content_hash AND typeof(c.refcount) = 'integer' AND c.refcount BETWEEN 1 AND 2147483647
                 `) : undefined;
                 let provenOffsets: Set<number> | undefined;
+                let insertMedia: ReturnType<SqliteDatabase["prepare"]> | undefined;
                 for (let i = 0; i < messages.length; i++) {
                     const offset = i % REPLAY_PROOF_BATCH;
                     if (batchProof && offset === 0) {
@@ -1337,9 +1343,8 @@ export class UnifiedStore {
                     // A reactivated row can have exact text but need its media mappings back (#4506).
                     for (const md of m.media ?? []) {
                         this.putContent(md.bytes, md.hash);
-                        const mm = this.db
-                            .prepare("INSERT OR IGNORE INTO message_media (session_id, seq, media_hash) VALUES (?, ?, ?)")
-                            .run(s.sessionId, m.seq, md.hash);
+                        insertMedia ??= this.db.prepare("INSERT OR IGNORE INTO message_media (session_id, seq, media_hash) VALUES (?, ?, ?)");
+                        const mm = insertMedia.run(s.sessionId, m.seq, md.hash);
                         if (mm.changes === 0) this.releaseContent(md.hash);
                     }
                 }
@@ -1838,11 +1843,16 @@ export class UnifiedStore {
             planToAbs.set(m.seq, abs);
             return { ...m, seq: abs };
         });
+        let backfillRef: ReturnType<SqliteDatabase["prepare"]> | undefined;
         for (const b of refBackfills) {
             // The ref IS NULL re-check inside the statement keeps the update
             // idempotent if two plan rows join the same stored row.
-            this.db.prepare("UPDATE messages SET ref = ?, ref_num = ? WHERE session_id = ? AND seq = ? AND ref IS NULL").run(b.ref, b.refNum, s.sessionId, b.seq);
+            backfillRef ??= this.db.prepare("UPDATE messages SET ref = ?, ref_num = ? WHERE session_id = ? AND seq = ? AND ref IS NULL");
+            backfillRef.run(b.ref, b.refNum, s.sessionId, b.seq);
         }
+        let retireSibling: ReturnType<SqliteDatabase["prepare"]> | undefined;
+        let selectLeftovers: ReturnType<SqliteDatabase["prepare"]> | undefined;
+        let updateHash: ReturnType<SqliteDatabase["prepare"]> | undefined;
         for (const r of repairs) {
             // #4793: a sibling row may already hold the target bytes for this
             // msg_id — e.g. an old generation stamped with an EMPTY identity
@@ -1858,16 +1868,18 @@ export class UnifiedStore {
             // other session's index, banner "SQLite storage degraded"). Same
             // content_hash ⇒ same CAS blob ⇒ retiring the sibling loses no
             // information, and our row keeps its stable seq (#4390 D4-1).
-            this.db
-                .prepare("UPDATE messages SET retired_at = ? WHERE session_id = ? AND msg_id = ? AND content_hash = ? AND seq <> ? AND retired_at IS NULL")
-                .run(Date.now(), s.sessionId, r.msgId, r.to, r.seq);
+            retireSibling ??= this.db.prepare(
+                "UPDATE messages SET retired_at = ? WHERE session_id = ? AND msg_id = ? AND content_hash = ? AND seq <> ? AND retired_at IS NULL",
+            );
+            retireSibling.run(Date.now(), s.sessionId, r.msgId, r.to, r.seq);
             // A retired duplicate still occupies the triple (the constraint
             // is not partial): it is byte-identical, so dropping the row and
             // its media mappings loses nothing. Rare path; common case stays
             // single-statement above.
-            const leftovers = this.db
-                .prepare("SELECT seq FROM messages WHERE session_id = ? AND msg_id = ? AND content_hash = ? AND seq <> ? AND retired_at IS NOT NULL")
-                .all(s.sessionId, r.msgId, r.to, r.seq) as { seq: number }[];
+            selectLeftovers ??= this.db.prepare(
+                "SELECT seq FROM messages WHERE session_id = ? AND msg_id = ? AND content_hash = ? AND seq <> ? AND retired_at IS NOT NULL",
+            );
+            const leftovers = selectLeftovers.all(s.sessionId, r.msgId, r.to, r.seq) as { seq: number }[];
             if (leftovers.length > 0) {
                 const selMedia = this.db.prepare("SELECT media_hash FROM message_media WHERE session_id = ? AND seq = ?");
                 const delMedia = this.db.prepare("DELETE FROM message_media WHERE session_id = ? AND seq = ?");
@@ -1887,7 +1899,8 @@ export class UnifiedStore {
                 }
             }
             this.putContent(r.content, r.to);
-            this.db.prepare("UPDATE messages SET content_hash = ? WHERE session_id = ? AND seq = ?").run(r.to, s.sessionId, r.seq);
+            updateHash ??= this.db.prepare("UPDATE messages SET content_hash = ? WHERE session_id = ? AND seq = ?");
+            updateHash.run(r.to, s.sessionId, r.seq);
             this.releaseContent(r.from);
         }
         // #4390: a rewound message that comes back reactivates in place —
@@ -1895,8 +1908,11 @@ export class UnifiedStore {
         // heals without a duplicate row even on completeLog-less saves.
         if (retiredSeqs.length > 0) {
             const presentedSeqs = new Set(messages.map((m) => m.seq));
+            let reactivate: ReturnType<SqliteDatabase["prepare"]> | undefined;
             for (const seq of retiredSeqs) {
-                if (presentedSeqs.has(seq)) this.db.prepare("UPDATE messages SET retired_at = NULL WHERE session_id = ? AND seq = ?").run(s.sessionId, seq);
+                if (!presentedSeqs.has(seq)) continue;
+                reactivate ??= this.db.prepare("UPDATE messages SET retired_at = NULL WHERE session_id = ? AND seq = ?");
+                reactivate.run(s.sessionId, seq);
             }
         }
         const remapSeqs = (seqs: number[] | null | undefined): number[] | null | undefined =>
