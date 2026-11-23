@@ -3534,6 +3534,16 @@ test("#5792: dsh pre-send chain parses the request body once per request", async
             await beforeSend(url, init);
             assert.equal(_bodyParseStatsForTest(), 1, "exactly one decode+parse across the whole pre-send chain (#5792)");
             assert.equal(init.body, original, "OpenAI shape rides full resend (body untouched)");
+
+            // Responses wire carries `input`, never `messages`, so recall and
+            // Anthropic incremental planning must skip JSON.parse completely.
+            const respUrl = `${proxy.origin}/bili/https://api.example.test/v1/responses`;
+            const respOriginal = JSON.stringify({ model: "gpt-test", input: [{ role: "user", content: [{ type: "input_text", text: "hi" }] }] });
+            const respInit: RequestInit = { method: "POST", body: respOriginal };
+            _resetBodyParseStatsForTest();
+            await beforeSend(respUrl, respInit);
+            assert.equal(_bodyParseStatsForTest(), 0, "Responses wire skips host JSON.parse completely");
+            assert.equal(respInit.body, respOriginal, "Responses body stays untouched");
         });
     } finally {
         proxy.close();

@@ -1938,6 +1938,16 @@ function conversationRecallStatsLine(): string {
     return ` (recall: ${s.recalled} claimed / ${s.learned} learned / ${s.rejectedNoBoundary + s.rejectedAmbiguous} no-evidence)`;
 }
 
+/** #5792 / Android long-session: Responses wire carries `input`, never `messages`,
+ *  so neither conversation recall nor Anthropic incremental-turn planning ever
+ *  consumes it. Skip full JSON.parse of multi-tens-of-MiB Responses bodies inside
+ *  the DSH host process before egress. */
+function isResponsesEndpointUrl(rawUrl: string): boolean {
+    const unwrapped = routedBiliModelUrl(rawUrl) ?? rawUrl;
+    const stripped = unwrapped.split(/[?#]/, 1)[0] ?? "";
+    return stripped.endsWith("/responses");
+}
+
 /** #4082: beforeSend-side learn + stamp. Attributed dispatches teach the
  * recall table (lane → session + boundary); unattributed dispatches claimed
  * by the gate get the negotiated conversation header stamped atomically with
@@ -1946,6 +1956,7 @@ async function maybeRecallBeforeSend(ctx: PluginContext, url: string, init: Requ
     if (!register.toolsReady || init === undefined) return;
     const attr = attributionOf(ctx);
     if (attr.state === "ok") {
+        if (isResponsesEndpointUrl(url)) return;
         const body = await parsedBodyOnce(init);
         if (body === undefined || typeof body !== "object") return;
         const messages = (body as { messages?: unknown }).messages;
@@ -2769,16 +2780,17 @@ export async function apply(ctx: PluginContext): Promise<void> {
     const incPendingAcks = new Map<string, { sid: string; url: string; messages: IncrementalWireMessage[]; system: unknown; base: string; at: number }>();
     async function maybeIncrementalNative(url: string, init: RequestInit | undefined): Promise<void> {
         if (!register.toolsReady || init === undefined) return;
+        if (isResponsesEndpointUrl(url)) return;
         const attr = attributionOf(ctx);
         if (attr.state !== "ok") return;
         const body = init.body;
         if (typeof body !== "string" || body.length === 0) return; // stream/Request bodies ride full resend
-        const parsed = (await parsedBodyOnce(init)) as { messages?: unknown; system?: unknown; model?: unknown } | undefined;
-        if (parsed === undefined) return;
-        if (typeof parsed.model !== "string" || !wireMessagesLookAnthropic(parsed.messages)) return; // anthropic wire only — OpenAI tool shapes (tool_calls / role:"tool") resend full (#3433)
         const base = register.base ?? state.origin;
         if (base === undefined) return;
         if (!(await probeIncrementalTurns(base))) return;
+        const parsed = (await parsedBodyOnce(init)) as { messages?: unknown; system?: unknown; model?: unknown } | undefined;
+        if (parsed === undefined) return;
+        if (typeof parsed.model !== "string" || !wireMessagesLookAnthropic(parsed.messages)) return; // anthropic wire only — OpenAI tool shapes (tool_calls / role:"tool") resend full (#3433)
         sweepStale(incPendingAcks, INC_PENDING_TTL_MS);
         // #3370 single-flight (omp/opencode pattern; kept over #3329's
         // removal per the rebase decision): while a marker'd request for
