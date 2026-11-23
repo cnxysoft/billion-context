@@ -14,7 +14,7 @@ import { _resetPluginStateForTest, forkMessageIdentityHash } from "../src/plugin
 import { _resetSessionsForTest } from "../src/session.ts";
 import { _setForTest } from "../src/registry.ts";
 import { resetToolRingForTest } from "../src/tool-ring.ts";
-import { forkIdentityHashOf, forkOrderHashOf, manifestForkCapable, matchForkPrefix, openaiBodyToCore, resetForkCapabilityCacheForTest, tryForkAdoption } from "../src/agent/fork-adopt.ts";
+import { forkIdentityHashOf, forkOrderHashOf, manifestForkCapable, matchForkPrefix, openaiBodyToCore, resetForkCapabilityCacheForTest, responsesBodyToCore, tryForkAdoption } from "../src/agent/fork-adopt.ts";
 import { sideShapedBody } from "../src/agent/dsh-native.ts";
 
 process.env.NODE_ENV = "test";
@@ -235,6 +235,41 @@ test("tryForkAdoption surfaces bounded snapshot diagnostics instead of a bare st
     assert.deepEqual(result, { outcome: "degraded", reason: "snapshot http 409 SNAPSHOT_UNAVAILABLE (Error: multimodal or opaque content cannot be compared by text)" });
     assert.equal(calls.length, 1, "one snapshot attempt, no fork POST");
     assert.equal(calls.every((c) => !c.url.includes("/__bili/plugin/fork")), true);
+});
+
+test("Responses fork only projects replay after a usable snapshot", async () => {
+    const core = responsesBodyToCore({ input: [{ role: "user", content: "replayed question" }] });
+    assert.ok(core?.length);
+    for (const available of [false, true]) {
+        let projections = 0;
+        const body = { input: [{ role: "user", get content() { projections++; return "replayed question"; } }] };
+        const calls: Recorded[] = [];
+        const fetchImpl = routerFetch({
+            snapshot: () => {
+                assert.equal(projections, 0, "sending the snapshot GET does not require projection");
+                return available ? jsonRes(snapshotFixture(core)) : jsonRes({ code: "SNAPSHOT_UNAVAILABLE" }, 409);
+            },
+            fork: () => jsonRes({ ok: true }, 201),
+        }, calls);
+        const result = await tryForkAdoption({ base: "http://proxy", parentConversationId: "parent", childConversationId: "child", body, fetchImpl });
+        if (available) {
+            assert.deepEqual(result, { outcome: "adopted", branchPoint: 1, replayed: false });
+            assert.equal(projections, 1);
+            assert.equal(calls.length, 2);
+        } else {
+            assert.deepEqual(result, { outcome: "degraded", reason: "snapshot http 409 SNAPSHOT_UNAVAILABLE" });
+            assert.equal(projections, 0);
+            assert.equal(calls.length, 1);
+        }
+    }
+});
+
+test("empty Responses replay still skips the snapshot request", async () => {
+    const calls: Recorded[] = [];
+    const fetchImpl = routerFetch({ snapshot: () => jsonRes(snapshotFixture(seedCore)) }, calls);
+    const result = await tryForkAdoption({ base: "http://proxy", parentConversationId: "parent", childConversationId: "child", body: { input: [] }, fetchImpl });
+    assert.deepEqual(result, { outcome: "degraded", reason: "body unmappable" });
+    assert.equal(calls.length, 0);
 });
 
 test("tryForkAdoption sanitizes control characters out of snapshot diagnostics (#2469)", async () => {

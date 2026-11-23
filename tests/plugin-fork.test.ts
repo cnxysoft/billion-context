@@ -1298,6 +1298,40 @@ for (const content of [null, "audio transcript"] as const) {
     });
 }
 
+test("cold multimodal parents refuse fork snapshots before reading the stored tail", async (t) => {
+    const oldMode = process.env.BILI_STORAGE_UNIFIED;
+    process.env.BILI_STORAGE_UNIFIED = "full";
+    const h = await harness(true);
+    try {
+        const parent = resolveConversation("parent").session!;
+        const comparable = await h.request("/__bili/plugin/snapshot?conversationId=parent");
+        assert.equal(comparable.status, 200);
+        parent.metadata.publicSnapshotTextComparable = false;
+        assert.ok(h.store.flushSync(parent));
+        h.store.cancelAll();
+        _resetSessionsForTest();
+        _resetPluginStateForTest();
+        const restored = getSession("parent");
+        assert.equal(restored.pluginSnapshot, undefined);
+        assert.equal(restored.metadata.publicSnapshotTextComparable, false);
+        const tailReads = t.mock.method(h.store, "unifiedTailViewRows");
+        const snapshot = await h.request("/__bili/plugin/snapshot?conversationId=parent");
+        assert.equal(snapshot.status, 409);
+        assert.equal(snapshot.body.code, "SNAPSHOT_UNAVAILABLE");
+        assert.equal(snapshot.body.error, "Error: multimodal or opaque content cannot be compared by text");
+        assert.equal(tailReads.mock.callCount(), 0);
+
+        restored.metadata.publicSnapshotTextComparable = true;
+        const coldComparable = await h.request("/__bili/plugin/snapshot?conversationId=parent");
+        assert.equal(coldComparable.status, 200, JSON.stringify(coldComparable.body));
+        assert.equal(tailReads.mock.callCount(), 1);
+        assert.deepEqual(coldComparable.body.orderedMessages, comparable.body.orderedMessages);
+    } finally {
+        await h.close();
+        if (oldMode === undefined) delete process.env.BILI_STORAGE_UNIFIED; else process.env.BILI_STORAGE_UNIFIED = oldMode;
+    }
+});
+
 test("HTTP fork before absorb summary preserves the original pair on the first child request", { timeout: 60_000 }, async () => {
     const h = await harness();
     try {

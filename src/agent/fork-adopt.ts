@@ -420,8 +420,12 @@ export async function tryForkAdoption(opts: {
     if (wire === "google") {
         return { outcome: "degraded", reason: `wire unsupported (${wire})` };
     }
-    const core = chatBodyToCore(opts.body);
-    if (core === null || core.length === 0) return { outcome: "degraded", reason: "body unmappable" };
+    // Responses projection clones the full replay. Wait until the parent can supply a usable snapshot.
+    const responsesInput = wire === "responses" ? (opts.body as { input: unknown[] }).input : undefined;
+    let core = responsesInput === undefined ? chatBodyToCore(opts.body) : undefined;
+    if (core === null || core?.length === 0 || responsesInput?.length === 0) {
+        return { outcome: "degraded", reason: "body unmappable" };
+    }
     const snapshotUrl = `${opts.base}/__bili/plugin/snapshot?conversationId=${encodeURIComponent(opts.parentConversationId)}`;
     for (let attempt = 0; attempt < 2; attempt += 1) {
         let snapshot: Awaited<ReturnType<typeof snapshotOf>>;
@@ -439,6 +443,8 @@ export async function tryForkAdoption(opts: {
             return { outcome: "degraded", reason: `snapshot error ${err instanceof Error ? err.message : String(err)}` };
         }
         if (snapshot === null) return { outcome: "degraded", reason: "snapshot malformed" };
+        core ??= chatBodyToCore(opts.body);
+        if (core === null || core.length === 0) return { outcome: "degraded", reason: "body unmappable" };
         const branchPoint = matchForkPrefix(core, snapshot.orderedMessages);
         if (branchPoint === 0) return { outcome: "degraded", reason: "no prefix match" };
         const prefix = snapshot.orderedMessages.slice(0, branchPoint);

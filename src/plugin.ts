@@ -1498,15 +1498,6 @@ function reconstructRawTailForFork(session: Session): CoreMessage[] | null {
 }
 
 function forkSnapshot(session: Session, source?: CoreMessage[] | null) {
-    const messages = source ?? session.pluginSnapshot ?? reconstructRawTailForFork(session);
-    if (!messages) {
-        const capped = session.metadata.publicSnapshotCapped === true;
-        const base = capped ? "raw snapshot exceeded the retention cap (BILI_PUBLIC_SNAPSHOT_CAP_BYTES); fork is refused rather than retaining an unbounded raw copy" : "raw snapshot unavailable; send a fresh plugin model request";
-        // the capped base names the refusal itself; a gate recorded under it is
-        // incidental (reconstruction may bail before reaching the cap check)
-        const why = capped ? undefined : reconMissReason(session.id);
-        throw new Error(why ? `${base} [reconstruction: ${why}]` : base);
-    }
     // #4266 mechanism 1: signed thinking is no longer an opaque refusal. Wire
     // thinking/redacted_thinking blocks project to a named reasoning message
     // (anthropicToCore), so they are comparable by view. The host-projected
@@ -1518,6 +1509,15 @@ function forkSnapshot(session: Session, source?: CoreMessage[] | null) {
     // identity hash, so only genuinely uncomparable content (images, audio,
     // publicSnapshotTextComparable === false) still refuses.
     if (session.metadata.publicSnapshotTextComparable === false) throw new Error("multimodal or opaque content cannot be compared by text");
+    const messages = source ?? session.pluginSnapshot ?? reconstructRawTailForFork(session);
+    if (!messages) {
+        const capped = session.metadata.publicSnapshotCapped === true;
+        const base = capped ? "raw snapshot exceeded the retention cap (BILI_PUBLIC_SNAPSHOT_CAP_BYTES); fork is refused rather than retaining an unbounded raw copy" : "raw snapshot unavailable; send a fresh plugin model request";
+        // the capped base names the refusal itself; a gate recorded under it is
+        // incidental (reconstruction may bail before reaching the cap check)
+        const why = capped ? undefined : reconMissReason(session.id);
+        throw new Error(why ? `${base} [reconstruction: ${why}]` : base);
+    }
     const store = contentStoreOf(session);
     const expectedStoredRefs = session.metadata.publicSnapshotStoredRefs;
     if (Array.isArray(expectedStoredRefs) && expectedStoredRefs.some((ref) => typeof ref !== "string" || !store.byRef[ref])) throw new Error("CCR original index unavailable");

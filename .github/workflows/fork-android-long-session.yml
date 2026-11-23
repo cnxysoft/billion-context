@@ -61,6 +61,7 @@ jobs:
         run: |
           node --import ./tests/preload-test-env.mjs --import ./tests/preload-storage-baseline.mjs --import tsx --test \
             tests/admin-origin.test.ts \
+            tests/dsh-fork-adopt.test.ts \
             tests/dsh-native.test.ts \
             tests/image-restore.test.ts \
             tests/issue2824-regression.test.ts \
@@ -72,6 +73,7 @@ jobs:
             tests/issue5140-cold-raw-tail-fork.test.ts \
             tests/issue7190-dsh-runtime-preset-coverage.test.ts \
             tests/opencode-rolling-cache-marks.test.ts \
+            tests/plugin-fork.test.ts \
             tests/plugin-status-provenance.test.ts \
             tests/plugin-terminal-usage.test.ts \
             tests/storage-batched-verification.test.ts \
