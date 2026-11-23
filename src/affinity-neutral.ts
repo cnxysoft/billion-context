@@ -197,11 +197,7 @@ function toolResultText(content: unknown): string {
     return content === undefined ? "" : canon(content);
 }
 
-/** Project a protocol message list onto wire-neutral turns. Pure: the same
- *  list always yields the same turn list (same-wire stability), and the
- *  same logical conversation yields the same list across wires. */
-export function neutralTurns(messages: unknown[], fragmentScope: "all" | "tail" = "all"): NeutralTurn[] {
-    const list = stripLeadingSystemRun(messages);
+function createNeutralTurnAccumulator(fragmentScope: "all" | "tail") {
     const turns: NeutralTurn[] = [];
     let asst: NeutralTurn | null = null;
     let asstFragments: (() => string)[] = [];
@@ -235,10 +231,10 @@ export function neutralTurns(messages: unknown[], fragmentScope: "all" | "tail" 
         pushTurn({ kind, text }, () => [fragmentHash(kind, text, [])]);
     };
 
-    for (const message of list) {
+    const feed = (message: unknown): void => {
         if (!message || typeof message !== "object") {
             pushTextTurn("raw", canon(message));
-            continue;
+            return;
         }
         const m = message as {
             role?: unknown;
@@ -290,13 +286,13 @@ export function neutralTurns(messages: unknown[], fragmentScope: "all" | "tail" 
                 asst.text = (asst.text ?? "") + joined;
                 if (calls.length > 0) (asst.calls ??= []).push(...calls);
                 addAssistantFragment(joined, calls);
-                continue;
+                return;
             }
             flushAssistant();
             for (const toolBody of toolBodies) pushTextTurn("tool", toolBody);
             if (calls.length > 0 && toolBodies.length === 0) pushTurn({ kind: "assistant", calls }, () => [fragmentHash("assistant", "", calls)]);
             else if (texts.length > 0) pushTextTurn(role, texts.join(""));
-            continue;
+            return;
         }
 
         // responses-protocol input items: {type:"function_call", …} /
@@ -308,13 +304,13 @@ export function neutralTurns(messages: unknown[], fragmentScope: "all" | "tail" 
             asst = asst ?? { kind: "assistant", text: "", calls: [] };
             (asst.calls ??= []).push(call);
             addAssistantFragment("", [call]);
-            continue;
+            return;
         }
         if (typeof m.type === "string" && (m.type === "function_call_output" || m.type === "local_shell_call_output")) {
             flushAssistant();
             const body = typeof m.output === "string" ? m.output : canon(m.output ?? "");
             pushTextTurn("tool", body);
-            continue;
+            return;
         }
 
         const role = typeof m.role === "string" ? m.role : "?";
@@ -326,7 +322,7 @@ export function neutralTurns(messages: unknown[], fragmentScope: "all" | "tail" 
                 ? m.content.map((b) => { const t = blockText(b); return t !== null ? t : canon(b); }).join("")
                 : m.content === undefined || m.content === null ? "" : canon(m.content);
             pushTextTurn("tool", body);
-            continue;
+            return;
         }
 
         // string content — openai and anthropic shorthand share this shape.
@@ -342,11 +338,11 @@ export function neutralTurns(messages: unknown[], fragmentScope: "all" | "tail" 
                 const own = text + (typeof m.reasoning_content === "string" ? m.reasoning_content : "");
                 asst.text = (asst.text ?? "") + own;
                 addAssistantFragment(own, []);
-                continue;
+                return;
             }
             flushAssistant();
             pushTextTurn(role, text);
-            continue;
+            return;
         }
 
         // block-list content (anthropic; openai array content)
@@ -375,14 +371,14 @@ export function neutralTurns(messages: unknown[], fragmentScope: "all" | "tail" 
                 asst.text = (asst.text ?? "") + ownText;
                 if (calls.length > 0) (asst.calls ??= []).push(...calls);
                 addAssistantFragment(ownText, calls);
-                continue;
+                return;
             }
             flushAssistant();
             for (const r of results) pushTextTurn("tool", r); // split multi-result messages
             if (results.length > 0 && texts.length > 0 && role === "user") pushTextTurn("user", texts.join(""));
             else if (results.length === 0 && texts.length > 0) pushTextTurn(role, texts.join(""));
             else if (results.length === 0 && texts.length === 0 && role === "user" && foreign) pushTextTurn("user", canon(m.content));
-            continue;
+            return;
         }
 
         // openai assistant with tool_calls and non-array content
@@ -392,9 +388,9 @@ export function neutralTurns(messages: unknown[], fragmentScope: "all" | "tail" 
                 const calls = m.tool_calls
                     .filter((tc): tc is { function?: { name?: unknown; arguments?: unknown } } => !!tc && typeof tc === "object")
                     .map((tc) => `${String(tc.function?.name ?? "")}\u0000${canonicalCallArgs(tc.function?.arguments)}`);
-                asst.calls = [...(asst.calls ?? []), ...calls];
+                if (calls.length > 0) (asst.calls ??= []).push(...calls);
                 addAssistantFragment("", calls);
-                continue;
+                return;
             }
         }
 
@@ -402,10 +398,42 @@ export function neutralTurns(messages: unknown[], fragmentScope: "all" | "tail" 
         flushAssistant();
         const text = canon(m);
         pushTurn({ kind: role, text }, () => [fragmentHash(role, text, [])]);
+    };
+
+    const finish = (): NeutralTurn[] => {
+        flushAssistant();
+        if (tailFragments) turns[turns.length - 1]!.frags = tailFragments();
+        return turns;
+    };
+
+    return { feed, finish };
+}
+
+/** Project a protocol message list onto wire-neutral turns. Pure: the same
+ *  list always yields the same turn list (same-wire stability), and the
+ *  same logical conversation yields the same list across wires. */
+export function neutralTurns(messages: unknown[], fragmentScope: "all" | "tail" = "all"): NeutralTurn[] {
+    const list = stripLeadingSystemRun(messages);
+    const acc = createNeutralTurnAccumulator(fragmentScope);
+    for (const message of list) acc.feed(message);
+    return acc.finish();
+}
+
+export async function neutralTurnsAsync(
+    messages: unknown[],
+    fragmentScope: "all" | "tail" = "all",
+    chunkSize = 512,
+): Promise<NeutralTurn[]> {
+    const list = stripLeadingSystemRun(messages);
+    const acc = createNeutralTurnAccumulator(fragmentScope);
+    const step = Math.max(1, chunkSize);
+    for (let i = 0; i < list.length; i++) {
+        if (i > 0 && i % step === 0) {
+            await new Promise<void>((resolve) => setImmediate(resolve));
+        }
+        acc.feed(list[i]);
     }
-    flushAssistant();
-    if (tailFragments) turns[turns.length - 1]!.frags = tailFragments();
-    return turns;
+    return acc.finish();
 }
 
 /** Canonical string of a neutral turn — the single hashing input for the

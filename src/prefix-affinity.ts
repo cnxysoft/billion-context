@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { hammingHex, sketchForCanonical } from "./affinity-simhash.js";
-import { MAX_TURN_FRAGS, neutralTurnCanonical, neutralTurns, type NeutralTurn } from "./affinity-neutral.js";
+import { MAX_TURN_FRAGS, neutralTurnCanonical, neutralTurns, neutralTurnsAsync, type NeutralTurn } from "./affinity-neutral.js";
 import { USER_IMAGE_PLACEHOLDER, normalizeMessageText } from "./fold-reconcile.js";
 
 /**
@@ -1017,10 +1017,10 @@ export class PrefixAffinityResolver {
 
     async chainFingerprintAsync(
         messages: unknown[],
-        chunkSize = 2048,
+        chunkSize = 512,
     ): Promise<{ depth: number; tailHash: string; itemHashes: string[]; normTailHash?: string; tailFrags?: string[] } | null> {
         if (!hasUserMessage(normalizeAffinityMessages(messages))) return null;
-        const turns = neutralTurns(messages, "tail");
+        const turns = await neutralTurnsAsync(messages, "tail", chunkSize);
         return PrefixAffinityResolver.hashNeutralTurnsAsync(turns, chunkSize);
     }
 
