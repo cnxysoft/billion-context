@@ -1140,19 +1140,32 @@ export class UnifiedStore {
                 // keeps the delta valid even when a fold left rows above
                 // the trusted tip.
                 messages = input.messages.map((m, i) => ({ ...m, seq: probe.maxSeq + 1 + i }));
-                const tail = JSON.parse(s.tailJson) as { tailSeqs?: number[] | null };
-                // Defense: the plan's tailSeqs prefix must be exactly the
-                // trusted prefix the watermark read produced (same-tick by
-                // construction; disagreement means a stale plan).
-                const prefixOk =
-                    Array.isArray(tail.tailSeqs) &&
-                    tail.tailSeqs.length === delta.trustedTailSeqs.length + input.messages.length &&
-                    delta.trustedTailSeqs.every((v, i) => tail.tailSeqs?.[i] === v);
-                if (!prefixOk) return false;
-                s.tailJson = JSON.stringify({
-                    ...tail,
-                    tailSeqs: [...delta.trustedTailSeqs, ...messages.map((m) => m.seq)],
-                });
+                // Steady-state delta: when planIngestDelta already built
+                // input.tailSeqs aligned with probe.maxSeq (no rows above the
+                // watermark), skip the redundant JSON.parse + JSON.stringify of
+                // tens of thousands of tail seq integers.
+                const planTailSeqs = input.tailSeqs;
+                const alignedTailOk =
+                    probe.maxSeq === delta.trustedSeq &&
+                    Array.isArray(planTailSeqs) &&
+                    planTailSeqs.length === delta.trustedTailSeqs.length + messages.length &&
+                    delta.trustedTailSeqs.every((v, i) => planTailSeqs[i] === v) &&
+                    messages.every((m, i) => planTailSeqs[delta.trustedTailSeqs.length + i] === m.seq);
+                if (!alignedTailOk) {
+                    const tail = JSON.parse(s.tailJson) as { tailSeqs?: number[] | null };
+                    // Defense: the plan's tailSeqs prefix must be exactly the
+                    // trusted prefix the watermark read produced (same-tick by
+                    // construction; disagreement means a stale plan).
+                    const prefixOk =
+                        Array.isArray(tail.tailSeqs) &&
+                        tail.tailSeqs.length === delta.trustedTailSeqs.length + input.messages.length &&
+                        delta.trustedTailSeqs.every((v, i) => tail.tailSeqs?.[i] === v);
+                    if (!prefixOk) return false;
+                    s.tailJson = JSON.stringify({
+                        ...tail,
+                        tailSeqs: [...delta.trustedTailSeqs, ...messages.map((m) => m.seq)],
+                    });
+                }
                 watermark = messages.length > 0 ? messages[messages.length - 1].seq : delta.trustedSeq;
             } else {
                 const full = this.remapPlanToAbsolute(input, opts?.completeLog !== true);

@@ -88,6 +88,7 @@ export async function prepareResponses(
     billingUpstream?: string,
     decide?: DecideConfig,
     onIncomingImages?: (images: IncomingImageCandidate[]) => void,
+    deferDurabilityIngest?: boolean,
 ): Promise<Prepared> {
     const sessionId = session.id;
     const inboundMessageCount = Array.isArray(parsed.input) ? parsed.input.length : 1;
@@ -772,9 +773,24 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
         if (responsesPairOrigin) session.stats.lastLocalTextEstimateOrigin = responsesPairOrigin;
     }
     snapshotMessages(session, originalMessages);
-    // #3397 durability-before-render (see prepare-anthropic.ts): rows durable NOW, before the model call.
-    getStore().ingestRowsNow(session);
-    markDirty(session);
+    // #3397 durability-before-render (see prepare-anthropic.ts): rows durable
+    // before the model response is delivered. When handle.ts passes
+    // deferDurabilityIngest=true, forward() overlaps this synchronous SQLite
+    // ingest with the upstream network RTT (and still completes it before any
+    // response header/byte reaches the client).
+    let deferredDurabilityCommit: (() => void) | undefined;
+    if (deferDurabilityIngest === true) {
+        let committed = false;
+        deferredDurabilityCommit = () => {
+            if (committed) return;
+            committed = true;
+            getStore().ingestRowsNow(session);
+            markDirty(session);
+        };
+    } else {
+        getStore().ingestRowsNow(session);
+        markDirty(session);
+    }
     // #564/#2627: ONE serialization of the outbound body. The same string is
     // both what we send and what the separator manifest binds to, so the claims
     // can never be attributed to a body that differs by even one byte.
@@ -810,6 +826,7 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
         resetAfterSuccess: isCompactionTrigger,
         codexForge,
         dropReasoning: (msgs: BiliMessage[]) => applyReasoningDrop(msgs, reasoningPlan, log, sessionId),
+        ...(deferredDurabilityCommit !== undefined ? { deferredDurabilityCommit } : {}),
     };
 }
 

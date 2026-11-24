@@ -69,6 +69,7 @@ export async function prepareOpenai(
     billingUpstream?: string,
     decide?: DecideConfig,
     bodyText?: string,
+    deferDurabilityIngest?: boolean,
 ): Promise<Prepared> {
     const sessionId = session.id;
     const stream = parsed.stream === true;
@@ -673,9 +674,20 @@ export async function prepareOpenai(
     // the save ingests the window through the bounded envelope view and does
     // NOT sweep the prefix.
     if (wpHit !== undefined) session.lastMessagesFolded = true;
-    // #3397 durability-before-render (see prepare-anthropic.ts): rows durable NOW, before the model call.
-    getStore().ingestRowsNow(session);
-    markDirty(session);
+    // #3397 durability-before-render (see prepare-anthropic.ts).
+    let deferredDurabilityCommit: (() => void) | undefined;
+    if (deferDurabilityIngest === true) {
+        let committed = false;
+        deferredDurabilityCommit = () => {
+            if (committed) return;
+            committed = true;
+            getStore().ingestRowsNow(session);
+            markDirty(session);
+        };
+    } else {
+        getStore().ingestRowsNow(session);
+        markDirty(session);
+    }
     let wpResponseHeaders: Record<string, string> | undefined;
     if (wpFullText !== undefined && wpOutcome !== null && wpTurnStrip !== undefined) {
         wpResponseHeaders = finalizeWatermarkTurn(session, wpOutcome, {
@@ -694,7 +706,7 @@ export async function prepareOpenai(
         if (Object.keys(wpResponseHeaders).length === 0) wpResponseHeaders = undefined;
     }
     if (nudgeOutcome === "injected") recordNudgeInject(session, nudge);
-    return { body: JSON.stringify(rebuilt), parsedBody: rebuilt, session, attachedRetrievals, attachedRetrievalNoteIds, processedMessages, originalMessages, judgeBaseline, protocol: "openai", stream, compressInjected: injectTools, pluginMode, mcpDialectNote: laneDecisions.mcpDialect, nudge, nudgeOutcome, nudgeStampsBefore: nudgeOutcome === "injected" ? nudgeStampsBefore : undefined, prompts, surface, openaiSystemText, systemNotes: sysNotes, renderTags: renderStrategy, responseExtraHeaders: wpResponseHeaders, dropReasoning: (msgs: BiliMessage[]) => applyReasoningDrop(msgs, reasoningPlan, log, sessionId) } as Prepared;
+    return { body: JSON.stringify(rebuilt), parsedBody: rebuilt, session, attachedRetrievals, attachedRetrievalNoteIds, processedMessages, originalMessages, judgeBaseline, protocol: "openai", stream, compressInjected: injectTools, pluginMode, mcpDialectNote: laneDecisions.mcpDialect, nudge, nudgeOutcome, nudgeStampsBefore: nudgeOutcome === "injected" ? nudgeStampsBefore : undefined, prompts, surface, openaiSystemText, systemNotes: sysNotes, renderTags: renderStrategy, responseExtraHeaders: wpResponseHeaders, dropReasoning: (msgs: BiliMessage[]) => applyReasoningDrop(msgs, reasoningPlan, log, sessionId), ...(deferredDurabilityCommit !== undefined ? { deferredDurabilityCommit } : {}) } as Prepared;
 }
 
 /** Append the ephemeral nudge to a Gemini `contents` array. Gemini is

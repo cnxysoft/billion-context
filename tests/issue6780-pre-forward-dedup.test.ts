@@ -5,7 +5,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { SessionStore } from "../src/persist.ts";
 import { getCacheLedger } from "../src/cache-ledger.ts";
-import { buildRefRows, serializeSessionMetadata } from "../src/storage/ingest.ts";
+import { buildRefRows, planIngest, serializeSessionMetadata, type LegacySessionLike } from "../src/storage/ingest.ts";
 import { snapshotMessages, type Session } from "../src/session.ts";
 import type { CoreMessage } from "acp-kernel";
 
@@ -313,4 +313,60 @@ test("serializeSessionMetadata and buildRefRows match uncached serialization acr
     assert.deepEqual(buildRefRows(byRaw), expected());
     delete byRaw.r1;
     assert.deepEqual(buildRefRows(byRaw), expected());
+});
+
+test("planIngest cached contentStore (ccrJson/ccrEntries) and orphansJson stay exact across mutations", () => {
+    const contentStore: NonNullable<LegacySessionLike["contentStore"]> = {
+        version: 1,
+        byHash: { h1: "r1" },
+        byRef: { r1: { text: "payload-1" } },
+    };
+    const blockContents = new Map<string, { one: { text: string; count: number } | null; full: { text: string; count: number } }>([
+        ["orphan_1", { one: { text: "one-1", count: 1 }, full: { text: "full-1", count: 1 } }],
+    ]);
+    const legacy: LegacySessionLike = {
+        id: "ccr-orphan-cache-test",
+        createdAt: 1,
+        lastSeen: 2,
+        meta: {},
+        stats: {},
+        metadata: {},
+        state: {
+            nextBlockId: 1,
+            nextRunId: 1,
+            blocks: [],
+            deadRefs: [],
+            messageRefs: { byRaw: {}, byRef: {} },
+        },
+        blockContents: blockContents as unknown as LegacySessionLike["blockContents"],
+        contentStore,
+    };
+
+    const p1 = planIngest(legacy);
+    assert.equal(p1.session.ccrJson, JSON.stringify(contentStore));
+    assert.equal(p1.ccrEntries.length, 1);
+    assert.equal(p1.session.orphansJson, JSON.stringify({ orphan_1: { one: { text: "one-1", count: 1 }, full: { text: "full-1", count: 1 } } }));
+
+    // Warm cache hit
+    const p2 = planIngest(legacy);
+    assert.equal(p2.session.ccrJson, p1.session.ccrJson);
+    assert.deepEqual(p2.ccrEntries, p1.ccrEntries);
+    assert.equal(p2.session.orphansJson, p1.session.orphansJson);
+
+    // In-place mutations must invalidate both caches immediately
+    contentStore.byRef.r2 = { text: "payload-2" };
+    contentStore.byHash.h2 = "r2";
+    blockContents.set("orphan_2", { one: null, full: { text: "full-2", count: 2 } });
+    const p3 = planIngest(legacy);
+    assert.equal(p3.session.ccrJson, JSON.stringify(contentStore));
+    assert.equal(p3.ccrEntries.length, 2);
+    assert.equal(p3.session.orphansJson, JSON.stringify({
+        orphan_1: { one: { text: "one-1", count: 1 }, full: { text: "full-1", count: 1 } },
+        orphan_2: { one: null, full: { text: "full-2", count: 2 } },
+    }));
+
+    // Deletion must clear orphansJson cleanly
+    blockContents.clear();
+    const p4 = planIngest(legacy);
+    assert.equal(p4.session.orphansJson, null);
 });

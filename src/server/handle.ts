@@ -3277,12 +3277,12 @@ async function handleRequest(
                         // v1internal dialect the model rides in the envelope meta
                         // instead of the path — fall back to it so Prepared carries
                         // a real model (the loop's synthetic frames read it back).
-                        return await prepareGoogle(work as GoogleRequestBody, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, nativeWindow, googleModel ?? v1Model, googlePathKind(urlPath) === "stream-generate", visibilityMarkers, upstreamOrigin, req, decide);
+                        return await prepareGoogle(work as GoogleRequestBody, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, nativeWindow, googleModel ?? v1Model, googlePathKind(urlPath) === "stream-generate", visibilityMarkers, upstreamOrigin, req, decide, respondFailFast);
                     }
                     const preparedOut = protocol === "anthropic"
-                        ? await prepareAnthropic(work as AnthropicRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, upstreamOrigin, reasoningCfg, visibilityMarkers, requestModel, decide)
+                        ? await prepareAnthropic(work as AnthropicRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, upstreamOrigin, reasoningCfg, visibilityMarkers, requestModel, decide, respondFailFast)
                         : protocol === "openai"
-                          ? await prepareOpenai(work as OpenAIRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, upstreamOrigin, nativeWindow, reasoningCfg, visibilityMarkers, route?.rewrittenUrl, decide, bodyText)
+                          ? await prepareOpenai(work as OpenAIRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, upstreamOrigin, nativeWindow, reasoningCfg, visibilityMarkers, route?.rewrittenUrl, decide, bodyText, respondFailFast)
                           : responsesCompact
                             // #618: when no bili compaction item is present,
                             // prepareResponsesCompact falls back to the raw bodyBuffer —
@@ -3292,7 +3292,7 @@ async function handleRequest(
                                 projectedIncomingImages = images;
                                 session.incomingImageIndex = refreshIncomingImageIndex(parsed, protocol, session.state, session.id, session.incomingImageIndex, images);
                                 projectedIncomingImagesIndexed = true;
-                            } : undefined);
+                            } : undefined, respondFailFast);
                     // The resolved model rides with the prepared request: on the
                     // Anthropic-on-Vertex wire the body carries none, and the
                     // relay's compress-loop rebuild reads it from here.
@@ -3327,6 +3327,7 @@ async function handleRequest(
                     if (prepared?.codexForge) {
                         return { body: prepared.body, prepared };
                     }
+                    prepared?.deferredDurabilityCommit?.();
                     // runPrepare may have mutated parsed before failing to forge.
                     // Normalize the original wire input only: fc_bili_* records
                     // are local summaries, not valid upstream compaction items.
@@ -3364,6 +3365,7 @@ async function handleRequest(
                 // interleaved turn can race the mirror. Fail-open: on failure
                 // `body` keeps the original continue and the forward proceeds.
                 if (prepared.threadsReforge !== undefined) {
+                    prepared.deferredDurabilityCommit?.();
                     const route0 = route;
                     // #3569: the side-call must hit the SAME endpoint as the
                     // main forward — full URL incl. path/query plus the same
@@ -3541,6 +3543,7 @@ async function handleRequest(
                                 }));
                             }
                         }
+                        prepared?.deferredDurabilityCommit?.();
                         logRequestCost(log, session.id, inboundMsgs, inboundBytes, reqT0);
                         return null;
                     }
@@ -3690,6 +3693,7 @@ async function handleRequest(
                 } finally {
                     // Transport failures and locally forged replies can return
                     // before the upstream response boundary.
+                    pendingForward.prepared?.deferredDurabilityCommit?.();
                     deferredIdentifiedChain = null;
                     releaseRequestInput();
                 }

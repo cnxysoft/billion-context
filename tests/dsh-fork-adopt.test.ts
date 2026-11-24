@@ -14,7 +14,7 @@ import { _resetPluginStateForTest, forkMessageIdentityHash } from "../src/plugin
 import { _resetSessionsForTest } from "../src/session.ts";
 import { _setForTest } from "../src/registry.ts";
 import { resetToolRingForTest } from "../src/tool-ring.ts";
-import { createForkAdopter, forkIdentityHashOf, forkOrderHashOf, manifestForkCapable, matchForkPrefix, openaiBodyToCore, resetForkCapabilityCacheForTest, responsesBodyToCore, tryForkAdoption } from "../src/agent/fork-adopt.ts";
+import { createForkAdopter, forkIdentityHashOf, forkOrderHashOf, manifestForkCapable, matchForkPrefix, openaiBodyToCore, probeChildHasTraffic, resetForkCapabilityCacheForTest, responsesBodyToCore, tryForkAdoption } from "../src/agent/fork-adopt.ts";
 import { sideShapedBody } from "../src/agent/dsh-native.ts";
 
 process.env.NODE_ENV = "test";
@@ -464,6 +464,13 @@ test("full chain: dsh fork child adopts the parent state and its replay is accep
         const existingChildBody = await existingChildSnap.json() as { code?: string };
         assert.equal(existingChildBody.code, "CHILD_CONFLICT");
 
+        // checkOnly=1 returns 409 CHILD_CONFLICT for a live child and 204 No Content
+        // for a fresh child without loading the parent session.
+        assert.equal(await probeChildHasTraffic({ base: h.origin, parent: "nonexistent-parent", child: "child-sid" }), true);
+        const freshCheckOnly = await fetch(`${h.origin}/__bili/plugin/snapshot?conversationId=nonexistent-parent&childConversationId=brand-new-child&checkOnly=1`);
+        assert.equal(freshCheckOnly.status, 204);
+        assert.equal(await probeChildHasTraffic({ base: h.origin, parent: "nonexistent-parent", child: "brand-new-child" }), false);
+
         // A brand-new child id still receives the parent snapshot normally.
         const freshChildSnap = await fetch(`${h.origin}/__bili/plugin/snapshot?conversationId=parent-sid&childConversationId=brand-new-child`);
         assert.equal(freshChildSnap.status, 200);
@@ -498,4 +505,16 @@ test("createForkAdopter.isSettled latches after terminal outcomes and stays open
     assert.equal(adopter.isSettled("child-transient"), false, "first 503 attempt leaves the retry window open");
     await adopter.maybeAdopt({ base: "http://127.0.0.1:9", parent: "parent-transient", child: "child-transient", body });
     assert.equal(adopter.isSettled("child-transient"), true, "exhausting maxAttempts settles the child");
+
+    assert.equal(adopter.isSettled("child-preprobed"), false);
+    adopter.markSettled("child-preprobed");
+    assert.equal(adopter.isSettled("child-preprobed"), true, "markSettled latches immediately after checkOnly CHILD_CONFLICT");
+});
+
+test("probeChildHasTraffic returns true only on 409 CHILD_CONFLICT and fails open otherwise", async () => {
+    const mockFetch = (status: number, body?: unknown) => (async () => new Response(body === undefined ? null : JSON.stringify(body), { status })) as unknown as typeof fetch;
+    assert.equal(await probeChildHasTraffic({ base: "http://127.0.0.1:9", parent: "p", child: "c", fetchImpl: mockFetch(409, { code: "CHILD_CONFLICT" }) }), true);
+    assert.equal(await probeChildHasTraffic({ base: "http://127.0.0.1:9", parent: "p", child: "c", fetchImpl: mockFetch(409, { code: "SNAPSHOT_UNAVAILABLE" }) }), false);
+    assert.equal(await probeChildHasTraffic({ base: "http://127.0.0.1:9", parent: "p", child: "c", fetchImpl: mockFetch(204) }), false);
+    assert.equal(await probeChildHasTraffic({ base: "http://127.0.0.1:9", parent: "p", child: "c", fetchImpl: mockFetch(500, { code: "ERR" }) }), false);
 });

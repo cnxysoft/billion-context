@@ -381,6 +381,7 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
     // E2: a codex native-compaction request intercepted in prepare() carries a
     // forged success response — serve it without contacting upstream.
     if (prepared?.codexForge) {
+        prepared.deferredDurabilityCommit?.();
         onWireBody?.();        releaseRequestInput?.();        log("info", `[${prepared.session.id}] codex compact served locally (${prepared.codexForge.kind}); upstream not contacted`);
         if (!res.headersSent) res.writeHead(200, { "content-type": prepared.codexForge.contentType });
         res.end(prepared.codexForge.body);
@@ -390,6 +391,7 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
     // zero-egress contract as codexForge; the audit line was written in
     // prepare (this line is the egress-proof for the serve itself).
     if (prepared?.autoModeForge) {
+        prepared.deferredDurabilityCommit?.();
         releaseRequestInput?.();
         log("info", `[${prepared.session.id}] auto-mode classifier served locally (${prepared.autoModeForge.variant}); upstream not contacted`);
         if (!res.headersSent) res.writeHead(200, { "content-type": prepared.autoModeForge.contentType });
@@ -1299,12 +1301,32 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
         const fetchPromise = fetchWithCodexCatalogCache(signal => fetchWithTransportRetry(upstreamUrl, init, undefined, signal, (info) => {
             log("warn", `[${prepared?.session.id ?? "unknown"}] [acp-proxy] upstream ${info.detail}; retrying in ${info.delayMs}ms (attempt ${info.attempt}/${info.maxAttempts})`);
         }), upstreamUrl, init, clientAbort.signal, log);
+        // Overlap the synchronous #3397 SQLite durability ingest with the
+        // upstream LLM's prefill RTT instead of blocking `forward POST` before
+        // the request hits the wire. The brief 250ms head-start lets TCP/TLS +
+        // the outbound body flush into the OS socket buffer first; if upstream
+        // answers sooner, the `finally` below runs the commit synchronously
+        // BEFORE any response header or byte is written to the client.
+        let durabilityTimer: ReturnType<typeof setTimeout> | undefined;
+        const deferredCommit = prepared?.deferredDurabilityCommit;
+        if (deferredCommit !== undefined) {
+            durabilityTimer = setTimeout(() => {
+                durabilityTimer = undefined;
+                deferredCommit();
+            }, 250);
+            durabilityTimer.unref?.();
+        }
         const firstByteTimer = armFirstByteWatchdog({ url: upstreamUrl, method: req.method ?? "UNKNOWN", lane, sessionId: prepared?.session.id ?? "passthrough", log, signal: clientAbort.signal });
         try {
             upstreamResult = await fetchPromise;
             firstAttemptClear = upstreamResult.clearTimer;
         } finally {
             clearTimeout(firstByteTimer);
+            if (durabilityTimer !== undefined) {
+                clearTimeout(durabilityTimer);
+                durabilityTimer = undefined;
+            }
+            deferredCommit?.();
         }
         if (!(isCodexCatalogRequest(upstreamUrl, init) && upstreamResult.response.headers.get("x-bili-model-catalog") === "offline-cache")) {
             recordUpstreamConnection(upstreamUrl, proxyUrl);

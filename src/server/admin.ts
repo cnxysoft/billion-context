@@ -532,6 +532,7 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
             snapUrl.searchParams.get("conversationId") ?? "",
             res,
             snapUrl.searchParams.get("childConversationId") ?? undefined,
+            snapUrl.searchParams.get("checkOnly") === "1",
         );
     }
     if (req.method === "POST" && req.url === "/__bili/plugin/fork") {

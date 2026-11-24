@@ -70,6 +70,7 @@ export async function prepareAnthropic(
      *  `model`, so the diag line below would otherwise print `undefined`. */
     resolvedModel?: string,
     decide?: DecideConfig,
+    deferDurabilityIngest?: boolean,
 ): Promise<Prepared> {
     const sessionId = session.id;
     const stream = parsed.stream === true;
@@ -635,15 +636,25 @@ export async function prepareAnthropic(
     // this wire the system rides the top-level `system` field outside the fold.
     session.metadata.systemPromptTokens = countSystemAndToolsTokens(extractSystem(systemOut), toolsOut);
     snapshotMessages(session, originalMessages);
-    // #3397 durability-before-render: make this turn's ledger rows durable NOW
+    // #3397 durability-before-render: make this turn's ledger rows durable
     // (synchronous SQLite ingest, no JSON envelope) so the refs the model is
-    // about to see are on disk BEFORE the response is sent. Without this, a
-    // crash before the debounced save (#5155) leaves rendered refs unbacked —
-    // the #3397 orphaned-generation gap that makes a later turn cite refs the
-    // gate rejects as "above the highest allocated ref". markDirty below keeps
-    // the JSON envelope debounced; this only moves the small row ingest ahead.
-    getStore().ingestRowsNow(session);
-    markDirty(session);
+    // about to see are on disk BEFORE the response is sent. When handle.ts
+    // passes deferDurabilityIngest=true, forward() overlaps this ingest with
+    // the upstream network RTT while still completing it before any response
+    // header/byte reaches the client.
+    let deferredDurabilityCommit: (() => void) | undefined;
+    if (deferDurabilityIngest === true) {
+        let committed = false;
+        deferredDurabilityCommit = () => {
+            if (committed) return;
+            committed = true;
+            getStore().ingestRowsNow(session);
+            markDirty(session);
+        };
+    } else {
+        getStore().ingestRowsNow(session);
+        markDirty(session);
+    }
 
     // [#5604] a preflight fold of the tail (soft protection relaxed to 0, or a
     // tail tool pair in neverPreserveRecentTools) can leave the outbound array
@@ -706,7 +717,7 @@ export async function prepareAnthropic(
     probeRequestMembership(session, collectRequestIds(incomingMsgIds, originalMessages), session.stats.localInputEstimate ?? 0);
     if (upstreamOrigin) session.stats.lastLocalTextEstimateOrigin = upstreamOrigin;
     if (nudgeOutcome === "injected") recordNudgeInject(session, nudge);
-    return { body: JSON.stringify(rebuilt), parsedBody: rebuilt, session, attachedRetrievals, attachedRetrievalNoteIds, processedMessages, originalMessages, judgeBaseline, anthropicSystem: parsed.system, anthropicBillingBlock, anthropicCacheMarks, anthropicClientCacheControls: clientCacheControls, systemNotes: sysNotes, protocol: "anthropic", stream, compressInjected: injectTools, pluginMode, mcpDialectNote: laneDecisions.mcpDialect, nudge, nudgeOutcome, nudgeStampsBefore: nudgeOutcome === "injected" ? nudgeStampsBefore : undefined, prompts, surface, renderTags: renderStrategy, dropReasoning: (msgs: BiliMessage[]) => applyReasoningDrop(msgs, reasoningPlan, log, sessionId) } as Prepared;
+    return { body: JSON.stringify(rebuilt), parsedBody: rebuilt, session, attachedRetrievals, attachedRetrievalNoteIds, processedMessages, originalMessages, judgeBaseline, anthropicSystem: parsed.system, anthropicBillingBlock, anthropicCacheMarks, anthropicClientCacheControls: clientCacheControls, systemNotes: sysNotes, protocol: "anthropic", stream, compressInjected: injectTools, pluginMode, mcpDialectNote: laneDecisions.mcpDialect, nudge, nudgeOutcome, nudgeStampsBefore: nudgeOutcome === "injected" ? nudgeStampsBefore : undefined, prompts, surface, renderTags: renderStrategy, dropReasoning: (msgs: BiliMessage[]) => applyReasoningDrop(msgs, reasoningPlan, log, sessionId), ...(deferredDurabilityCommit !== undefined ? { deferredDurabilityCommit } : {}) } as Prepared;
 }
 
 export const TRAILING_ASSISTANT_NUDGE = "[bili] Earlier context was compressed above. Continue the task.";

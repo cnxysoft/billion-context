@@ -2146,6 +2146,12 @@ export type Prepared = {
      *  for a fresh create) before the forward. Fail-open: an unsuccessful
      *  execution leaves `body` (the original continue) untouched. */
     threadsReforge?: import("./server/threads-lane.js").ThreadsReforgePlan;
+    /** Idempotent #3397 durability-before-render commit (`ingestRowsNow` +
+     *  `markDirty`) deferred from prepare*() so forward() can dispatch the
+     *  upstream HTTP POST onto the wire first and overlap SQLite ingest with
+     *  the upstream LLM's prefill RTT, while unconditionally completing before
+     *  any response header/byte reaches the client. */
+    deferredDurabilityCommit?: () => void;
 };
 
 

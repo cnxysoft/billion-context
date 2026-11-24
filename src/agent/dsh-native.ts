@@ -68,7 +68,7 @@ import { matchModelEndpoint, loadDeclaredModelEndpoints } from "../model-endpoin
 import { runOutsideFetchChain } from "./fetch-chain/index.js";
 import { installNativeWebSocketIntercept } from "./native-ws-intercept.js";
 import { asciiHeaderValue, fetchManifest, fetchProxyVersion, fetchStatus, fetchStatusLatest, forwardTool, reportAttributionHealth, reportRuntimeInfo, waitForProxyVersion, type ManifestTool } from "./shared.js";
-import { createForkAdopter, sideShapedBody } from "./fork-adopt.js";
+import { createForkAdopter, probeChildHasTraffic, sideShapedBody } from "./fork-adopt.js";
 import { clearIncrementalProbe, createPrepareDirectSend, INCREMENTAL_TURN_MARKER_HEADER, INCREMENTAL_TURN_ID_HEADER, incrementalCacheRetouchEnabled, newIncrementalTurnId, noteIncrementalRejection, noteIncrementalAck, planIncrementalTurn, probeIncrementalTurns, rememberOriginalBody, sweepStale, wireMessagesLookAnthropic, type IncrementalWireMessage } from "./incremental-client.js";
 import { compactionCoverageText, declareDshCompactionActive, detectCompactionOverlayGap } from "./dsh-compaction-disable.js";
 import { maskUrlForDiagnostics } from "../log-mask.js";
@@ -1661,6 +1661,17 @@ async function maybeForkAdoptBeforeSend(ctx: PluginContext, init: RequestInit | 
         return;
     }
     if (dshForkAdopter.isSettled(child.sid)) return;
+    const base = register.base;
+    // Large resumed children (> 256 KiB): ask the O(1) checkOnly snapshot guard
+    // whether the child already has traffic BEFORE JSON-parsing a multi-tens-of-MB
+    // body inside the host process (#5792). Small bodies keep the existing
+    // body-first order so side-shaped / google-wire gates never touch the network.
+    if (base !== undefined && inboundBytesOf(init?.body) > 262_144) {
+        if (await probeChildHasTraffic({ base, parent: child.parent, child: child.sid })) {
+            dshForkAdopter.markSettled(child.sid);
+            return;
+        }
+    }
     const body = await parsedBodyOnce(init);
     if (body === undefined) {
         noteForkGateOnce(`gate:body-parse:${child.sid}`, "warn",
@@ -1672,7 +1683,6 @@ async function maybeForkAdoptBeforeSend(ctx: PluginContext, init: RequestInit | 
             `bili-native-dsh: fork adoption for ${child.sid} deferred for a side-shaped request (no tools, budget <= 200) — the adoption window stays open for the main request (#4215)`);
         return;
     }
-    const base = register.base;
     if (base === undefined) {
         noteForkGateOnce(`gate:proxy-base:${child.sid}`, "warn",
             `bili-native-dsh: fork adoption for ${child.sid} skipped at the proxy-base gate — the proxy origin is not known yet, so the fork protocol cannot be reached (#4215)`);

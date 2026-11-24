@@ -547,7 +547,34 @@ export function sideShapedBody(body: unknown): boolean {
     return budget !== undefined && budget <= 200;
 }
 
-export function createForkAdopter(log: (line: string) => void, opts?: { maxAttempts?: number; fetchImpl?: typeof fetch }): { isSettled(childId: string): boolean; maybeAdopt(input: ForkAdoptInput | undefined): Promise<void> } {
+/** Lightweight O(1) pre-parse check for large resumed children: asks the
+ *  snapshot endpoint with checkOnly=1 whether the child already has persisted
+ *  traffic (409 CHILD_CONFLICT) so callers can settle without JSON-parsing a
+ *  multi-tens-of-MB request body first (#5792). Fail-open (returns false) on
+ *  any non-CHILD_CONFLICT response or network error. */
+export async function probeChildHasTraffic(opts: {
+    base: string;
+    parent: string;
+    child: string;
+    fetchImpl?: typeof fetch;
+}): Promise<boolean> {
+    if (!opts.base || !opts.parent || !opts.child || opts.parent === opts.child) return false;
+    const doFetch = opts.fetchImpl ?? fetch;
+    const url = `${opts.base}/__bili/plugin/snapshot?conversationId=${encodeURIComponent(opts.parent)}&childConversationId=${encodeURIComponent(opts.child)}&checkOnly=1`;
+    try {
+        const res = await doFetch(url, { signal: AbortSignal.timeout(2_000) });
+        if (res.status !== 409) {
+            void res.body?.cancel?.().catch(() => undefined);
+            return false;
+        }
+        const detail = await readBoundedErrorBody(res);
+        return detail.code === "CHILD_CONFLICT";
+    } catch {
+        return false;
+    }
+}
+
+export function createForkAdopter(log: (line: string) => void, opts?: { maxAttempts?: number; fetchImpl?: typeof fetch }): { isSettled(childId: string): boolean; markSettled(childId: string): void; maybeAdopt(input: ForkAdoptInput | undefined): Promise<void> } {
     const maxAttempts = opts?.maxAttempts ?? 3;
     const done = new Set<string>();
     const attempts = new Map<string, number>();
@@ -595,6 +622,9 @@ export function createForkAdopter(log: (line: string) => void, opts?: { maxAttem
     return {
         isSettled(childId: string): boolean {
             return done.has(childId) || (attempts.get(childId) ?? 0) >= maxAttempts;
+        },
+        markSettled(childId: string): void {
+            if (childId) done.add(childId);
         },
         async maybeAdopt(input): Promise<void> {
             if (input === undefined) return;

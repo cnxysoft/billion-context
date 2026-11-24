@@ -86,6 +86,7 @@ export async function prepareGoogle(
     upstreamOrigin: string,
     req: http.IncomingMessage,
     decide?: DecideConfig,
+    deferDurabilityIngest?: boolean,
 ): Promise<Prepared> {
     const sessionId = session.id;
     ++session.stats.requests;
@@ -418,11 +419,22 @@ export async function prepareGoogle(
         if (upstreamOrigin) session.stats.lastLocalTextEstimateOrigin = upstreamOrigin;
     }
     snapshotMessages(session, originalMessages);
-    // #3397 durability-before-render (see prepare-anthropic.ts): rows durable NOW, before the model call.
-    getStore().ingestRowsNow(session);
-    markDirty(session);
+    // #3397 durability-before-render (see prepare-anthropic.ts).
+    let deferredDurabilityCommit: (() => void) | undefined;
+    if (deferDurabilityIngest === true) {
+        let committed = false;
+        deferredDurabilityCommit = () => {
+            if (committed) return;
+            committed = true;
+            getStore().ingestRowsNow(session);
+            markDirty(session);
+        };
+    } else {
+        getStore().ingestRowsNow(session);
+        markDirty(session);
+    }
     if (nudgeOutcome === "injected") recordNudgeInject(session, nudge);
-    return { body: JSON.stringify(rebuilt), parsedBody: rebuilt, session, processedMessages, originalMessages, judgeBaseline, protocol: "google", stream, compressInjected: injectTools, pluginMode, mcpDialectNote: laneDecisions.mcpDialect, nudge, nudgeOutcome, nudgeStampsBefore: nudgeOutcome === "injected" ? nudgeStampsBefore : undefined, prompts, surface, google: { system: googleClientSystem, model }, systemNotes: sysNotes, renderTags: renderStrategy } as Prepared;
+    return { body: JSON.stringify(rebuilt), parsedBody: rebuilt, session, processedMessages, originalMessages, judgeBaseline, protocol: "google", stream, compressInjected: injectTools, pluginMode, mcpDialectNote: laneDecisions.mcpDialect, nudge, nudgeOutcome, nudgeStampsBefore: nudgeOutcome === "injected" ? nudgeStampsBefore : undefined, prompts, surface, google: { system: googleClientSystem, model }, systemNotes: sysNotes, renderTags: renderStrategy, ...(deferredDurabilityCommit !== undefined ? { deferredDurabilityCommit } : {}) } as Prepared;
 }
 
 /** `POST /v1beta/models/<model>:countTokens` — the fold-prune twin of

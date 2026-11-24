@@ -652,6 +652,119 @@ function blockSerializationMapFor(sessionId: string): Map<string, CachedBlockSer
     return map;
 }
 
+interface CachedContentStoreSerialization {
+    version: unknown;
+    byRefRef: Record<string, unknown>;
+    byHashRef: Record<string, string>;
+    byRefKeys: string[];
+    byRefVals: unknown[];
+    byHashKeys: string[];
+    byHashVals: string[];
+    entries: CcrEntryRow[];
+    json: string;
+}
+
+const contentStoreSerializationCache = new WeakMap<object, CachedContentStoreSerialization>();
+
+function serializeContentStoreCached(
+    cs: NonNullable<LegacySessionLike["contentStore"]>,
+): { entries: CcrEntryRow[]; json: string } {
+    const cached = contentStoreSerializationCache.get(cs);
+    const byRefKeys = Object.keys(cs.byRef);
+    const byHashKeys = Object.keys(cs.byHash);
+    if (
+        cached !== undefined &&
+        cached.version === cs.version &&
+        cached.byRefRef === cs.byRef &&
+        cached.byHashRef === cs.byHash &&
+        cached.byRefKeys.length === byRefKeys.length &&
+        cached.byHashKeys.length === byHashKeys.length
+    ) {
+        let same = true;
+        for (let i = 0; i < byRefKeys.length; i++) {
+            const k = byRefKeys[i]!;
+            if (k !== cached.byRefKeys[i] || cs.byRef[k] !== cached.byRefVals[i]) {
+                same = false;
+                break;
+            }
+        }
+        if (same) {
+            for (let i = 0; i < byHashKeys.length; i++) {
+                const k = byHashKeys[i]!;
+                if (k !== cached.byHashKeys[i] || cs.byHash[k] !== cached.byHashVals[i]) {
+                    same = false;
+                    break;
+                }
+            }
+        }
+        if (same) return { entries: cached.entries, json: cached.json };
+    }
+    const byRefVals = byRefKeys.map((k) => cs.byRef[k]);
+    const byHashVals = byHashKeys.map((k) => cs.byHash[k]!);
+    const entries: CcrEntryRow[] = byRefKeys.map((key, ord) => {
+        const content = JSON.stringify(byRefVals[ord]);
+        return { ord, key, content, contentHash: sha256Hex(content) };
+    });
+    const json = JSON.stringify(cs);
+    contentStoreSerializationCache.set(cs, {
+        version: cs.version,
+        byRefRef: cs.byRef,
+        byHashRef: cs.byHash,
+        byRefKeys,
+        byRefVals,
+        byHashKeys,
+        byHashVals,
+        entries,
+        json,
+    });
+    return { entries, json };
+}
+
+interface CachedOrphansSerialization {
+    keys: string[];
+    ones: unknown[];
+    fulls: unknown[];
+    json: string;
+}
+
+const orphansSerializationCache = new WeakMap<object, CachedOrphansSerialization>();
+
+function serializeOrphansCached(
+    blockContents: LegacySessionLike["blockContents"],
+    blocks: ReadonlyArray<{ blockId: string }>,
+): string | null {
+    const knownBlockIds = new Set(blocks.map((b) => b.blockId));
+    const keys: string[] = [];
+    const ones: unknown[] = [];
+    const fulls: unknown[] = [];
+    for (const [blockId, view] of blockContents) {
+        if (!knownBlockIds.has(blockId)) {
+            keys.push(blockId);
+            ones.push(view.one);
+            fulls.push(view.full);
+        }
+    }
+    if (keys.length === 0) return null;
+    const cached = orphansSerializationCache.get(blockContents);
+    if (cached !== undefined && cached.keys.length === keys.length) {
+        let same = true;
+        for (let i = 0; i < keys.length; i++) {
+            if (keys[i] !== cached.keys[i] || ones[i] !== cached.ones[i] || fulls[i] !== cached.fulls[i]) {
+                same = false;
+                break;
+            }
+        }
+        if (same) return cached.json;
+    }
+    const orphanEntries: Record<string, { one: unknown; full: unknown }> = {};
+    for (let i = 0; i < keys.length; i++) {
+        orphanEntries[keys[i]!] = { one: ones[i], full: fulls[i] };
+    }
+    const json = JSON.stringify(orphanEntries);
+    orphansSerializationCache.set(blockContents, { keys, ones, fulls, json });
+    return json;
+}
+
 function serializeBlockMetadata(
     b: CompressionBlock,
     sessionCache: Map<string, CachedBlockSerialization>,
@@ -794,12 +907,7 @@ function finishPlan(
     // same transaction as the rest of the session. This is what makes the
     // reap shape REPRESENTABLE, so record() no longer skips the ingest (the
     // freeze in #4216: sessions stuck at hours-old rows).
-    const knownBlockIds = new Set(session.state.blocks.map((b) => b.blockId));
-    const orphanEntries: Record<string, { one: unknown; full: unknown }> = {};
-    for (const [blockId, view] of session.blockContents) {
-        if (!knownBlockIds.has(blockId)) orphanEntries[blockId] = { one: view.one, full: view.full };
-    }
-    const orphansJson = Object.keys(orphanEntries).length > 0 ? JSON.stringify(orphanEntries) : null;
+    const orphansJson = serializeOrphansCached(session.blockContents, session.state.blocks);
 
     const deadRefs = (session.state.deadRefs ?? []).map((ref, ord) => ({
         ord,
@@ -808,12 +916,8 @@ function finishPlan(
         recordedAt: session.lastSeen,
     }));
 
-    const ccrEntries: CcrEntryRow[] = session.contentStore
-        ? Object.entries(session.contentStore.byRef).map(([key, value], ord) => {
-              const content = JSON.stringify(value);
-              return { ord, key, content, contentHash: sha256Hex(content) };
-          })
-        : [];
+    const ccrSerialized = session.contentStore ? serializeContentStoreCached(session.contentStore) : null;
+    const ccrEntries: CcrEntryRow[] = ccrSerialized ? ccrSerialized.entries : [];
 
     const kstate: Record<string, unknown> = {};
     for (const field of MERGE_STATE_FIELDS) {
@@ -853,7 +957,7 @@ function finishPlan(
         metadataJson: serializeSessionMetadata(session.metadata),
         kstateJson: JSON.stringify(kstate),
         tailJson: JSON.stringify({ pluginSnapshotSeqs, tailSeqs, tailFolded: session.lastMessagesFolded === true }),
-        ccrJson: session.contentStore ? JSON.stringify(session.contentStore) : null,
+        ccrJson: ccrSerialized ? ccrSerialized.json : null,
     };
 
     return { session: sessionRow, messages, blocks, deadRefs, refs, ccrEntries, pluginSnapshotSeqs, tailSeqs };
