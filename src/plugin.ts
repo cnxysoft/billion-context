@@ -1725,8 +1725,14 @@ function forkReply(res: ServerResponse, status: number, body: unknown): void {
     res.end(JSON.stringify(body));
 }
 
-export async function handlePluginSnapshot(conversationId: string, res: ServerResponse): Promise<void> {
+export async function handlePluginSnapshot(conversationId: string, res: ServerResponse, childConversationId?: string): Promise<void> {
     if (!conversationId) return forkReply(res, 400, { ok: false, code: "INVALID_REQUEST", error: "conversationId is required" });
+    if (childConversationId && childConversationId !== conversationId) {
+        const residentChild = peekSession(childConversationId);
+        if ((residentChild && residentChild.stats.requests > 0) || await getStore().hasPersistedTrafficAsync(childConversationId)) {
+            return forkReply(res, 409, { ok: false, code: "CHILD_CONFLICT", error: "child conversation already has traffic" });
+        }
+    }
     const session = await resolveForkConversation(conversationId);
     if (!session) return forkReply(res, 404, { ok: false, code: "PARENT_NOT_FOUND", error: "unknown plugin conversation" });
     acquireInFlight(session);

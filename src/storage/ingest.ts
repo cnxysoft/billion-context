@@ -619,6 +619,7 @@ export function serializeSessionMetadata(metadata: Record<string, unknown>): str
 interface CachedBlockSerialization {
     eff: readonly string[];
     dir: readonly string[];
+    coveredIds: readonly string[];
     coveredHash: string;
     keys: readonly string[];
     snapshot: Record<string, unknown>;
@@ -654,7 +655,7 @@ function blockSerializationMapFor(sessionId: string): Map<string, CachedBlockSer
 function serializeBlockMetadata(
     b: CompressionBlock,
     sessionCache: Map<string, CachedBlockSerialization>,
-): { coveredHash: string; payloadJson: string } {
+): { coveredHash: string; payloadJson: string; coveredIds: readonly string[] } {
     const prev = sessionCache.get(b.blockId);
     const sameCoverage =
         prev !== undefined &&
@@ -663,6 +664,11 @@ function serializeBlockMetadata(
     const coveredHash = sameCoverage
         ? prev!.coveredHash
         : sha256Hex(JSON.stringify({ effectiveMessageIds: b.effectiveMessageIds, directMessageIds: b.directMessageIds }));
+    const coveredIds = sameCoverage
+        ? prev!.coveredIds
+        : (b.directMessageIds && b.directMessageIds.length > 0
+            ? [...b.effectiveMessageIds, ...b.directMessageIds]
+            : [...b.effectiveMessageIds]);
 
     const rec = b as unknown as Record<string, unknown>;
     const keys = Object.keys(rec);
@@ -682,7 +688,7 @@ function serializeBlockMetadata(
             break;
         }
         if (samePayload) {
-            return { coveredHash, payloadJson: prev.payloadJson };
+            return { coveredHash, payloadJson: prev.payloadJson, coveredIds };
         }
     }
 
@@ -696,12 +702,13 @@ function serializeBlockMetadata(
     sessionCache.set(b.blockId, {
         eff: [...b.effectiveMessageIds],
         dir: [...b.directMessageIds],
+        coveredIds,
         coveredHash,
         keys,
         snapshot,
         payloadJson,
     });
-    return { coveredHash, payloadJson };
+    return { coveredHash, payloadJson, coveredIds };
 }
 
 function finishPlan(
@@ -746,7 +753,7 @@ function finishPlan(
         const one = views?.one ?? null;
         const fullSer = serializeBlockView(full);
         const oneSer = one === null ? null : serializeBlockView(one);
-        const { coveredHash, payloadJson } = serializeBlockMetadata(b, blockSerCache);
+        const { coveredHash, payloadJson, coveredIds } = serializeBlockMetadata(b, blockSerCache);
         let startSeq = -1;
         let endSeq = -1;
         if (seqById.size > 0) {
@@ -757,9 +764,6 @@ function finishPlan(
                 if (s > endSeq) endSeq = s;
             }
         }
-        const coveredIds = b.directMessageIds && b.directMessageIds.length > 0
-            ? [...b.effectiveMessageIds, ...b.directMessageIds]
-            : b.effectiveMessageIds;
         return {
             blockId: b.blockId,
             ord,

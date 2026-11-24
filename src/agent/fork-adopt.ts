@@ -426,7 +426,7 @@ export async function tryForkAdoption(opts: {
     if (core === null || core?.length === 0 || responsesInput?.length === 0) {
         return { outcome: "degraded", reason: "body unmappable" };
     }
-    const snapshotUrl = `${opts.base}/__bili/plugin/snapshot?conversationId=${encodeURIComponent(opts.parentConversationId)}`;
+    const snapshotUrl = `${opts.base}/__bili/plugin/snapshot?conversationId=${encodeURIComponent(opts.parentConversationId)}&childConversationId=${encodeURIComponent(opts.childConversationId)}`;
     for (let attempt = 0; attempt < 2; attempt += 1) {
         let snapshot: Awaited<ReturnType<typeof snapshotOf>>;
         try {
@@ -547,7 +547,7 @@ export function sideShapedBody(body: unknown): boolean {
     return budget !== undefined && budget <= 200;
 }
 
-export function createForkAdopter(log: (line: string) => void, opts?: { maxAttempts?: number; fetchImpl?: typeof fetch }): { maybeAdopt(input: ForkAdoptInput | undefined): Promise<void> } {
+export function createForkAdopter(log: (line: string) => void, opts?: { maxAttempts?: number; fetchImpl?: typeof fetch }): { isSettled(childId: string): boolean; maybeAdopt(input: ForkAdoptInput | undefined): Promise<void> } {
     const maxAttempts = opts?.maxAttempts ?? 3;
     const done = new Set<string>();
     const attempts = new Map<string, number>();
@@ -593,6 +593,9 @@ export function createForkAdopter(log: (line: string) => void, opts?: { maxAttem
         if (!transient || (attempts.get(input.child) ?? 0) >= maxAttempts) done.add(input.child);
     };
     return {
+        isSettled(childId: string): boolean {
+            return done.has(childId) || (attempts.get(childId) ?? 0) >= maxAttempts;
+        },
         async maybeAdopt(input): Promise<void> {
             if (input === undefined) return;
             if (input.parent === "" || input.child === "" || input.parent === input.child) return;

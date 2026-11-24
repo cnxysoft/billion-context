@@ -14,7 +14,7 @@ import { _resetPluginStateForTest, forkMessageIdentityHash } from "../src/plugin
 import { _resetSessionsForTest } from "../src/session.ts";
 import { _setForTest } from "../src/registry.ts";
 import { resetToolRingForTest } from "../src/tool-ring.ts";
-import { forkIdentityHashOf, forkOrderHashOf, manifestForkCapable, matchForkPrefix, openaiBodyToCore, resetForkCapabilityCacheForTest, responsesBodyToCore, tryForkAdoption } from "../src/agent/fork-adopt.ts";
+import { createForkAdopter, forkIdentityHashOf, forkOrderHashOf, manifestForkCapable, matchForkPrefix, openaiBodyToCore, resetForkCapabilityCacheForTest, responsesBodyToCore, tryForkAdoption } from "../src/agent/fork-adopt.ts";
 import { sideShapedBody } from "../src/agent/dsh-native.ts";
 
 process.env.NODE_ENV = "test";
@@ -456,7 +456,46 @@ test("full chain: dsh fork child adopts the parent state and its replay is accep
         assert.equal(divergent.status, 409);
         const divergentBody = await divergent.json() as { code?: string };
         assert.equal(divergentBody.code, "CHILD_CONFLICT");
+
+        // Snapshot probes carrying an already-live childConversationId (requests > 0)
+        // short-circuit with 409 CHILD_CONFLICT without loading the parent session.
+        const existingChildSnap = await fetch(`${h.origin}/__bili/plugin/snapshot?conversationId=nonexistent-parent&childConversationId=child-sid`);
+        assert.equal(existingChildSnap.status, 409);
+        const existingChildBody = await existingChildSnap.json() as { code?: string };
+        assert.equal(existingChildBody.code, "CHILD_CONFLICT");
+
+        // A brand-new child id still receives the parent snapshot normally.
+        const freshChildSnap = await fetch(`${h.origin}/__bili/plugin/snapshot?conversationId=parent-sid&childConversationId=brand-new-child`);
+        assert.equal(freshChildSnap.status, 200);
     } finally {
         await h.close();
     }
+});
+
+test("createForkAdopter.isSettled latches after terminal outcomes and stays open across transient retries", async () => {
+    const logs: string[] = [];
+    const adopter = createForkAdopter((line) => logs.push(line), {
+        maxAttempts: 2,
+        fetchImpl: (async (input) => {
+            const url = String(input);
+            if (url.includes("/__bili/plugin/manifest")) {
+                return new Response(JSON.stringify({ capabilities: { fork: { protocolVersion: 2 } } }), { status: 200 });
+            }
+            if (url.includes("parent-transient")) {
+                return new Response(JSON.stringify({ ok: false, code: "TEMP" }), { status: 503 });
+            }
+            return new Response(JSON.stringify({ ok: false, code: "CHILD_CONFLICT" }), { status: 409 });
+        }) as typeof fetch,
+    });
+    const body = { model: "claude-test", max_tokens: 1024, messages: [{ role: "user", content: "hi" }] };
+
+    assert.equal(adopter.isSettled("child-terminal"), false);
+    await adopter.maybeAdopt({ base: "http://127.0.0.1:9", parent: "parent-ok", child: "child-terminal", body });
+    assert.equal(adopter.isSettled("child-terminal"), true, "409 terminal outcome must settle the child immediately");
+
+    assert.equal(adopter.isSettled("child-transient"), false);
+    await adopter.maybeAdopt({ base: "http://127.0.0.1:9", parent: "parent-transient", child: "child-transient", body });
+    assert.equal(adopter.isSettled("child-transient"), false, "first 503 attempt leaves the retry window open");
+    await adopter.maybeAdopt({ base: "http://127.0.0.1:9", parent: "parent-transient", child: "child-transient", body });
+    assert.equal(adopter.isSettled("child-transient"), true, "exhausting maxAttempts settles the child");
 });

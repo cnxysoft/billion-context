@@ -1011,6 +1011,27 @@ test("delta saves reuse unchanged block coverage bounds and committed ref prefix
         store.ingestSession(planIngest(legacy), undefined, { completeLog: true });
         assert.equal(queries.some((sql) => sql.includes("SELECT seq, msg_id, identity, retired_at FROM messages WHERE session_id = ?")), false);
         assert.equal(store.getMessages(legacy.id).some((row) => row.msgId === m5.id), true, "m5 reactivated cleanly");
+
+        // Steady-state delta after a full ingest uses the committed block
+        // snapshot and skips reading payload_json from blocks altogether.
+        const m7 = msg(7);
+        legacy.lastMessages = [...legacy.lastMessages, m7];
+        byRaw[m7.id] = "m08205";
+        const mark4 = store.ingestWatermark(legacy.id)!;
+        const boundary4 = store.probeIngestBoundary(legacy.id, mark4.seq)!;
+        const deltaPlan4 = planIngestDelta(legacy, mark4.seq, mark4.tailSeqs, { msgId: boundary4.msgId, contentHash: boundary4.contentHash }, true)!;
+        queries.length = 0;
+        assert.equal(store.ingestSession(deltaPlan4, {
+            trustedSeq: mark4.seq,
+            boundaryMsgId: boundary4.msgId,
+            boundaryHash: boundary4.contentHash,
+            trustedTailSeqs: mark4.tailSeqs,
+        }), true);
+        assert.equal(
+            queries.some((sql) => sql.includes("payload_json FROM blocks WHERE session_id = ?")),
+            false,
+            "steady-state delta save must skip full blocks payload_json read via committed block snapshot",
+        );
     } finally {
         store.close();
         rmBestEffort(dir);

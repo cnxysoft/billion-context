@@ -53,7 +53,7 @@ import { FORCE_TEXT_PROTOCOL, injectResponsesTool, injectTool } from "./inject.j
 import { nudgeOn, resolveLaneDecisions, surfaceOffDetail } from "./lane-decisions.js";
 import { pluginAgentHeader } from "../plugin.js";
 
-const ACTIVE_HINTS_TTL_MS = 120_000;
+const ACTIVE_HINTS_TTL_MS = 1_800_000;
 let activeResponsesHints: {
     sessionId: string;
     hints: (CanonicalBaseHint | undefined)[];

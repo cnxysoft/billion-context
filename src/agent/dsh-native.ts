@@ -1660,6 +1660,7 @@ async function maybeForkAdoptBeforeSend(ctx: PluginContext, init: RequestInit | 
             `bili-native-dsh: fork adoption for ${child.sid} skipped at the tools-ready gate — this request arrived before bili tool registration completed; later requests can still adopt (#4215)`);
         return;
     }
+    if (dshForkAdopter.isSettled(child.sid)) return;
     const body = await parsedBodyOnce(init);
     if (body === undefined) {
         noteForkGateOnce(`gate:body-parse:${child.sid}`, "warn",

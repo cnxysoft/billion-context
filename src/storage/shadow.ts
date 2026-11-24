@@ -140,6 +140,15 @@ function applyProvenCorruptionPolicy(
 
 const VERIFY_BATCH_SIZE = 32;
 
+/** Thresholds above which background saves run BatchedViewVerification in
+ *  time-sliced event-loop ticks instead of one synchronous blocking pass.
+ *  Small sessions finish inline in <5ms; mega-sessions (tens of thousands of
+ *  messages) yield every ASYNC_VERIFY_SLICE_MS so incoming requests are never
+ *  stalled behind a multi-second post-response verification sweep. */
+const ASYNC_VERIFY_MIN_MESSAGES = 256;
+const ASYNC_VERIFY_MIN_BLOCKS = 64;
+const ASYNC_VERIFY_SLICE_MS = 8;
+
 /** Bound transient CAS strings during normal cold loads, not the retained history. */
 const VIEW_READ_BATCH_SIZE = 256;
 
@@ -317,6 +326,9 @@ export class UnifiedShadow {
      *  only — nothing persisted, no schema change. */
     private readonly ingestCounts = new Map<string, number>();
     private readonly pendingVerifySessions = new Set<string>();
+    private readonly activeAsyncVerify = new Map<string, { gen: number; timer: ReturnType<typeof setTimeout> | null }>();
+    private asyncVerifyGen = 0;
+    private closed = false;
     /** Warn-dedup key of the last logged failure — the error message itself
      *  (#5140: one warn per distinct message, no per-turn spam). #5627 makes
      *  the message victim-specific where possible, so distinct victims still
@@ -600,7 +612,7 @@ export class UnifiedShadow {
      *  message log authoritatively, so the ingest uses the raw tail whenever
      *  available; both digest legs go through the same override, so parity
      *  accounting stays honest. */
-    record(record: unknown, rawTail?: { lastMessages: CoreMessage[]; lastMessagesFolded?: boolean }, liveCcr?: MessageContentStore, opts?: { deferVerify?: boolean }): void {
+    record(record: unknown, rawTail?: { lastMessages: CoreMessage[]; lastMessagesFolded?: boolean }, liveCcr?: MessageContentStore, opts?: { deferVerify?: boolean; asyncVerify?: boolean }): void {
         // #3931 step 3: network backend — the ingest runs on the serial
         // queue (fire-and-forget; failures are logged once per distinct message — never disabled).
         if (this.sync === null) {
@@ -615,6 +627,10 @@ export class UnifiedShadow {
             const loaded = this.legacyLoad(record);
             if (!loaded) return;
             sessionId = loaded.id;
+            // Cancel any superseded background verification for this session
+            // BEFORE ingesting newer rows, keeping verification pending so the
+            // next eligible save checks the latest committed state cleanly.
+            this.cancelAsyncVerify(sessionId, true);
             // #4216/#4242: the reap shape (blockContents without their
             // state.blocks entries) is now REPRESENTABLE — planIngest
             // journals the orphan contents into sessions.orphans_json and
@@ -703,103 +719,207 @@ export class UnifiedShadow {
                 this.pendingVerifySessions.add(legacy.id);
             } else if (dueVerify) {
                 this.pendingVerifySessions.delete(legacy.id);
-                this.stats.verifySamples++;
-                const sessionRow = this.sync.getSessionRow(legacy.id);
-                if (!sessionRow) throw new Error(`session row missing after ingest: ${legacy.id}`);
-                const verifier = new BatchedViewVerification(legacy, sessionRow, this.sync.getRefs(legacy.id), this.sync.getDeadRefs(legacy.id));
-                for (let offset = 0; ; offset += VERIFY_BATCH_SIZE) {
-                    const rows = this.sync.getBlocks(legacy.id, { limit: VERIFY_BATCH_SIZE, offset });
-                    verifier.addBlocks(rows);
-                    if (rows.length < VERIFY_BATCH_SIZE) break;
-                }
-                for (let i = 0; i < verifier.messageSeqs.length; i += VERIFY_BATCH_SIZE) {
-                    verifier.addMessages(this.sync.getMessages(legacy.id, { seqs: verifier.messageSeqs.slice(i, i + VERIFY_BATCH_SIZE) }));
-                }
-                const verified = verifier.finish();
-                warnTailGaps(legacy.id, verified);
-                if (!verified.matches) {
-                    this.stats.verifyDrift++;
-                    // #3919: membership from BEFORE this add is the repeat
-                    // signal — two consecutive sampled drifts mean the views
-                    // are NOT converging (the watermark clear healed nothing),
-                    // which is the structural-drift signature the user needs
-                    // to distinguish from one-off external churn.
-                    const repeat = this.driftedSessions.has(legacy.id);
-                    this.driftedSessions.add(legacy.id);
-                    // #4323: count CONSECUTIVE sampled drifts — membership alone
-                    // caps at "repeat yes/no" and cannot distinguish 3+ samples.
-                    // N in a row marks a STRUCTURAL divergence: the watermark
-                    // clear healed nothing. Note the drift can be a single-
-                    // instance artifact (#4392 — digest shape), not only the
-                    // multi-writer #394 case; escalate ONCE at the threshold
-                    // with a loud WARN naming both sides' fold counts, then
-                    // freeze THIS process's envelope writes for the session so
-                    // the ping-pong stops churning the file copy (persist.ts
-                    // consults envelopeFrozen on every save route; the unified
-                    // store keeps receiving every save either way).
-                    const streak = (this.driftStreaks.get(legacy.id) ?? 0) + 1;
-                    this.driftStreaks.set(legacy.id, streak);
-                    // #3919: the digest says WHICH bytes disagree but not WHERE —
-                    // append the field-level diagnosis (diverged dimensions +
-                    // first divergent tail slot, fingerprints only, never body
-                    // text) so one log line is enough to classify the trigger.
-                    // The line prefix stays byte-identical for existing greps.
-                    // #5408: computed BEFORE the escalation so the ESCALATED
-                    // warn carries it too — that line is the one operators see
-                    // when they grep for the freeze, and "diverged: state"
-                    // without the sub-key drill-down left #5408 undiagnosable.
-                    let diagnosis = "";
-                    try {
-                        diagnosis = formatDriftDiagnostics(verified.diagnostics);
-                    } catch {
-                        // diagnostics must never break the heal path
-                    }
-                    if (streak === DRIFT_ESCALATE_STREAK) {
-                        this.frozenEnvelopeIds.add(legacy.id);
-                        // #5408: stamp WHEN this process froze the writes — the
-                        // skip-save logs and the status wire surface the age.
-                        this.frozenEnvelopeSince.set(legacy.id, Date.now());
-                        let sides = "";
-                        try {
-                            const envBlocks = legacy.state.blocks.filter((b) => b.active).length;
-                            const idxBlocks = verified.activeBlocks;
-                            sides = ` [envelope ${envBlocks} active block(s) vs index ${idxBlocks}]`;
-                        } catch {
-                            // counts must never break the heal path
-                        }
-                        loggerLog("warn", `[storage] DIGEST DRIFT ESCALATED for ${legacy.id}: ${streak} consecutive sampled drifts — the views have stopped converging${sides}${diagnosis}. Both legs are built in THIS process, so a persistent gap is a digest-shape mismatch first (field only one leg builds, ordering — #4392) and only then a writer: known producers are a second bili instance sharing one sessions dir (#394 anti-pattern; second-instance detection: #4177), or ONE host re-writing history slots below the ingest watermark on every save (the delta fast path skips them by design, so the sampled backstop cannot converge against a repeating trigger — #4614). Freezing THIS process's JSON envelope writes for the session until a clean sample re-admits it — the unified store keeps receiving every save (#4323)`);
-                    }
-                    // Panels consume {disabled, lastError} — make the sampled
-                    // degradation visible there, not just in the counter/log.
-                    this.stats.lastError = `digest drift for ${legacy.id}: unified replay != legacy load view`;
-                    // #3166 review: the backstop must heal, not only report —
-                    // the watermark still vouches for a prefix the digest just
-                    // proved stale (e.g. an envelope re-render or interior
-                    // rewrite below the boundary), and every same-length save
-                    // would re-take the unverified empty delta against it.
-                    // Drop the watermark so the next save re-points every
-                    // tail slot through the exact full path (divergence
-                    // window bounded to ≤ VERIFY_EVERY_INGESTS saves).
-                    this.sync.clearIngestWatermark(legacy.id);
-                    loggerLog("error", `[storage] unified shadow DIGEST DRIFT for ${legacy.id}: unified replay != legacy load view${repeat ? " (repeat: consecutive sampled drift — the views are not converging)" : ""}${diagnosis} — dropped the ingest watermark, the next save re-ingests the full tail`);
+                const useAsync = opts?.asyncVerify === true && (
+                    (legacy.lastMessages?.length ?? 0) > ASYNC_VERIFY_MIN_MESSAGES ||
+                    legacy.state.blocks.length > ASYNC_VERIFY_MIN_BLOCKS
+                );
+                if (useAsync) {
+                    this.scheduleAsyncVerify(legacy);
                 } else {
-                    this.stats.verifyOk++;
-                    // #3135 ④/#3818: a clean sample re-admits the session to
-                    // index-first reads (the watermark re-verify path above
-                    // proved the views converged again).
-                    this.driftedSessions.delete(legacy.id);
-                    // #4323: convergence also ends the streak and unfreezes
-                    // this process's envelope writes for the session.
-                    this.driftStreaks.delete(legacy.id);
-                    if (this.frozenEnvelopeIds.delete(legacy.id)) {
-                        this.frozenEnvelopeSince.delete(legacy.id);
-                        loggerLog("info", `[storage] drift resolved for ${legacy.id}: clean sample re-admits the session — envelope writes resume (#4323)`);
+                    this.stats.verifySamples++;
+                    const sessionRow = this.sync.getSessionRow(legacy.id);
+                    if (!sessionRow) throw new Error(`session row missing after ingest: ${legacy.id}`);
+                    const verifier = new BatchedViewVerification(legacy, sessionRow, this.sync.getRefs(legacy.id), this.sync.getDeadRefs(legacy.id));
+                    for (let offset = 0; ; offset += VERIFY_BATCH_SIZE) {
+                        const rows = this.sync.getBlocks(legacy.id, { limit: VERIFY_BATCH_SIZE, offset });
+                        verifier.addBlocks(rows);
+                        if (rows.length < VERIFY_BATCH_SIZE) break;
                     }
+                    for (let i = 0; i < verifier.messageSeqs.length; i += VERIFY_BATCH_SIZE) {
+                        verifier.addMessages(this.sync.getMessages(legacy.id, { seqs: verifier.messageSeqs.slice(i, i + VERIFY_BATCH_SIZE) }));
+                    }
+                    const verified = verifier.finish();
+                    this.applyVerificationOutcome(legacy, verified);
                 }
             }
             this.consecutiveFailures = 0;
         } catch (err) {
             this.noteIngestFailure(err, phase, sessionId);
+        }
+    }
+
+    private cancelAsyncVerify(sessionId: string, rearmPending: boolean): void {
+        const job = this.activeAsyncVerify.get(sessionId);
+        if (!job) return;
+        if (job.timer !== null) clearTimeout(job.timer);
+        this.activeAsyncVerify.delete(sessionId);
+        if (rearmPending) this.pendingVerifySessions.add(sessionId);
+    }
+
+    private scheduleAsyncVerify(legacy: LegacySessionLike): void {
+        const snapshot: LegacySessionLike = {
+            ...legacy,
+            state: {
+                ...legacy.state,
+                blocks: [...legacy.state.blocks],
+                messageRefs: {
+                    byRaw: { ...legacy.state.messageRefs.byRaw },
+                    byRef: { ...legacy.state.messageRefs.byRef },
+                },
+                ...(legacy.state.deadRefs ? { deadRefs: [...legacy.state.deadRefs] } : {}),
+            },
+            blockContents: new Map(legacy.blockContents),
+            ...(legacy.lastMessages ? { lastMessages: [...legacy.lastMessages] } : {}),
+            ...(legacy.pluginSnapshot ? { pluginSnapshot: [...legacy.pluginSnapshot] } : {}),
+        };
+        const id = snapshot.id;
+        const gen = ++this.asyncVerifyGen;
+        const job: { gen: number; timer: ReturnType<typeof setTimeout> | null } = { gen, timer: null };
+        this.activeAsyncVerify.set(id, job);
+
+        let verifier: BatchedViewVerification | null = null;
+        let blockOffset = 0;
+        let blocksDone = false;
+        let msgOffset = 0;
+
+        const scheduleNext = (): void => {
+            if (this.closed || this.activeAsyncVerify.get(id)?.gen !== gen) return;
+            const timer = setTimeout(step, 0);
+            timer.unref?.();
+            job.timer = timer;
+        };
+
+        const step = (): void => {
+            job.timer = null;
+            if (this.closed || this.sync === null || this.activeAsyncVerify.get(id)?.gen !== gen) return;
+            try {
+                const sliceStart = performance.now();
+                if (verifier === null) {
+                    const sessionRow = this.sync.getSessionRow(id);
+                    if (!sessionRow) throw new Error(`session row missing after ingest: ${id}`);
+                    verifier = new BatchedViewVerification(snapshot, sessionRow, this.sync.getRefs(id), this.sync.getDeadRefs(id));
+                    scheduleNext();
+                    return;
+                }
+                while (!blocksDone) {
+                    const rows = this.sync.getBlocks(id, { limit: VERIFY_BATCH_SIZE, offset: blockOffset });
+                    verifier.addBlocks(rows);
+                    blockOffset += VERIFY_BATCH_SIZE;
+                    if (rows.length < VERIFY_BATCH_SIZE) {
+                        blocksDone = true;
+                        break;
+                    }
+                    if (performance.now() - sliceStart >= ASYNC_VERIFY_SLICE_MS) {
+                        scheduleNext();
+                        return;
+                    }
+                }
+                while (msgOffset < verifier.messageSeqs.length) {
+                    const seqs = verifier.messageSeqs.slice(msgOffset, msgOffset + VERIFY_BATCH_SIZE);
+                    verifier.addMessages(this.sync.getMessages(id, { seqs }));
+                    msgOffset += VERIFY_BATCH_SIZE;
+                    if (msgOffset < verifier.messageSeqs.length && performance.now() - sliceStart >= ASYNC_VERIFY_SLICE_MS) {
+                        scheduleNext();
+                        return;
+                    }
+                }
+                if (this.closed || this.sync === null || this.activeAsyncVerify.get(id)?.gen !== gen) return;
+                this.activeAsyncVerify.delete(id);
+                this.stats.verifySamples++;
+                const verified = verifier.finish();
+                this.applyVerificationOutcome(snapshot, verified);
+            } catch (err) {
+                this.activeAsyncVerify.delete(id);
+                if (!this.closed) this.noteIngestFailure(err, "verify-sample", id);
+            }
+        };
+
+        scheduleNext();
+    }
+
+    private applyVerificationOutcome(
+        legacy: LegacySessionLike,
+        verified: { matches: boolean; activeBlocks: number; tailGaps: number; diagnostics: DriftDiagnostics },
+    ): void {
+        warnTailGaps(legacy.id, verified);
+        if (!verified.matches) {
+            this.stats.verifyDrift++;
+            // #3919: membership from BEFORE this add is the repeat
+            // signal — two consecutive sampled drifts mean the views
+            // are NOT converging (the watermark clear healed nothing),
+            // which is the structural-drift signature the user needs
+            // to distinguish from one-off external churn.
+            const repeat = this.driftedSessions.has(legacy.id);
+            this.driftedSessions.add(legacy.id);
+            // #4323: count CONSECUTIVE sampled drifts — membership alone
+            // caps at "repeat yes/no" and cannot distinguish 3+ samples.
+            // N in a row marks a STRUCTURAL divergence: the watermark
+            // clear healed nothing. Note the drift can be a single-
+            // instance artifact (#4392 — digest shape), not only the
+            // multi-writer #394 case; escalate ONCE at the threshold
+            // with a loud WARN naming both sides' fold counts, then
+            // freeze THIS process's envelope writes for the session so
+            // the ping-pong stops churning the file copy (persist.ts
+            // consults envelopeFrozen on every save route; the unified
+            // store keeps receiving every save either way).
+            const streak = (this.driftStreaks.get(legacy.id) ?? 0) + 1;
+            this.driftStreaks.set(legacy.id, streak);
+            // #3919: the digest says WHICH bytes disagree but not WHERE —
+            // append the field-level diagnosis (diverged dimensions +
+            // first divergent tail slot, fingerprints only, never body
+            // text) so one log line is enough to classify the trigger.
+            // The line prefix stays byte-identical for existing greps.
+            // #5408: computed BEFORE the escalation so the ESCALATED
+            // warn carries it too — that line is the one operators see
+            // when they grep for the freeze, and "diverged: state"
+            // without the sub-key drill-down left #5408 undiagnosable.
+            let diagnosis = "";
+            try {
+                diagnosis = formatDriftDiagnostics(verified.diagnostics);
+            } catch {
+                // diagnostics must never break the heal path
+            }
+            if (streak === DRIFT_ESCALATE_STREAK) {
+                this.frozenEnvelopeIds.add(legacy.id);
+                // #5408: stamp WHEN this process froze the writes — the
+                // skip-save logs and the status wire surface the age.
+                this.frozenEnvelopeSince.set(legacy.id, Date.now());
+                let sides = "";
+                try {
+                    const envBlocks = legacy.state.blocks.filter((b) => b.active).length;
+                    const idxBlocks = verified.activeBlocks;
+                    sides = ` [envelope ${envBlocks} active block(s) vs index ${idxBlocks}]`;
+                } catch {
+                    // counts must never break the heal path
+                }
+                loggerLog("warn", `[storage] DIGEST DRIFT ESCALATED for ${legacy.id}: ${streak} consecutive sampled drifts — the views have stopped converging${sides}${diagnosis}. Both legs are built in THIS process, so a persistent gap is a digest-shape mismatch first (field only one leg builds, ordering — #4392) and only then a writer: known producers are a second bili instance sharing one sessions dir (#394 anti-pattern; second-instance detection: #4177), or ONE host re-writing history slots below the ingest watermark on every save (the delta fast path skips them by design, so the sampled backstop cannot converge against a repeating trigger — #4614). Freezing THIS process's JSON envelope writes for the session until a clean sample re-admits it — the unified store keeps receiving every save (#4323)`);
+            }
+            // Panels consume {disabled, lastError} — make the sampled
+            // degradation visible there, not just in the counter/log.
+            this.stats.lastError = `digest drift for ${legacy.id}: unified replay != legacy load view`;
+            // #3166 review: the backstop must heal, not only report —
+            // the watermark still vouches for a prefix the digest just
+            // proved stale (e.g. an envelope re-render or interior
+            // rewrite below the boundary), and every same-length save
+            // would re-take the unverified empty delta against it.
+            // Drop the watermark so the next save re-points every
+            // tail slot through the exact full path (divergence
+            // window bounded to ≤ VERIFY_EVERY_INGESTS saves).
+            this.sync?.clearIngestWatermark(legacy.id);
+            loggerLog("error", `[storage] unified shadow DIGEST DRIFT for ${legacy.id}: unified replay != legacy load view${repeat ? " (repeat: consecutive sampled drift — the views are not converging)" : ""}${diagnosis} — dropped the ingest watermark, the next save re-ingests the full tail`);
+        } else {
+            this.stats.verifyOk++;
+            // #3135 ④/#3818: a clean sample re-admits the session to
+            // index-first reads (the watermark re-verify path above
+            // proved the views converged again).
+            this.driftedSessions.delete(legacy.id);
+            // #4323: convergence also ends the streak and unfreezes
+            // this process's envelope writes for the session.
+            this.driftStreaks.delete(legacy.id);
+            if (this.frozenEnvelopeIds.delete(legacy.id)) {
+                this.frozenEnvelopeSince.delete(legacy.id);
+                loggerLog("info", `[storage] drift resolved for ${legacy.id}: clean sample re-admits the session — envelope writes resume (#4323)`);
+            }
         }
     }
 
@@ -973,6 +1093,7 @@ export class UnifiedShadow {
     /** GC parity: remove the session's rows when the legacy files are deleted. */
     remove(id: string): void {
         if (this.sync === null) return;
+        this.cancelAsyncVerify(id, false);
         this.ingestCounts.delete(id);
         this.pendingVerifySessions.delete(id);
         this.driftStreaks.delete(id);
@@ -1645,6 +1766,10 @@ export class UnifiedShadow {
     }
 
     close(): void {
+        this.closed = true;
+        for (const id of [...this.activeAsyncVerify.keys()]) {
+            this.cancelAsyncVerify(id, false);
+        }
         if (this.sync === null) return;
         try {
             this.sync.close();

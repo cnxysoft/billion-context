@@ -507,6 +507,29 @@ export class UnifiedStore {
     private releaseDelete: ReturnType<SqliteDatabase["prepare"]> | null = null;
     private readonly messageReadStatements = new Map<string, ReturnType<SqliteDatabase["prepare"]>>();
     private readonly committedRefPrefixes = new Map<string, { rawIds: string[]; refs: string[]; refNums: (number | null)[] }>();
+    private readonly committedBlockSnapshots = new Map<string, {
+        entries: Array<{
+            blockId: string;
+            ord: number;
+            startSeq: number;
+            endSeq: number;
+            startRef: number | null;
+            endRef: number | null;
+            tier: number;
+            summaryHash: string;
+            oneHash: string | null;
+            supersedesBlockId: string | null;
+            active: boolean;
+            createdAt: number;
+            coveredHash: string;
+            payloadJson: string;
+        }>;
+        coveredIds: Set<string>;
+        count: number;
+        maxOrd: number;
+        activeSum: number;
+        maxCreatedAt: number;
+    }>();
 
     private constructor(db: SqliteDatabase, engine: SqliteEngineName, engineSource: SqliteEngineSource, lockPath: string | null, foreignLockHolder: { pid: number } | null, dbPath: string) {
         this.db = db;
@@ -1082,6 +1105,8 @@ export class UnifiedStore {
     ): boolean {
         const s = input.session;
         let refCacheUpdate: { mode: "append"; added: RefRow[] } | { mode: "replace"; rows: RefRow[] } | null = null;
+        type BlockSnapshotValue = NonNullable<ReturnType<UnifiedStore["committedBlockSnapshots"]["get"]>>;
+        let blockCacheUpdate: BlockSnapshotValue | "keep" | "clear" = "clear";
         const ok = this.db.transaction((): boolean => {
             let messages: MessageRow[];
             let watermark: number | null;
@@ -1369,6 +1394,13 @@ export class UnifiedStore {
             // via reapDestroyedSubstrate) — they would resurrect on every
             // unified load. Drop absent ids first, releasing their content
             // refs inside the same transaction (deleteSession discipline).
+            // Steady-state delta fast path: when every incoming block matches
+            // our committed snapshot, no newly appended delta message falls
+            // inside any block's coverage, and the DB row summary matches, skip
+            // loading multi-MiB payload_json rows altogether.
+            if (delta !== undefined && opts?.envelopeImport !== true && this.blocksUnchangedOnDelta(s.sessionId, input.blocks, messages)) {
+                blockCacheUpdate = "keep";
+            } else {
             // #5744: ONE full-row read serves both the stale sweep and the
             // unchanged-row skip below (previously: 1 hash-only sweep read +
             // 1 point read per block per save).
@@ -1514,6 +1546,12 @@ export class UnifiedStore {
                    created_at = excluded.created_at, covered_hash = excluded.covered_hash,
                    payload_json = excluded.payload_json`,
             );
+            const nextBlockEntries: BlockSnapshotValue["entries"] = [];
+            const nextCoveredIds = new Set<string>();
+            let canCacheBlocks = !skipIncomingBlocks;
+            let nextMaxOrd = -1;
+            let nextActiveSum = 0;
+            let nextMaxCreatedAt = -1;
             for (const b of input.blocks) {
                 if (skipIncomingBlocks) continue;
                 const [bStartSeq, bEndSeq] = boundsForCovered(b);
@@ -1524,6 +1562,10 @@ export class UnifiedStore {
                 // per unchanged block. #4608 bound preservation makes "the
                 // incoming -1 keeps the stored value" part of the equality.
                 const ex = storedBlocks.get(b.blockId);
+                const effStartSeq = bStartSeq >= 0 ? bStartSeq : (ex?.start_seq ?? -1);
+                const effEndSeq = bEndSeq >= 0 ? bEndSeq : (ex?.end_seq ?? -1);
+                let finalSummaryHash = b.summaryHash;
+                let finalOneHash = b.oneHash ?? null;
                 if (ex &&
                     ex.ord === b.ord &&
                     (bStartSeq < 0 || bStartSeq === ex.start_seq) &&
@@ -1538,65 +1580,111 @@ export class UnifiedStore {
                     ex.created_at === b.createdAt &&
                     ex.covered_hash === b.coveredHash &&
                     ex.payload_json === b.payloadJson) {
-                    continue;
-                }
-                const summaryHash = this.putContent(b.summary, b.summaryHash);
-                const oneHash = b.one === null ? null : this.putContent(b.one, b.oneHash ?? undefined);
-                // Re-ingest of the same block id replaces the row (dry-run
-                // idempotence). Refcount math must distinguish identical
-                // re-ingest (bump then undo) from a true replacement (release
-                // the old hash, keep the new bump) — otherwise identical
-                // re-ingest drives the surviving refcount to zero.
-                // #4242: redirect the row BEFORE the undo/release so a
-                // released-to-zero old hash is no longer FK-referenced by
-                // this blocks row when the content DELETE fires. The
-                // identical-re-ingest undo (same hash) is a pure -1
-                // against the +1 bump and cannot reach zero while the row
-                // itself holds the reference.
-                // Re-saves bind the TRANSCRIPT-resolved bounds, never the
-                // plan-local b.startSeq/endSeq: those are positions in THIS
-                // plan's log, and once a covered id's old generation is
-                // tombstoned (an in-place edit lands the new one past
-                // max(seq)) they no longer coincide with absolute seqs —
-                // writing them would clobber the durable interval with
-                // plan-relative numbers.
-                blocksUpsert.run(
-                    b.blockId,
-                    s.sessionId,
-                    b.ord,
-                    bStartSeq,
-                    bEndSeq,
-                    b.startRef,
-                    b.endRef,
-                    b.tier,
-                    summaryHash,
-                    oneHash,
-                    b.supersedesBlockId,
-                    b.active ? 1 : 0,
-                    b.createdAt,
-                    b.coveredHash,
-                    b.payloadJson,
-                );
-                if (ex) {
-                    if (ex.summary_hash === summaryHash) this.releaseContent(summaryHash);
-                    else this.releaseContent(ex.summary_hash);
-                    if (ex.one_hash !== null) {
-                        if (ex.one_hash === oneHash && oneHash !== null) this.releaseContent(oneHash);
-                        else this.releaseContent(ex.one_hash);
+                    // unchanged row
+                } else {
+                    const summaryHash = this.putContent(b.summary, b.summaryHash);
+                    const oneHash = b.one === null ? null : this.putContent(b.one, b.oneHash ?? undefined);
+                    finalSummaryHash = summaryHash;
+                    finalOneHash = oneHash;
+                    // Re-ingest of the same block id replaces the row (dry-run
+                    // idempotence). Refcount math must distinguish identical
+                    // re-ingest (bump then undo) from a true replacement (release
+                    // the old hash, keep the new bump) — otherwise identical
+                    // re-ingest drives the surviving refcount to zero.
+                    // #4242: redirect the row BEFORE the undo/release so a
+                    // released-to-zero old hash is no longer FK-referenced by
+                    // this blocks row when the content DELETE fires. The
+                    // identical-re-ingest undo (same hash) is a pure -1
+                    // against the +1 bump and cannot reach zero while the row
+                    // itself holds the reference.
+                    // Re-saves bind the TRANSCRIPT-resolved bounds, never the
+                    // plan-local b.startSeq/endSeq: those are positions in THIS
+                    // plan's log, and once a covered id's old generation is
+                    // tombstoned (an in-place edit lands the new one past
+                    // max(seq)) they no longer coincide with absolute seqs —
+                    // writing them would clobber the durable interval with
+                    // plan-relative numbers.
+                    blocksUpsert.run(
+                        b.blockId,
+                        s.sessionId,
+                        b.ord,
+                        bStartSeq,
+                        bEndSeq,
+                        b.startRef,
+                        b.endRef,
+                        b.tier,
+                        summaryHash,
+                        oneHash,
+                        b.supersedesBlockId,
+                        b.active ? 1 : 0,
+                        b.createdAt,
+                        b.coveredHash,
+                        b.payloadJson,
+                    );
+                    if (ex) {
+                        if (ex.summary_hash === summaryHash) this.releaseContent(summaryHash);
+                        else this.releaseContent(ex.summary_hash);
+                        if (ex.one_hash !== null) {
+                            if (ex.one_hash === oneHash && oneHash !== null) this.releaseContent(oneHash);
+                            else this.releaseContent(ex.one_hash);
+                        }
                     }
                 }
+                if (canCacheBlocks) {
+                    if (finalSummaryHash === undefined || effStartSeq < 0 || effEndSeq < 0) {
+                        canCacheBlocks = false;
+                    } else {
+                        nextBlockEntries.push({
+                            blockId: b.blockId,
+                            ord: b.ord,
+                            startSeq: effStartSeq,
+                            endSeq: effEndSeq,
+                            startRef: b.startRef ?? null,
+                            endRef: b.endRef ?? null,
+                            tier: b.tier,
+                            summaryHash: finalSummaryHash,
+                            oneHash: finalOneHash,
+                            supersedesBlockId: b.supersedesBlockId ?? null,
+                            active: b.active,
+                            createdAt: b.createdAt,
+                            coveredHash: b.coveredHash,
+                            payloadJson: b.payloadJson,
+                        });
+                        if (b.ord > nextMaxOrd) nextMaxOrd = b.ord;
+                        if (b.active) nextActiveSum += 1;
+                        if (b.createdAt > nextMaxCreatedAt) nextMaxCreatedAt = b.createdAt;
+                        const covIds = b.coveredIds ?? coverageByBlock.get(b);
+                        if (covIds) {
+                            for (const id of covIds) nextCoveredIds.add(id);
+                        } else {
+                            canCacheBlocks = false;
+                        }
+                    }
+                }
+            }
+            if (canCacheBlocks) {
+                blockCacheUpdate = {
+                    entries: nextBlockEntries,
+                    coveredIds: nextCoveredIds,
+                    count: nextBlockEntries.length,
+                    maxOrd: nextMaxOrd,
+                    activeSum: nextActiveSum,
+                    maxCreatedAt: nextMaxCreatedAt,
+                };
+            }
             }
 
             // dead_refs: tombstones can be LIFTED (backing message
             // reappears) — the array is authoritative, so rows at ords the
             // incoming set no longer covers are stale and must go.
             this.db.prepare("DELETE FROM dead_refs WHERE session_id = ? AND ord >= ?").run(s.sessionId, input.deadRefs.length);
-            for (const d of input.deadRefs) {
-                this.db
-                    .prepare(
-                        "INSERT INTO dead_refs (session_id, ord, ref, ref_num, recorded_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(session_id, ord) DO UPDATE SET ref = excluded.ref, ref_num = excluded.ref_num, recorded_at = excluded.recorded_at",
-                    )
-                    .run(s.sessionId, d.ord, d.ref, d.refNum, d.recordedAt);
+            if (input.deadRefs.length > 0) {
+                const upsertDeadRef = this.db.prepare(
+                    "INSERT INTO dead_refs (session_id, ord, ref, ref_num, recorded_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(session_id, ord) DO UPDATE SET ref = excluded.ref, ref_num = excluded.ref_num, recorded_at = excluded.recorded_at",
+                );
+                for (const d of input.deadRefs) {
+                    upsertDeadRef.run(s.sessionId, d.ord, d.ref, d.refNum, d.recordedAt);
+                }
             }
 
             // refs: the incoming array is AUTHORITATIVE — native compaction
@@ -1709,9 +1797,52 @@ export class UnifiedStore {
         });
         if (ok) {
             this.updateCommittedRefPrefix(s.sessionId, refCacheUpdate);
+            if (blockCacheUpdate === "clear") this.committedBlockSnapshots.delete(s.sessionId);
+            else if (blockCacheUpdate !== "keep") this.committedBlockSnapshots.set(s.sessionId, blockCacheUpdate);
             this.maybeCheckpointWal();
         }
         return ok;
+    }
+
+    private blocksUnchangedOnDelta(sessionId: string, blocks: readonly BlockRow[], deltaMessages: readonly MessageRow[]): boolean {
+        const cached = this.committedBlockSnapshots.get(sessionId);
+        if (cached === undefined || cached.entries.length !== blocks.length) return false;
+        for (const m of deltaMessages) {
+            if (cached.coveredIds.has(m.msgId)) return false;
+        }
+        for (let i = 0; i < blocks.length; i++) {
+            const b = blocks[i]!;
+            const c = cached.entries[i]!;
+            if (
+                c.blockId !== b.blockId ||
+                c.ord !== b.ord ||
+                c.startSeq < 0 ||
+                c.endSeq < 0 ||
+                c.startRef !== (b.startRef ?? null) ||
+                c.endRef !== (b.endRef ?? null) ||
+                c.tier !== b.tier ||
+                c.summaryHash !== b.summaryHash ||
+                c.oneHash !== (b.oneHash ?? null) ||
+                c.supersedesBlockId !== (b.supersedesBlockId ?? null) ||
+                c.active !== b.active ||
+                c.createdAt !== b.createdAt ||
+                c.coveredHash !== b.coveredHash ||
+                c.payloadJson !== b.payloadJson
+            ) {
+                return false;
+            }
+        }
+        const summary = this.db
+            .prepare(
+                "SELECT COUNT(*) AS n, COALESCE(MAX(ord), -1) AS max_ord, COALESCE(SUM(active), 0) AS active_sum, COALESCE(MAX(created_at), -1) AS max_created FROM blocks WHERE session_id = ?",
+            )
+            .get(sessionId) as { n: number; max_ord: number; active_sum: number; max_created: number };
+        return (
+            summary.n === cached.count &&
+            summary.max_ord === cached.maxOrd &&
+            summary.active_sum === cached.activeSum &&
+            summary.max_created === cached.maxCreatedAt
+        );
     }
 
     private updateCommittedRefPrefix(
@@ -2151,6 +2282,7 @@ export class UnifiedStore {
      *  against a stale watermark and the divergence would be permanent. */
     clearIngestWatermark(sessionId: string): void {
         this.committedRefPrefixes.delete(sessionId);
+        this.committedBlockSnapshots.delete(sessionId);
         this.db.prepare("UPDATE sessions SET last_ingested_seq = NULL WHERE session_id = ?").run(sessionId);
     }
 
@@ -2169,6 +2301,7 @@ export class UnifiedStore {
      *  Cost: one full ingest per saved session per boot. */
     resetAllIngestWatermarks(): void {
         this.committedRefPrefixes.clear();
+        this.committedBlockSnapshots.clear();
         this.db.prepare("UPDATE sessions SET last_ingested_seq = NULL").run();
     }
 
@@ -2408,6 +2541,7 @@ export class UnifiedStore {
             this.db.prepare("DELETE FROM dead_refs WHERE session_id = ?").run(sessionId);
             this.db.prepare("DELETE FROM refs WHERE session_id = ?").run(sessionId);
             this.committedRefPrefixes.delete(sessionId);
+            this.committedBlockSnapshots.delete(sessionId);
             this.db.prepare("DELETE FROM ccr_entries WHERE session_id = ?").run(sessionId);
             this.db.prepare("DELETE FROM conversations WHERE session_id = ?").run(sessionId);
             this.db.prepare("DELETE FROM session_ext WHERE session_id = ?").run(sessionId);
@@ -2645,6 +2779,7 @@ export class UnifiedStore {
             this.db.prepare("DELETE FROM dead_refs WHERE session_id = ?").run(sessionId);
             this.db.prepare("DELETE FROM refs WHERE session_id = ?").run(sessionId);
             this.committedRefPrefixes.delete(sessionId);
+            this.committedBlockSnapshots.delete(sessionId);
             this.db.prepare("DELETE FROM ccr_entries WHERE session_id = ?").run(sessionId);
             this.db.prepare("DELETE FROM session_ext WHERE session_id = ?").run(sessionId);
             this.db.prepare("UPDATE sessions SET status = 'archived' WHERE session_id = ?").run(sessionId);
@@ -2757,6 +2892,7 @@ export class UnifiedStore {
             const insRef = this.db.prepare("INSERT INTO refs (session_id, ord, raw_id, ref, ref_num) VALUES (?, ?, ?, ?, ?)");
             for (const r of dump.refs) insRef.run(sessionId, r.ord, r.raw_id, r.ref, r.ref_num ?? null);
             this.committedRefPrefixes.delete(sessionId);
+            this.committedBlockSnapshots.delete(sessionId);
             const insDead = this.db.prepare("INSERT INTO dead_refs (session_id, ord, ref, ref_num, recorded_at) VALUES (?, ?, ?, ?, ?)");
             for (const d of dump.deadRefs) insDead.run(sessionId, d.ord, d.ref, d.ref_num, d.recorded_at);
             const insCcr = this.db.prepare("INSERT INTO ccr_entries (session_id, ord, ccr_key, content_hash) VALUES (?, ?, ?, ?)");

@@ -186,3 +186,30 @@ test("missing and retired tail rows remain visible as drift", (t) => {
         assert.equal(store.ingestWatermark(view.id), null);
     }
 });
+
+test("asyncVerify slices verification off the record() tick for large sessions and aborts cleanly on superseding saves", async (t) => {
+    const { shadow, view } = fixture(t);
+    const largeMessages = Array.from({ length: 320 }, (_, i) => message(i));
+    const largeView: LegacySessionLike = { ...view, lastMessages: largeMessages, pluginSnapshot: undefined };
+
+    shadow.record(largeView, undefined, undefined, { asyncVerify: true });
+    assert.equal(shadow.stats.verifySamples, 0, "large asyncVerify must not block synchronously inside record()");
+
+    // A superseding deferVerify save (next turn's pre-forward durability ingest)
+    // aborts the in-flight background verify and keeps verification pending.
+    const nextView: LegacySessionLike = { ...largeView, lastMessages: [...largeMessages, message(320)] };
+    shadow.record(nextView, undefined, undefined, { deferVerify: true });
+    await new Promise((r) => setTimeout(r, 40));
+    assert.equal(shadow.stats.verifySamples, 0, "aborted asyncVerify must not complete stale work after a superseding deferVerify save");
+
+    // The subsequent non-deferred asyncVerify save runs to completion across ticks.
+    const finalView: LegacySessionLike = { ...nextView, lastMessages: [...nextView.lastMessages!, message(321)] };
+    shadow.record(finalView, undefined, undefined, { asyncVerify: true });
+    const deadline = Date.now() + 2000;
+    while (shadow.stats.verifySamples < 1 && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 10));
+    }
+    assert.equal(shadow.stats.verifySamples, 1, "background sliced verify completes across ticks");
+    assert.equal(shadow.stats.verifyOk, 1, shadow.stats.lastError ?? "asyncVerify must pass cleanly");
+    assert.equal(shadow.stats.verifyDrift, 0);
+});

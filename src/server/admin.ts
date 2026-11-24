@@ -527,7 +527,12 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
         return handlePluginManifest(res, applyCompressSettings(config, opts.modelContextLimit, opts.compress, { ...agentProviderRecipes(), ...opts.namedProviders ?? {} }), packSurface.surface.toolPrompts);
     }
     if (req.method === "GET" && req.url?.split("?")[0] === "/__bili/plugin/snapshot") {
-        return await handlePluginSnapshot(new URL(req.url, "http://localhost").searchParams.get("conversationId") ?? "", res);
+        const snapUrl = new URL(req.url, "http://localhost");
+        return await handlePluginSnapshot(
+            snapUrl.searchParams.get("conversationId") ?? "",
+            res,
+            snapUrl.searchParams.get("childConversationId") ?? undefined,
+        );
     }
     if (req.method === "POST" && req.url === "/__bili/plugin/fork") {
         try {

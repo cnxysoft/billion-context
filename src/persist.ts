@@ -3115,7 +3115,7 @@ export class SessionStore {
                 this.shadow?.record(payload !== undefined ? { ...record, decompositionLog: payload } : record,
                     tail && tail.length > 0
                         ? { lastMessages: tail, lastMessagesFolded: session.lastMessagesFolded }
-                        : undefined, session.contentStore ?? undefined);
+                        : undefined, session.contentStore ?? undefined, { asyncVerify: true });
                 this.noteOwnCommit(session.id, record);
                 return record;
             }
@@ -3135,7 +3135,7 @@ export class SessionStore {
             // to the live session so serving converges on the same newest-wins
             // arbitration the write side just used.
             this.convergeToDisk(session, disk);
-            this.shadow?.record(disk);
+            this.shadow?.record(disk, undefined, undefined, { asyncVerify: true });
             // Rewrite the disk's own payload: content-identical no-op that
             // preserves the newer state while satisfying the write chain.
             this.noteOwnCommit(session.id, disk);
@@ -4123,6 +4123,22 @@ export class SessionStore {
         await this.ready();
         this.cancelAll();
         await this.shadow?.closeAsync();
+    }
+
+    /** O(1) probe: does the unified store already hold recorded model traffic
+     *  for `id` (requests > 0)? Used by handlePluginSnapshot to reject stale
+     *  post-restart fork-adoption probes for an already-live child WITHOUT
+     *  cold-loading the parent session (or the child). Returns false when the
+     *  unified store is unavailable or the session has 0 requests (so fresh
+     *  fork receipts remain replayable). */
+    async hasPersistedTrafficAsync(id: string): Promise<boolean> {
+        if (!this.enabled || !this.shadow) return false;
+        try {
+            const counters = await this.shadow.sessionCountersAsync(id);
+            return counters !== null && counters.requests > 0;
+        } catch {
+            return false;
+        }
     }
 
     /** Whether a write is currently pending (debounce timer armed) for a id. */
