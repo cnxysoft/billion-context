@@ -8,6 +8,11 @@ type PartBoundMessage = CoreMessage & {
     [responsesPartBinding]?: { source: ResponseInputItem; part: ResponseContentPart; sourceId: string };
 };
 
+export function remapResponsesPartBindingSourceId(message: BiliMessage, newId: string): void {
+    const binding = (message as PartBoundMessage)[responsesPartBinding];
+    if (binding) binding.sourceId = newId;
+}
+
 export function responsesToolImageParts(item: unknown): ResponseContentPart[] | undefined {
     if (typeof item !== "object" || item === null) return undefined;
     const raw = item as Record<string, unknown>;

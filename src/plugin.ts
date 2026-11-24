@@ -568,17 +568,29 @@ interface PluginWireMetadata {
 
 /** Capture the raw request's snapshot evidence before prepare mutates its
  *  parsed view. Only these scalars need to survive forwarding. */
-export function preparePluginWireMetadata(rawWire: Buffer, parsedWire: unknown): PluginWireMetadata {
+export function preparePluginWireMetadata(rawWire: Buffer, parsedWire: unknown, overrideTextComparable?: boolean): PluginWireMetadata {
     let textComparable = false;
-    try {
-        if (parsedWire !== null && typeof parsedWire === "object") {
-            const wire = parsedWire as Record<string, unknown>;
-            textComparable = comparableHistory(wire.messages ?? wire.input ?? wire.contents);
+    if (overrideTextComparable !== undefined) {
+        textComparable = overrideTextComparable;
+    } else {
+        try {
+            if (parsedWire !== null && typeof parsedWire === "object") {
+                const wire = parsedWire as Record<string, unknown>;
+                textComparable = comparableHistory(wire.messages ?? wire.input ?? wire.contents);
+            }
+        } catch {
+            textComparable = false;
         }
-    } catch {
-        textComparable = false;
     }
     return { wireHash: createHash("sha256").update(rawWire).digest("hex"), textComparable };
+}
+
+export function isComparableWireHistory(value: unknown): boolean {
+    try {
+        return comparableHistory(value);
+    } catch {
+        return false;
+    }
 }
 
 /** Keep the last prepare()'s view for a plugin session so tool-API execution

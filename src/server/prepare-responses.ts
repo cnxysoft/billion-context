@@ -1,7 +1,7 @@
 import http from "node:http";
 import type { AbsorbConfig, CompressionCore, Config, CoreMessage, NudgeDecision, PackSurface, Prompts } from "acp-kernel";
 import { defaultCountTokens, buildBlockOpsSystemPrompt, renderNudgeText, viableRanges } from "acp-kernel";
-import { collectIncomingImageCandidates, type IncomingImageCandidate } from "../image-restore.js";
+import { bodyMightCarryImages, collectIncomingImageCandidates, type IncomingImageCandidate } from "../image-restore.js";
 import { recordNudgeInject } from "../cache-ledger.js";
 import { injectResponsesDeveloperMessage, type BiliMessage, type ResponseInputItem, type ResponsesProjection, type ResponsesRequestBody } from "acp-kernel/wire";
 import type { CompressReasoningConfig } from "../reasoning-drop.js";
@@ -44,14 +44,14 @@ import { reconcileSystemAnchor } from "../system-anchor.js";
 import { buildPromptForgeBody, buildTriggerForgeBody, carriesCodexLocalCompactionSummary, codexCompactGate, codexCompactGatePre, codexCompactMode, hasCompactionPrompt, hasCompactionTrigger, isCodexClient, isCodexHost, mergeForgedSummaries, nativeCompactionKey, replaceBiliCompactionItems, stripBiliCompactionItems, CODEX_COMPACT_HEALTH_RATIO, CODEX_LOCAL_COMPACTION_MIN_MISSING } from "../codex-compact.js";
 import type { ConversationIdentity } from "../session-id.js";
 import { pckKeyAbated } from "../pck-probe.js";
-import { reconcilePluginFoldCallIds } from "../plugin.js";
-import { logRawStripCounts, markerArtifactCount, stripRawStage } from "../marker/engine.js";
+import { isComparableWireHistory, pluginAgentHeader, reconcilePluginFoldCallIds } from "../plugin.js";
+import { logRawStripCounts, markerArtifactCount, stripRawStage, type RawStripCounts } from "../marker/engine.js";
 import { imageRescaleMaxDim, keepResponseId as knobKeepResponseId, noCompressPrompt as knobNoCompressPrompt, noInjectTool as knobNoInjectTool, renderNone as knobRenderNone } from "../knobs.js";
 import { applyImageRescaleItems } from "../image-rescale.js";
 import { clampOutgoingOutput, countLoadedToolTokens, countSystemAndToolsTokens, dshLedgerFloorTokens, emergencyNudge, emergencyNudgeArmed, modelVisibleTools } from "./budget.js";
 import { FORCE_TEXT_PROTOCOL, injectResponsesTool, injectTool } from "./inject.js";
 import { nudgeOn, resolveLaneDecisions, surfaceOffDetail } from "./lane-decisions.js";
-import { pluginAgentHeader } from "../plugin.js";
+import { addRawStripCounts, buildIncrementalResponsesProjection, commitIncrementalResponsesPrefixEntry, evictResponsesPrefixEntry, seedResponsesPrefixCache, type ResponsesPrefixFastpathHit, type ResponsesPrefixSeedContext } from "./responses-prefix-cache.js";
 
 const ACTIVE_HINTS_TTL_MS = 1_800_000;
 let activeResponsesHints: {
@@ -89,9 +89,13 @@ export async function prepareResponses(
     decide?: DecideConfig,
     onIncomingImages?: (images: IncomingImageCandidate[]) => void,
     deferDurabilityIngest?: boolean,
+    prefixCache?: { hit?: ResponsesPrefixFastpathHit; seed?: ResponsesPrefixSeedContext },
 ): Promise<Prepared> {
     const sessionId = session.id;
-    const inboundMessageCount = Array.isArray(parsed.input) ? parsed.input.length : 1;
+    const fastpathHit = prefixCache?.hit;
+    const inboundMessageCount = fastpathHit !== undefined
+        ? fastpathHit.entry.prefixRawWireCount + fastpathHit.tailItems.length
+        : (Array.isArray(parsed.input) ? parsed.input.length : 1);
     const stream = parsed.stream === true;
     ++session.stats.requests;
     // #3222: #651's reasoning-drop plan, computed on the INBOUND history before
@@ -113,16 +117,59 @@ export async function prepareResponses(
     // codex's own user-message rule) instead of a foreign opaque blob. Real
     // OpenAI blobs carry no bili marker and pass through untouched.
     let echoReplaced = false;
-    if (Array.isArray(parsed.input)) {
-        const { items, replaced, dropped } = replaceBiliCompactionItems(parsed.input);
+    let compactionDropped = 0;
+    let tailPostStrip: ResponseInputItem[] | undefined;
+    let tailMarkerCarriers = 0;
+    let typedItems = 0;
+    let droppedEmpty = 0;
+    let markerCounts: RawStripCounts;
+
+    if (fastpathHit !== undefined && Array.isArray(parsed.input)) {
+        // Byte-exact prefix fastpath: the verified prefix is ALREADY normalized,
+        // id-sanitized, whitespace-pruned, and raw-stripped. Run those passes
+        // ONLY on the appended tail items (O(tail) instead of O(history)).
+        const rawTail = fastpathHit.tailItems.slice();
+        const { items: tailAfterCompact, replaced, dropped } = replaceBiliCompactionItems(rawTail);
+        compactionDropped = dropped;
         if (replaced + dropped > 0) {
-            // Only a real replacement carries a summary into the history; a
-            // drop-only echo removed a marker blob without inserting one, so the
-            // forge-time captured summaries must still be re-injected (#1064).
             if (replaced > 0) echoReplaced = true;
             log("info", `[${sessionId}] replaced ${replaced} echoed bili compaction item(s) with summary handoff message(s)${dropped > 0 ? `, dropped ${dropped} legacy marker item(s)` : ""}`);
-            parsed.input = items as typeof parsed.input;
         }
+        const tailWork = replaced + dropped > 0 ? tailAfterCompact : rawTail;
+        const tailTyped = normalizeResponsesMessageItems(tailWork);
+        sanitizeResponsesInputIds(tailWork);
+        const tailDropped = dropWhitespaceResponsesMessages(tailWork);
+        const tailMarkers = stripRawStage({ input: tailWork }, "responses");
+        tailMarkerCarriers = tailMarkers.carriers;
+
+        typedItems = fastpathHit.entry.prefixTypedItems + tailTyped;
+        droppedEmpty = fastpathHit.entry.prefixDroppedEmpty + tailDropped;
+        markerCounts = addRawStripCounts(fastpathHit.entry.prefixMarkerCounts, tailMarkers);
+        tailPostStrip = tailWork as ResponseInputItem[];
+        parsed.input = fastpathHit.entry.prefixPostStripInput.concat(tailPostStrip);
+    } else {
+        if (Array.isArray(parsed.input)) {
+            const { items, replaced, dropped } = replaceBiliCompactionItems(parsed.input);
+            compactionDropped = dropped;
+            if (replaced + dropped > 0) {
+                // Only a real replacement carries a summary into the history; a
+                // drop-only echo removed a marker blob without inserting one, so the
+                // forge-time captured summaries must still be re-injected (#1064).
+                if (replaced > 0) echoReplaced = true;
+                log("info", `[${sessionId}] replaced ${replaced} echoed bili compaction item(s) with summary handoff message(s)${dropped > 0 ? `, dropped ${dropped} legacy marker item(s)` : ""}`);
+                parsed.input = items as typeof parsed.input;
+            }
+        }
+        // #242: over-long input item ids (poisoned rollouts) 400 upstream on every
+        // request; rewrite them to short deterministic ids before anything reads
+        // or replays the input.
+        // omp-style type-less user items must be typed before the projection
+        // drops them (see normalizeResponsesMessageItems) — before id sanitize and
+        // whitespace drop so those see the canonical form.
+        typedItems = normalizeResponsesMessageItems(parsed.input);
+        sanitizeResponsesInputIds(parsed.input);
+        droppedEmpty = dropWhitespaceResponsesMessages(parsed.input);
+        markerCounts = stripRawStage(parsed, "responses");
     }
 
     let processedMessages: CoreMessage[] = [];
@@ -146,24 +193,12 @@ export async function prepareResponses(
     // projection.systemParts, so every projection-built estimator must add them
     // back explicitly (same extraction + chars/4 method as estimateWireOverhead).
 
-    // #242: over-long input item ids (poisoned rollouts) 400 upstream on every
-    // request; rewrite them to short deterministic ids before anything reads
-    // or replays the input.
-    // omp-style type-less user items must be typed before the projection
-    // drops them (see normalizeResponsesMessageItems) — before id sanitize and
-    // whitespace drop so those see the canonical form.
-    const typedItems = normalizeResponsesMessageItems(parsed.input);
     if (typedItems > 0) {
         log("info", `[${sessionId}] stamped type:"message" on ${typedItems} type-less input item(s) before projection (omp wire form)`);
     }
-    sanitizeResponsesInputIds(parsed.input);
-
-    const droppedEmpty = dropWhitespaceResponsesMessages(parsed.input);
     if (droppedEmpty > 0) {
         log("info", `[${sessionId}] dropped ${droppedEmpty} whitespace-only message item(s) before projection (flattened-turn artifact)`);
     }
-
-    const markerCounts = stripRawStage(parsed, "responses");
     logRawStripCounts(markerCounts, log, sessionId);
 
     const shouldInject = opts.compress.injectTool;
@@ -220,7 +255,6 @@ export async function prepareResponses(
         // what the host SENT; the ledger pairs it with the forwarded-projection
         // fingerprint so a self-heal mode switch stops masquerading as a host
         // rewrite (#2867).
-        const canonicalSysDev = canonicalResponsesSystem(parsed);
         const curMode: "plugin" | "proxy" = pluginMode ? "plugin" : "proxy";
         const prevMode = session.metadata[METADATA_LAST_RESPONSES_MODE] as "plugin" | "proxy" | undefined;
         session.metadata[METADATA_LAST_RESPONSES_MODE] = curMode;
@@ -238,10 +272,62 @@ export async function prepareResponses(
         // fold coverage, and byte-stable verbatim re-emission) for EVERY
         // client, not just plugin/codex; the head prefix still hoists into
         // systemParts for strict single-system upstreams (#377).
-        const prevHints = activeResponsesHints?.sessionId === sessionId ? activeResponsesHints.hints : undefined;
-        const nextHints: (CanonicalBaseHint | undefined)[] = [];
-        const projection = responsesToCore(parsed, { prevHints, nextHints });
-        if (nextHints.length > 0) setActiveResponsesHints(sessionId, nextHints);
+        let canonicalSysDev: Array<{ role: string; text: string }>;
+        let projection: ResponsesProjection;
+        const inc = fastpathHit !== undefined && tailPostStrip !== undefined
+            ? buildIncrementalResponsesProjection(fastpathHit.entry, parsed, tailPostStrip)
+            : null;
+        if (inc !== null && fastpathHit !== undefined) {
+            projection = inc.projection;
+            canonicalSysDev = [
+                ...(typeof parsed.instructions === "string" && parsed.instructions.trim()
+                    ? [{ role: "instructions", text: parsed.instructions }]
+                    : []),
+                ...fastpathHit.entry.prefixCanonicalSysDev,
+                ...inc.tailCanonicalSysDev,
+            ];
+            log("info", `[${sessionId}] [responses-prefix-cache] HIT prefix=${fastpathHit.entry.prefixRawWireCount} tail=${fastpathHit.tailItems.length} sha256=${fastpathHit.sha256Ms}ms parse=${fastpathHit.parseMs}ms proj=${inc.projMs}ms`);
+            if (Array.isArray(parsed.input) && !echoReplaced && compactionDropped === 0 && tailMarkerCarriers === 0 && !isCompactionTrigger && compactForm === undefined) {
+                commitIncrementalResponsesPrefixEntry({
+                    sessionId,
+                    hit: fastpathHit,
+                    nextPostStripInput: parsed.input,
+                    nextProjection: projection,
+                    tailMsgs: inc.tailMsgs,
+                    tailToolNames: inc.tailToolNames,
+                    tailCanonicalSysDev: inc.tailCanonicalSysDev,
+                    nextTypedItems: typedItems,
+                    nextDroppedEmpty: droppedEmpty,
+                    nextMarkerCounts: markerCounts,
+                    nextRawTextComparable: fastpathHit.entry.prefixRawTextComparable && isComparableWireHistory(fastpathHit.tailItems),
+                    nextMayCarryImages: fastpathHit.entry.prefixMayCarryImages || bodyMightCarryImages(fastpathHit.tailJsonText, "responses"),
+                });
+            }
+        } else {
+            if (fastpathHit !== undefined) {
+                evictResponsesPrefixEntry(fastpathHit.entry.sessionId);
+            }
+            canonicalSysDev = canonicalResponsesSystem(parsed);
+            const prevHints = activeResponsesHints?.sessionId === sessionId ? activeResponsesHints.hints : undefined;
+            const nextHints: (CanonicalBaseHint | undefined)[] = [];
+            projection = responsesToCore(parsed, { prevHints, nextHints });
+            if (nextHints.length > 0) setActiveResponsesHints(sessionId, nextHints);
+            if (prefixCache?.seed !== undefined && Array.isArray(parsed.input) && !echoReplaced && compactionDropped === 0 && markerCounts.carriers === 0 && !isCompactionTrigger && compactForm === undefined) {
+                const seeded = seedResponsesPrefixCache({
+                    sessionId,
+                    seed: prefixCache.seed,
+                    parsed,
+                    postStripInput: parsed.input,
+                    projection,
+                    typedItems,
+                    droppedEmpty,
+                    markerCounts,
+                });
+                if (seeded.seeded) {
+                    log("info", `[${sessionId}] [responses-prefix-cache] SEED items=${prefixCache.seed.rawWireCount} bytes=${seeded.bytes} took=${seeded.tookMs}ms`);
+                }
+            }
+        }
         if (onIncomingImages) incomingImages = collectIncomingImageCandidates(projection.msgs);
         if (checkpoint && checkpoint !== session.metadata.codexNativeCompactionKey) {
             const covered = coveredRealHistoryIds(session.state.blocks);

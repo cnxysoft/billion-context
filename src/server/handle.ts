@@ -57,7 +57,7 @@ import { executeThreadsReforge, threadsBetaToDecline } from "./threads-lane.js";
 import { resetThreadTailTracking } from "./thread-tracking.js";
 import { resolveClaudeTranscriptLineage } from "../claude-transcript-lineage.js";
 import { opencodeForkParent } from "../opencode-fork-lineage.js";
-import { consumePluginRegisterFor, PLUGIN_PURPOSE_CONVERSATION, pluginAgentHeader, pluginCompressionProxyHeader, pluginConversationHeader, pluginHeadersMatchModel, pluginPurposeHeader, pluginReportedContextWindow, pluginReportedMaxOutput, pluginReportedModel, pluginRequestAgentHeader, pluginRuntimeInfoFor, pluginRuntimeInfoForConversation, preparePluginWireMetadata, publicForkInputCheck, recordChainVerdict, recordPluginSession, rememberPluginMessages, resolveConversation, runtimeConversationId, takePendingPluginRegister } from "../plugin.js";
+import { consumePluginRegisterFor, isComparableWireHistory, PLUGIN_PURPOSE_CONVERSATION, pluginAgentHeader, pluginCompressionProxyHeader, pluginConversationHeader, pluginHeadersMatchModel, pluginPurposeHeader, pluginReportedContextWindow, pluginReportedMaxOutput, pluginReportedModel, pluginRequestAgentHeader, pluginRuntimeInfoFor, pluginRuntimeInfoForConversation, preparePluginWireMetadata, publicForkInputCheck, recordChainVerdict, recordPluginSession, rememberPluginMessages, resolveConversation, runtimeConversationId, takePendingPluginRegister } from "../plugin.js";
 import { scheduleAffinityPersist } from "../affinity-persist.js";
 import { evaluateChain, extractChainCarriers } from "../chain-checkpoint.js";
 import { BILI_PASSTHROUGH_HEADER, BILI_PLUGIN_BYPASS_HEADER, isLoopbackAddress, normalizeUpstreamOrigin, provenCompletionReserve, reserveOutputHeadroom, resolveOutputHeadroomCap, shouldReserveOutputHeadroom, type WireProtocol } from "../util.js";
@@ -85,6 +85,7 @@ import { prepareOpenai } from "./prepare-openai.js";
 import { prepareGoogle, prepareGoogleCountTokens } from "./prepare-google.js";
 import { DUMP_PLAINTEXT_BANNER } from "../dump-banner.js";
 import { prepareResponses, prepareResponsesCompact } from "./prepare-responses.js";
+import { isResponsesPrefixCacheEnabled, tryMatchResponsesPrefix, type ResponsesPrefixFastpathHit, type ResponsesPrefixSeedContext } from "./responses-prefix-cache.js";
 import { bodyDumpEnabled, isModelDiscoveryPath, isV1InternalControlPlanePath, logDumpFailure, logUnrecognizedPath } from "./observability.js";
 import { yieldToEventLoop } from "../yield-loop.js";
 import { adminGateDenial, handleAdminRoute, isManagementPath } from "./admin.js";
@@ -695,9 +696,25 @@ async function handleRequest(
     // windows behind different relays), then the built-in table. Falls back to
     // the global env default if neither matches.
     // Parse body once and reuse everywhere (fixes duplicate JSON.parse).
+    // Byte-exact Responses prefix fastpath: on full-resend warm turns, verify
+    // the cached input[] prefix bytes with SHA-256 and parse ONLY the tiny
+    // envelope + appended tail items, skipping 48 MiB UTF-8 decode + JSON.parse.
     let parsed: unknown = null;
     let bodyText: string | undefined;
-    if (protocol && bodyBuffer.length > 0) {
+    let responsesFastpathHit: ResponsesPrefixFastpathHit | undefined;
+    let responsesFastpathRawTextComparable: boolean | undefined;
+    if (protocol === "responses" && !responsesCompact && !countTokens && bodyBuffer.length > 0 && isResponsesPrefixCacheEnabled()) {
+        const hit = tryMatchResponsesPrefix(bodyBuffer, pluginConversationHeader(req.headers));
+        if (hit !== null) {
+            responsesFastpathHit = hit;
+            responsesFastpathRawTextComparable = hit.entry.prefixRawTextComparable && isComparableWireHistory(hit.tailItems);
+            parsed = {
+                ...hit.envelope,
+                input: hit.entry.prefixPostStripInput.concat(hit.tailItems as import("acp-kernel/wire").ResponseInputItem[]),
+            };
+        }
+    }
+    if (responsesFastpathHit === undefined && protocol && bodyBuffer.length > 0) {
         bodyText = bodyBuffer.toString("utf8");
         try {
             parsed = JSON.parse(bodyText);
@@ -707,7 +724,7 @@ async function handleRequest(
     }
     // Capture the raw-wire verdict before unwrapping or preparing can mutate
     // parsed. Only these scalars are needed for the post-forward bookkeeping.
-    const rawWireMetadata = protocol ? preparePluginWireMetadata(bodyBuffer, parsed) : undefined;
+    const rawWireMetadata = protocol ? preparePluginWireMetadata(bodyBuffer, parsed, responsesFastpathRawTextComparable) : undefined;
     // Only Claude Code answers the decline by dropping threads. It defers MCP tools behind tool
     // search, so its bili MCP registration (keyed by its session id) counts when the tools are off the wire.
     const ccSessionId = req.headers["x-claude-code-session-id"];
@@ -772,7 +789,11 @@ async function handleRequest(
     //  (#1995/#2607) can find anything — a provably image-free body skips BOTH
     //  index builds (each one re-converts the full history wire→core). The
     //  predicate over-approximates by design; see bodyMightCarryImages.
-    const bodyMayCarryImages = protocol !== null && bodyText !== undefined ? bodyMightCarryImages(bodyText, protocol) : false;
+    const bodyMayCarryImages = responsesFastpathHit !== undefined
+        ? (responsesFastpathHit.entry.prefixMayCarryImages
+            || bodyMightCarryImages(responsesFastpathHit.tailJsonText, "responses")
+            || bodyMightCarryImages(responsesFastpathHit.envelopeJsonText, "responses"))
+        : (protocol !== null && bodyText !== undefined ? bodyMightCarryImages(bodyText, protocol) : false);
     // #5403/#5418: the plugin full-resend watermark fastpath (prepare-openai) needs
     // the raw body text. #4753 released it unconditionally, which silently disabled
     // the fastpath (its bodyText !== undefined gate could never fire). Keep the text
@@ -782,12 +803,24 @@ async function handleRequest(
     // #903: inbound message count for the per-request cost line — messages
     // (anthropic/openai) or input (responses); null when the body has neither.
     const inboundMsgs: number | null = (() => {
+        if (responsesFastpathHit !== undefined) {
+            return responsesFastpathHit.entry.prefixRawWireCount + responsesFastpathHit.tailItems.length;
+        }
         if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
         const p = parsed as Record<string, unknown>;
         if (Array.isArray(p.messages)) return p.messages.length;
         if (Array.isArray(p.input)) return p.input.length;
         return null;
     })();
+    let responsesSeedCtx: ResponsesPrefixSeedContext | undefined =
+        protocol === "responses" && !responsesCompact && !countTokens && responsesFastpathHit === undefined && bodyBuffer.length > 0 && isResponsesPrefixCacheEnabled() && inboundMsgs !== null && inboundMsgs > 0
+            ? {
+                bodyBuffer,
+                rawWireCount: inboundMsgs,
+                rawTextComparable: rawWireMetadata?.textComparable ?? false,
+                bodyMayCarryImages,
+            }
+            : undefined;
     // #1395 step 3 (#1421): chain-checkpoint ENFORCEMENT — first-processor-
     // wins. A verifiable checkpoint means an upstream bili already ran the
     // pipeline on this exact body: forward it verbatim (pipeline skipped)
@@ -820,6 +853,8 @@ async function handleRequest(
                             log("warn", `${head}; digest match but out-of-window/future timestamp — forwarding verbatim + warn (replay or clock skew) (#1421)`);
                         } else {
                             parsed = extractChainCarriers(parsed, protocol).stripped;
+                            responsesFastpathHit = undefined;
+                            responsesSeedCtx = undefined;
                             log("info", `${head}; no digest match — stripping stale checkpoint(s), processing normally (#1421)`);
                         }
                         break;
@@ -3279,6 +3314,10 @@ async function handleRequest(
                         // a real model (the loop's synthetic frames read it back).
                         return await prepareGoogle(work as GoogleRequestBody, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, nativeWindow, googleModel ?? v1Model, googlePathKind(urlPath) === "stream-generate", visibilityMarkers, upstreamOrigin, req, decide, respondFailFast);
                     }
+                    const fpHit = responsesFastpathHit;
+                    const fpSeed = responsesSeedCtx;
+                    responsesFastpathHit = undefined;
+                    responsesSeedCtx = undefined;
                     const preparedOut = protocol === "anthropic"
                         ? await prepareAnthropic(work as AnthropicRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, upstreamOrigin, reasoningCfg, visibilityMarkers, requestModel, decide, respondFailFast)
                         : protocol === "openai"
@@ -3292,7 +3331,7 @@ async function handleRequest(
                                 projectedIncomingImages = images;
                                 session.incomingImageIndex = refreshIncomingImageIndex(parsed, protocol, session.state, session.id, session.incomingImageIndex, images);
                                 projectedIncomingImagesIndexed = true;
-                            } : undefined, respondFailFast);
+                            } : undefined, respondFailFast, (fpHit !== undefined || fpSeed !== undefined) ? { hit: fpHit, seed: fpSeed } : undefined);
                     // The resolved model rides with the prepared request: on the
                     // Anthropic-on-Vertex wire the body carries none, and the
                     // relay's compress-loop rebuild reads it from here.
