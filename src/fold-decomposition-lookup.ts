@@ -46,8 +46,24 @@ function defaultSource(): DecompositionSource {
 }
 
 /** Wire-site convenience: build the wire-id set and run the lookup in one
- *  call (used by all four prepare-* lanes). */
+ *  call (used by all four prepare-* lanes). Pre-checks whether ANY anchor is
+ *  even eligible for legacy assistant backfill before building an O(history)
+ *  wireIds Set (avoids 38K-entry Set churn on steady-state turns). */
 export function storedMessagesFor(session: Session, sessionId: string, msgs: readonly CoreMessage[]): CoreMessage[] | undefined {
+    const metadata = session.metadata;
+    if (metadata === undefined) return undefined;
+    const anchors = metadata[METADATA_ANCHORS] as Record<string, FoldAnchor> | undefined;
+    if (anchors === undefined) return undefined;
+    const tried = (metadata[TRIED_METADATA_KEY] as Record<string, number> | undefined) ?? {};
+    let hasEligible = false;
+    for (const id in anchors) {
+        const a = anchors[id]!;
+        if (a.p === undefined && a.r === "assistant" && a.t === undefined && tried[id] === undefined) {
+            hasEligible = true;
+            break;
+        }
+    }
+    if (!hasEligible) return undefined;
     const wireIds = new Set<string>();
     for (const m of msgs) if (m.id !== undefined) wireIds.add(m.id);
     return resolveStoredDecompositions(session, sessionId, wireIds);

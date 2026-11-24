@@ -78,13 +78,6 @@ export function dropCompressReasoningIds(messages: BiliMessage[], cfg?: Compress
     if (!drop || messages.length === 0) return ids;
     try {
         const last = messages.length - 1;
-        const resultAt = new Map<string, number>();
-        for (let i = 0; i <= last; i++) {
-            const m = messages[i]!;
-            if (m.contentType === "tool-result" && typeof m.toolCallId === "string" && !resultAt.has(m.toolCallId)) {
-                resultAt.set(m.toolCallId, i);
-            }
-        }
         // Contiguous reasoning run ending at i-1 (message i is the first
         // non-reasoning after it); null when there is no such run.
         const runBefore = (i: number): number[] | null => {
@@ -101,6 +94,41 @@ export function dropCompressReasoningIds(messages: BiliMessage[], cfg?: Compress
             for (const k of idx) total += (messages[k]!.text ?? "").length;
             if (total > threshold) for (const k of idx) ids.add(messages[k]!.id);
         };
+        if (!tail) {
+            // Fast path for the default (tail=false): collect ONLY compress
+            // tool-call indices first; if none exist, avoid allocating a
+            // 19K-entry tool-result Map across the full resent history.
+            const compressIdx: number[] = [];
+            const wantedIds = new Set<string>();
+            for (let i = 0; i <= last; i++) {
+                const m = messages[i]!;
+                if (m.contentType !== "tool-call" || typeof m.toolName !== "string" || !isMcpBiliCompress(m.toolName)) continue;
+                if (typeof m.toolCallId !== "string") continue;
+                compressIdx.push(i);
+                wantedIds.add(m.toolCallId);
+            }
+            if (compressIdx.length === 0) return ids;
+            const resultAt = new Map<string, number>();
+            for (let i = 0; i <= last; i++) {
+                const m = messages[i]!;
+                if (m.contentType === "tool-result" && typeof m.toolCallId === "string" && wantedIds.has(m.toolCallId) && !resultAt.has(m.toolCallId)) {
+                    resultAt.set(m.toolCallId, i);
+                }
+            }
+            for (const i of compressIdx) {
+                const ri = resultAt.get(messages[i]!.toolCallId!);
+                if (ri === undefined || ri <= i || ri >= last) continue;
+                harvest(i);
+            }
+            return ids;
+        }
+        const resultAt = new Map<string, number>();
+        for (let i = 0; i <= last; i++) {
+            const m = messages[i]!;
+            if (m.contentType === "tool-result" && typeof m.toolCallId === "string" && !resultAt.has(m.toolCallId)) {
+                resultAt.set(m.toolCallId, i);
+            }
+        }
         for (let i = 0; i <= last; i++) {
             const m = messages[i]!;
             if (m.contentType !== "tool-call" || typeof m.toolName !== "string" || !isMcpBiliCompress(m.toolName)) continue;
@@ -112,19 +140,17 @@ export function dropCompressReasoningIds(messages: BiliMessage[], cfg?: Compress
         // A tool call closes when its result arrived with at least one
         // message after it; an assistant text turn (a run's successor is
         // always model output) closes when it is no longer the last message.
-        if (tail) {
-            for (let i = 0; i <= last; i++) {
-                const m = messages[i]!;
-                if (m.contentType === "tool-call") {
-                    const ri = typeof m.toolCallId === "string" ? resultAt.get(m.toolCallId) : undefined;
-                    if (ri === undefined || ri <= i || ri >= last) continue;
-                } else if (m.contentType === "text") {
-                    if (i >= last) continue;
-                } else {
-                    continue;
-                }
-                harvest(i);
+        for (let i = 0; i <= last; i++) {
+            const m = messages[i]!;
+            if (m.contentType === "tool-call") {
+                const ri = typeof m.toolCallId === "string" ? resultAt.get(m.toolCallId) : undefined;
+                if (ri === undefined || ri <= i || ri >= last) continue;
+            } else if (m.contentType === "text") {
+                if (i >= last) continue;
+            } else {
+                continue;
             }
+            harvest(i);
         }
     } catch {
         // fail-safe: report nothing to drop rather than corrupt the view

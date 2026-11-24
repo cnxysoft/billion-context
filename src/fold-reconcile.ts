@@ -1055,6 +1055,13 @@ export function planReconciliation(
         }
     }
     let posPrefixAligned = posLen > 0 && !posShiftAligned;
+    // `reconcileFoldCoverage` retains only the last MAX_ORDER entries of
+    // `plan.nextCanon` on clean passes (`missing.length === 0`). When a long
+    // history exceeds MAX_ORDER and posShiftAligned holds, defer hashing the
+    // dropped head (`i < minRetainedCanonIdx`) unless a drift pass actually
+    // needs Pass 0 over that prefix.
+    const minRetainedCanonIdx = Math.max(0, msgs.length - MAX_ORDER);
+    let deferredHeadCanon = false;
     for (const m of msgs) {
         if (m.id === undefined) continue;
         const i = newOrder.length;
@@ -1068,6 +1075,10 @@ export function planReconciliation(
                     continue;
                 }
                 posShiftAligned = false;
+            } else if (i < minRetainedCanonIdx) {
+                canon.push("");
+                deferredHeadCanon = true;
+                continue;
             } else {
                 canon.push(cachedPositionalFingerprint(m));
                 continue;
@@ -1107,6 +1118,14 @@ export function planReconciliation(
         }
     }
     if (missing.length === 0) return plan;
+    if (deferredHeadCanon) {
+        for (let i = 0; i < newOrder.length; i++) {
+            if (canon[i] === "") {
+                const m = byId.get(newOrder[i]!);
+                if (m !== undefined) canon[i] = cachedPositionalFingerprint(m);
+            }
+        }
+    }
 
     // Anchor the neighborhoods: longest exact-id run from the head and from
     // the tail. Churn is local in practice (a re-serialized block, an edited
@@ -1870,6 +1889,50 @@ export interface ReconcileOptions {
       *  persisted, see the channel-2 note). Invoked only on drift passes
       *  (≤256 ids/pass); undefined = legacy mode, channels 2+3 stay silent. */
     storedRowLookup?: (msgIds: readonly string[]) => Array<{ seq: number; msgId: string; content: string }> | null;
+    /** Cryptographically verified pure-append tail length (from Responses
+     *  prefix fastpath): `msgs[0 .. msgs.length - pureAppendTail - 1]` are
+     *  verbatim identical to the previous turn's messages. Enables an O(tail)
+     *  clean-state witness fastpath when the previous turn was clean and block
+     *  coverage is structurally unchanged. */
+    pureAppendTail?: number;
+}
+
+interface CleanReconcileWitness {
+    mode: FoldReconcileMode;
+    blocksSig: string;
+    anchors: Record<string, FoldAnchor>;
+    order: string[];
+    positions: { ids: string[]; canon: string[] };
+    cov: Record<string, FoldBlockCoverage>;
+    prevLen: number;
+    lastId: string;
+    expectedSize: number;
+}
+
+const cleanReconcileWitness = new WeakMap<Session, CleanReconcileWitness>();
+
+function blocksStructuralSig(blocks: readonly BlockLike[]): string {
+    const parts: string[] = [String(blocks.length)];
+    for (let i = 0; i < blocks.length; i++) {
+        const b = blocks[i]!;
+        const eff = b.effectiveMessageIds;
+        const len = eff?.length ?? 0;
+        parts.push(
+            `${b.blockId ?? ""}:${b.active ? 1 : 0}:${b.expanded ? 1 : 0}:${len}:${len > 0 ? eff![0] : ""}:${len > 0 ? eff![len - 1] : ""}`,
+        );
+    }
+    return parts.join("|");
+}
+
+/** Whether `session` has a verified clean fold-reconcile witness matching its
+ *  current blocks and message prefix (used by prepare-responses to also skip
+ *  redundant local-compaction O(history) scans on pure-append fastpath hits). */
+export function hasCleanFoldReconcileWitness(session: Session, prevLen: number, prevLastId: string | undefined): boolean {
+    const w = cleanReconcileWitness.get(session);
+    if (w === undefined || prevLastId === undefined) return false;
+    if (w.prevLen !== prevLen || w.lastId !== prevLastId) return false;
+    const blocks = (session.state?.blocks ?? []) as BlockLike[];
+    return blocksStructuralSig(blocks) === w.blocksSig;
 }
 
 /** Entry point wired into the four wire sites, immediately BEFORE the
@@ -1878,10 +1941,84 @@ export interface ReconcileOptions {
 export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opts: ReconcileOptions = {}): FoldReconcileResult {
     const mode = opts.mode ?? resolveFoldReconcileMode(process.env);
     if (mode === "off") {
+        cleanReconcileWitness.delete(session);
         resetFoldDriftState(session);
         return { kind: "off", missing: 0, claims: 0, byPos: 0, byTool: 0, byTwin: 0, bySim: 0, byOrder: 0, byNorm: 0, byTurn: 0, byImage: 0, byShape: 0, reaped: 0, unmatched: 0, expectedRetired: 0 };
     }
     const blocks = (session.state?.blocks ?? []) as BlockLike[];
+    // Pure-append clean-witness fastpath: when the caller cryptographically
+    // proved `msgs[0..prevLen-1]` are identical to the prior turn, the prior
+    // turn finished completely clean (0 missing, 0 claims, stable anchors &
+    // coverage), and `blocks` are structurally unchanged, appending `tail`
+    // messages cannot drop any covered id — update order/positions/channel-1
+    // in O(tail) instead of rebuilding 38K Sets/Maps.
+    if (
+        opts.pureAppendTail !== undefined &&
+        opts.pureAppendTail >= 0 &&
+        session.metadata !== undefined &&
+        (opts.storedMessages === undefined || opts.storedMessages.length === 0) &&
+        (opts.inboundMessageCount === undefined || opts.inboundMessageCount >= SIDE_REQUEST_MAX_MSGS)
+    ) {
+        const w = cleanReconcileWitness.get(session);
+        const prevLen = msgs.length - opts.pureAppendTail;
+        if (
+            w !== undefined &&
+            w.mode === mode &&
+            w.prevLen === prevLen &&
+            prevLen >= SIDE_REQUEST_MAX_MSGS &&
+            msgs[prevLen - 1]?.id === w.lastId &&
+            w.anchors === session.metadata[METADATA_ANCHORS] &&
+            w.order === session.metadata[METADATA_ORDER] &&
+            w.positions === session.metadata[METADATA_POSITIONS] &&
+            w.cov === session.metadata[METADATA_FOLD_COVERAGE] &&
+            ((session.metadata[METADATA_DRIFT_STREAK] as number | undefined) ?? 0) === 0 &&
+            !epochConfirmPending(session) &&
+            blocksStructuralSig(blocks) === w.blocksSig
+        ) {
+            const expected = (session.metadata[METADATA_EXPECTED_REBASE] as Record<string, string> | undefined) ?? {};
+            const expectedSizeBefore = Object.keys(expected).length;
+            if (expectedSizeBefore === w.expectedSize) {
+                const classifyCarrier = typeof session.metadata.pluginAgent === "string"
+                    ? oneShotCarrierPaths[session.metadata.pluginAgent] : undefined;
+                const tailIds: string[] = [];
+                const tailCanons: string[] = [];
+                let expectedAdded = false;
+                for (let i = prevLen; i < msgs.length; i++) {
+                    const m = msgs[i]!;
+                    const id = m.id;
+                    if (id !== undefined) {
+                        tailIds.push(id);
+                        tailCanons.push(cachedPositionalFingerprint(m));
+                        if (classifyCarrier !== undefined && w.anchors[id] === undefined && expected[id] === undefined) {
+                            const path = classifyCarrier(m);
+                            if (path !== undefined) {
+                                expected[id] = path;
+                                expectedAdded = true;
+                            }
+                        }
+                    }
+                }
+                if (expectedAdded) {
+                    session.metadata[METADATA_EXPECTED_REBASE] = expected;
+                }
+                const nextExpectedSize = expectedAdded ? Object.keys(expected).length : expectedSizeBefore;
+                if (tailIds.length > 0) {
+                    const nextOrder = w.order.concat(tailIds).slice(-MAX_ORDER);
+                    const nextCanon = w.positions.canon.concat(tailCanons).slice(-MAX_ORDER);
+                    const nextPositions = { ids: nextOrder, canon: nextCanon };
+                    session.metadata[METADATA_ORDER] = nextOrder;
+                    session.metadata[METADATA_POSITIONS] = nextPositions;
+                    w.order = nextOrder;
+                    w.positions = nextPositions;
+                }
+                w.prevLen = msgs.length;
+                w.lastId = msgs[msgs.length - 1]?.id ?? w.lastId;
+                w.expectedSize = nextExpectedSize;
+                return { kind: "resend", missing: 0, claims: 0, byPos: 0, byTool: 0, byTwin: 0, bySim: 0, byOrder: 0, byNorm: 0, byTurn: 0, byImage: 0, byShape: 0, reaped: 0, unmatched: 0, expectedRetired: nextExpectedSize };
+            }
+        }
+    }
+    cleanReconcileWitness.delete(session);
     // Active coverage first (the anchor cap's survivor order, #2334), then the
     // retained view-deactivated lineage re-fed into the claim ladder (#4050);
     // see recoveryCandidateIds for what is excluded and why. activeCovered keeps
@@ -2696,6 +2833,28 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
     // so it reports like a plain resend (the drift-warn cascade below must not
     // fire for carrier retirement / offload rewrites).
     if (realUnmatched.length === 0 && plan.claims.size === 0) {
+        const storedPos = session.metadata[METADATA_POSITIONS] as { ids: string[]; canon: string[] } | undefined;
+        const lastMsgId = msgs[msgs.length - 1]?.id;
+        if (
+            reapedCount === 0 &&
+            prevStreak === 0 &&
+            !epochConfirmPending(session) &&
+            storedPos !== undefined &&
+            lastMsgId !== undefined &&
+            msgs.length >= SIDE_REQUEST_MAX_MSGS
+        ) {
+            cleanReconcileWitness.set(session, {
+                mode,
+                blocksSig: blocksStructuralSig(blocks),
+                anchors: nextAnchors,
+                order: nextOrder,
+                positions: storedPos,
+                cov: nextCov,
+                prevLen: msgs.length,
+                lastId: lastMsgId,
+                expectedSize,
+            });
+        }
         return { kind: "resend", missing: 0, claims: 0, byPos: 0, byTool: 0, byTwin: 0, bySim: 0, byOrder: 0, byNorm: 0, byTurn: 0, byImage: 0, byShape: 0, reaped: reapedCount, unmatched: 0, expectedRetired: expectedSize };
     }
     if (opts.log !== undefined) {

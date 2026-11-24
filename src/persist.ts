@@ -1036,6 +1036,26 @@ export class SessionStore {
         return rows.map((r) => r.sessionId);
     }
 
+    /** Return the single most-recently-updated persisted session id from the
+     *  unified store (ordered by updatedAt desc). Used by post-listen background
+     *  warming so an active mega-session that exceeded the synchronous boot byte
+     *  cap is ready in RAM before Turn 1 arrives without delaying server listen. */
+    async mostRecentSessionId(): Promise<string | undefined> {
+        const shadow = this.shadow;
+        if (!shadow || shadow.stats.disabled) return undefined;
+        try {
+            const rows = await shadow.sessionSummariesAsync();
+            if (rows.length === 0) return undefined;
+            let best = rows[0]!;
+            for (let i = 1; i < rows.length; i++) {
+                if (rows[i]!.updatedAt > best.updatedAt) best = rows[i]!;
+            }
+            return best.sessionId;
+        } catch {
+            return undefined;
+        }
+    }
+
     private async bootBounded(limits: { maxSessions: number; maxBytes: number }): Promise<Map<string, Session>> {
         if (!Number.isFinite(limits.maxSessions) || limits.maxSessions < 0 || !Number.isFinite(limits.maxBytes) || limits.maxBytes < 0) {
             throw new Error("Invalid session boot limits");

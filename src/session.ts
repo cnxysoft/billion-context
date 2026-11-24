@@ -1453,6 +1453,55 @@ export async function initSessions(): Promise<void> {
     for (const [id, s] of loaded) sessions.set(id, s);
 }
 
+/** Post-listen background warm of the single most-recently-updated persisted
+ *  session. Runs AFTER the HTTP listener is already accepting traffic (0ms boot
+ *  delay) so an active mega-session that exceeded the synchronous boot warm byte
+ *  budget is already resident in RAM before Turn 1 arrives. Disable via
+ *  BILI_BOOT_WARM_HOT=0. */
+export function scheduleHotSessionWarm(
+    log: (level: string, msg: string) => void = loggerLog,
+    delayMs = 200,
+): ReturnType<typeof setTimeout> | null {
+    if ((process.env.BILI_BOOT_WARM_HOT ?? "").trim() === "0") return null;
+    const store = getStore();
+    if (!store.enabled) return null;
+    const timer = setTimeout(() => {
+        void warmMostRecentSessionNow(log);
+    }, delayMs);
+    timer.unref?.();
+    return timer;
+}
+
+export async function warmMostRecentSessionNow(
+    log: (level: string, msg: string) => void = loggerLog,
+): Promise<string | null> {
+    if ((process.env.BILI_BOOT_WARM_HOT ?? "").trim() === "0") return null;
+    const store = getStore();
+    if (!store.enabled || totalInFlight() > 0) return null;
+    let topId: string | undefined;
+    try {
+        topId = await store.mostRecentSessionId();
+    } catch {
+        return null;
+    }
+    if (!topId || sessions.has(topId) || pendingSessionLoads.has(topId) || publishingForks.has(topId)) return null;
+    const t0 = performance.now();
+    try {
+        const reloaded = await store.loadAsync(topId);
+        if (!reloaded || sessions.has(topId)) return null;
+        reloaded.restored = true;
+        reloaded.persisted = true;
+        reloaded.coldLoadedAt = Date.now();
+        makeResidentRoom(sessionWeight(reloaded));
+        sessions.set(topId, reloaded);
+        const tookMs = Math.round(performance.now() - t0);
+        log("info", `[persist] background-warmed hot session ${topId} in ${tookMs}ms`);
+        return topId;
+    } catch {
+        return null;
+    }
+}
+
 /** Zero-valued stats for a fresh session (#1991) — exported so test fixtures
  *  can build sessions without retyping every field. */
 export function zeroStats(): Session["stats"] {

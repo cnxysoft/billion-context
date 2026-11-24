@@ -34,6 +34,7 @@
  */
 import { loadOptions, ensureConfigTemplate } from "./config.js";
 import { startServer, restartForceCloseOf } from "./server.js";
+import { scheduleHotSessionWarm } from "./session.js";
 import { serveStartupFailurePage } from "./startup-failure-page.js";
 import { ensureSqliteEngine } from "./storage/engine-bootstrap.js";
 import { recordEngineBootstrap } from "./storage/runtime-status.js";
@@ -939,6 +940,11 @@ export async function main(): Promise<void> {
         await serveStartupFailurePage(opts, err);
         throw err;
     }
+
+    // Background-warm the single most-recently-updated persisted session AFTER
+    // listen() so mega-sessions that exceeded the synchronous boot byte budget
+    // are ready in RAM before Turn 1 arrives (0ms added to startup latency).
+    scheduleHotSessionWarm(loggerLog);
 
     // #3754: config-file edits don't hot-reload — this process holds whatever
     // loadOptions() resolved at startup until restart. Log the effective

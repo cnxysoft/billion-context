@@ -21,7 +21,12 @@ import { startServer } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { _setStoreForTest, SessionStore } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
-import { _resetSessionsForTest } from "../src/session.ts";
+import { _resetSessionsForTest, createSession, peekSession, warmMostRecentSessionNow } from "../src/session.ts";
+import { hasCleanFoldReconcileWitness, reconcileFoldCoverage } from "../src/fold-reconcile.ts";
+import { reconcilePluginFoldCallIds } from "../src/plugin.ts";
+import { dropCompressReasoningIds } from "../src/reasoning-drop.ts";
+import type { CoreMessage } from "acp-kernel";
+import type { BiliMessage } from "acp-kernel/wire";
 
 process.env.NODE_ENV = "test";
 process.env.BILI_PERSIST = "0";
@@ -533,4 +538,168 @@ test("E2E HTTP proxy parity: 4-turn Responses session (seed -> hit -> hit -> tam
         normalizeTimestamps(withoutCache.forwarded),
         "Every single forwarded upstream body must be 100% identical with vs without prefix cache",
     );
+});
+
+test("reconcileFoldCoverage pureAppendTail fastpath matches full path byte-for-byte and invalidates on block change", () => {
+    const makeMsgs = (count: number): CoreMessage[] => {
+        const arr: CoreMessage[] = [];
+        for (let i = 0; i < count; i++) {
+            arr.push({
+                id: `h_${String(i).padStart(16, "0")}`,
+                role: i % 2 === 0 ? "user" : "assistant",
+                contentType: "text",
+                text: `message number ${i}`,
+            });
+        }
+        return arr;
+    };
+
+    const msgs1 = makeMsgs(16);
+    const makeSessionWithBlock = () => {
+        const s = createSession("fold-parity-sess", { protocol: "responses", upstreamOrigin: "http://127.0.0.1" });
+        s.metadata.pluginAgent = "dsh";
+        const eff = msgs1.slice(0, 8).map((m) => m.id);
+        s.state.blocks.push({
+            blockId: "b_1",
+            active: true,
+            startRef: "m00001",
+            endRef: "m00008",
+            summary: "Block 1 summary",
+            directMessageIds: eff,
+            directBlockIds: [],
+            descendantBlockIds: [],
+            effectiveMessageIds: eff,
+            originalTokens: 400,
+            summaryTokens: 40,
+            compressCallId: "call_real_1",
+            tier: 1,
+            createdAt: 1,
+        } as unknown as (typeof s.state.blocks)[number]);
+        return s;
+    };
+
+    const sFast = makeSessionWithBlock();
+    const sFull = makeSessionWithBlock();
+
+    // Turn 1: both run full reconcileFoldCoverage -> arms clean witness on sFast
+    const r1Fast = reconcileFoldCoverage(sFast, msgs1, { mode: "repair", sessionId: sFast.id, inboundMessageCount: msgs1.length });
+    const r1Full = reconcileFoldCoverage(sFull, msgs1, { mode: "repair", sessionId: sFull.id, inboundMessageCount: msgs1.length });
+    assert.deepEqual(r1Fast, r1Full);
+    assert.equal(hasCleanFoldReconcileWitness(sFast, msgs1.length, msgs1[msgs1.length - 1]!.id), true);
+
+    // Turn 2: pure append of 3 messages -> sFast uses pureAppendTail=3, sFull runs full scan
+    const msgs2 = makeMsgs(19);
+    const r2Fast = reconcileFoldCoverage(sFast, msgs2, { mode: "repair", sessionId: sFast.id, inboundMessageCount: msgs2.length, pureAppendTail: 3 });
+    const r2Full = reconcileFoldCoverage(sFull, msgs2, { mode: "repair", sessionId: sFull.id, inboundMessageCount: msgs2.length });
+    assert.deepEqual(r2Fast, r2Full);
+    assert.deepEqual(sFast.metadata.foldAnchorOrder, sFull.metadata.foldAnchorOrder);
+    assert.deepEqual(sFast.metadata.foldPositions, sFull.metadata.foldPositions);
+    assert.deepEqual(sFast.metadata.foldAnchors, sFull.metadata.foldAnchors);
+    assert.deepEqual(sFast.metadata.foldCoverage, sFull.metadata.foldCoverage);
+
+    // Turn 3: adding a new active block invalidates clean witness -> falls back to full scan & matches sFull
+    const eff2 = msgs2.slice(8, 14).map((m) => m.id);
+    for (const s of [sFast, sFull]) {
+        s.state.blocks.push({
+            blockId: "b_2",
+            active: true,
+            startRef: "m00009",
+            endRef: "m00014",
+            summary: "Block 2 summary",
+            directMessageIds: eff2,
+            directBlockIds: [],
+            descendantBlockIds: [],
+            effectiveMessageIds: eff2,
+            originalTokens: 400,
+            summaryTokens: 40,
+            compressCallId: "call_real_2",
+            tier: 1,
+            createdAt: 2,
+        } as unknown as (typeof s.state.blocks)[number]);
+    }
+    assert.equal(hasCleanFoldReconcileWitness(sFast, msgs2.length, msgs2[msgs2.length - 1]!.id), false);
+    const msgs3 = makeMsgs(21);
+    const r3Fast = reconcileFoldCoverage(sFast, msgs3, { mode: "repair", sessionId: sFast.id, inboundMessageCount: msgs3.length, pureAppendTail: 2 });
+    const r3Full = reconcileFoldCoverage(sFull, msgs3, { mode: "repair", sessionId: sFull.id, inboundMessageCount: msgs3.length });
+    assert.deepEqual(r3Fast, r3Full);
+    assert.deepEqual(sFast.metadata.foldAnchors, sFull.metadata.foldAnchors);
+    assert.deepEqual(sFast.metadata.foldCoverage, sFull.metadata.foldCoverage);
+});
+
+test("reconcilePluginFoldCallIds early-exits without placeholders and dropCompressReasoningIds fastpath matches semantics", () => {
+    const s = createSession("plugin-callid-sess", { protocol: "responses", upstreamOrigin: "http://127.0.0.1" });
+    s.state.blocks.push({
+        blockId: "b_1",
+        active: true,
+        startRef: "m00001",
+        endRef: "m00005",
+        summary: "sum",
+        directMessageIds: [],
+        directBlockIds: [],
+        descendantBlockIds: [],
+        effectiveMessageIds: [],
+        originalTokens: 100,
+        summaryTokens: 10,
+        compressCallId: "real_provider_call_id",
+        tier: 1,
+        createdAt: 1,
+    } as unknown as (typeof s.state.blocks)[number]);
+    assert.equal(reconcilePluginFoldCallIds(s, []), 0);
+
+    // dropCompressReasoningIds: 0 compress calls -> empty set; closed compress call -> drops oversized reasoning; in-flight -> kept
+    const bigReasoning = "r".repeat(3000);
+    const noCompressMsgs: BiliMessage[] = [
+        { id: "r1", role: "assistant", contentType: "reasoning", text: bigReasoning },
+        { id: "c1", role: "assistant", contentType: "tool-call", toolName: "read_file", toolCallId: "tc1", text: "{}" },
+        { id: "t1", role: "tool", contentType: "tool-result", toolName: "read_file", toolCallId: "tc1", text: "ok" },
+        { id: "u1", role: "user", contentType: "text", text: "next" },
+    ];
+    assert.equal(dropCompressReasoningIds(noCompressMsgs).size, 0);
+
+    const closedCompressMsgs: BiliMessage[] = [
+        { id: "r_closed", role: "assistant", contentType: "reasoning", text: bigReasoning },
+        { id: "c_closed", role: "assistant", contentType: "tool-call", toolName: "compress", toolCallId: "tc_cmp", text: "{}" },
+        { id: "t_closed", role: "tool", contentType: "tool-result", toolName: "compress", toolCallId: "tc_cmp", text: "ok" },
+        { id: "r_inflight", role: "assistant", contentType: "reasoning", text: bigReasoning },
+        { id: "c_inflight", role: "assistant", contentType: "tool-call", toolName: "compress", toolCallId: "tc_cmp2", text: "{}" },
+        { id: "t_inflight", role: "tool", contentType: "tool-result", toolName: "compress", toolCallId: "tc_cmp2", text: "ok" },
+    ];
+    assert.deepEqual([...dropCompressReasoningIds(closedCompressMsgs)], ["r_closed"]);
+});
+
+test("warmMostRecentSessionNow background-warms hottest persisted session and respects kill-switch", async () => {
+    _resetSessionsForTest();
+    delete process.env.BILI_BOOT_WARM_HOT;
+    const hotSession = createSession("hot-mega-sess", { protocol: "responses", upstreamOrigin: "http://127.0.0.1" });
+    let loadCalls = 0;
+    const fakeStore = {
+        enabled: true,
+        setSessionCommitListener() {},
+        async mostRecentSessionId() { return "hot-mega-sess"; },
+        async loadAsync(id: string) {
+            loadCalls++;
+            return id === "hot-mega-sess" ? hotSession : null;
+        },
+    } as unknown as SessionStore;
+    _setStoreForTest(fakeStore);
+
+    const logs: string[] = [];
+    const warmedId = await warmMostRecentSessionNow((_lvl, msg) => logs.push(msg));
+    assert.equal(warmedId, "hot-mega-sess");
+    assert.equal(loadCalls, 1);
+    assert.equal(peekSession("hot-mega-sess"), hotSession);
+    assert.equal(hotSession.restored, true);
+    assert.ok(logs.some((l) => l.includes("background-warmed hot session hot-mega-sess")));
+
+    // Second call skips already-resident session (zero extra loads)
+    assert.equal(await warmMostRecentSessionNow(), null);
+    assert.equal(loadCalls, 1);
+
+    // Kill-switch BILI_BOOT_WARM_HOT=0 disables warm
+    _resetSessionsForTest();
+    process.env.BILI_BOOT_WARM_HOT = "0";
+    assert.equal(await warmMostRecentSessionNow(), null);
+    assert.equal(loadCalls, 1);
+    delete process.env.BILI_BOOT_WARM_HOT;
+    _resetSessionsForTest();
 });

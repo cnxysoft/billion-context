@@ -170,6 +170,7 @@ function boundProjection(projection: ResponsesProjection, messages: CoreMessage[
         runs.set(binding.source, groups);
         previous = bound;
     }
+    if (runs.size === 0) return projection;
     const sources = new Map(projection.msgs.map(message => [message.id, message]));
     const replaced = new Set<string>();
     const rebound: BiliMessage[] = [];

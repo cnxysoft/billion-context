@@ -178,6 +178,17 @@ export function isPluginFoldCallId(callId: string | undefined): boolean {
 
 /** Reconnect legacy plugin blocks before the kernel mistakes their live carriers for orphans. */
 export function reconcilePluginFoldCallIds(session: Session, messages: CoreMessage[]): number {
+    // Only blocks carrying a synthetic plugin placeholder id can ever be
+    // rewritten below; skip the O(history) message/tool-result Map build on
+    // steady-state turns when every active block already has its real call id.
+    let hasPendingPlaceholder = false;
+    for (const block of session.state.blocks) {
+        if (block.active && block.startRef && block.endRef && isPluginFoldCallId(block.compressCallId)) {
+            hasPendingPlaceholder = true;
+            break;
+        }
+    }
+    if (!hasPendingPlaceholder) return 0;
     const blocks = new Map<string, typeof session.state.blocks>();
     for (const block of session.state.blocks) {
         if (!block.active || !block.startRef || !block.endRef) continue;

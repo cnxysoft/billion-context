@@ -17,7 +17,7 @@ import { excludeDeadRefRanges } from "../acp-status.js";
 import { mergeAdjacentConfigurationUpdates, patchResponsesInputWithToolImages as patchResponsesInput, responsesToCoreWithToolImages as responsesToCore } from "../responses-tool-output.js";
 import type { CanonicalBaseHint } from "acp-kernel/wire";
 import { dropWhitespaceResponsesMessages, normalizeResponsesMessageItems, sanitizeResponsesInputIds } from "../loop/adapter-responses.js";
-import { METADATA_LAST_RESPONSES_MODE, noteCanonicalSystemFingerprint, reconcileFoldCoverage, noteSystemPromptFingerprint, resolveFoldReconcileMode } from "../fold-reconcile.js";
+import { hasCleanFoldReconcileWitness, METADATA_LAST_RESPONSES_MODE, noteCanonicalSystemFingerprint, reconcileFoldCoverage, noteSystemPromptFingerprint, resolveFoldReconcileMode } from "../fold-reconcile.js";
 import { buildAnchoredView, maybeSnapshotView, noteAnchoredRender, SnapshotAnchorFallbackError, wsAnchoredPayload } from "./snapshot-render.js";
 import { storedMessagesFor, storedRowLookupFor } from "../fold-decomposition-lookup.js";
 import { nudgeSuppressed, pluginLaneDegraded } from "../session-self-heal.js";
@@ -424,30 +424,40 @@ export async function prepareResponses(
         // #3686: host policy — a declared plugin host with a codex-shaped UA is not codex.
         const codexLane = !isCompactionTrigger && isCodexHost(req.headers);
         const dshLane = !isCompactionTrigger && laneDecisions.profile.compactsClientSide; // #3417 registry property (dsh native compaction, #2432)
-        if ((codexLane || dshLane) && session.state.blocks.some((b) => b.active)) {
+        const pureAppendTail = inc !== null ? inc.tailMsgs.length : undefined;
+        const pureAppendPrefixClean = pureAppendTail !== undefined && hasCleanFoldReconcileWitness(
+            session,
+            msgs.length - pureAppendTail,
+            msgs[msgs.length - pureAppendTail - 1]?.id,
+        );
+        if ((codexLane || dshLane) && !pureAppendPrefixClean && session.state.blocks.some((b) => b.active)) {
             const coveredBeforeLocalCompact = coveredRealHistoryIds(session.state.blocks);
             const localGap = foldCoverage(coveredBeforeLocalCompact, msgs.map((m) => m.id));
-            // #2621: pre-turn ref map for the dsh novelty gate — a freshly-landed
-            // checkpoint is a NEW id; historical quotes/replays hit old ids.
-            const knownIdsBeforeLocalCompact = new Set(Object.keys(session.state.messageRefs.byRaw));
-            const codexHit = codexLane && carriesCodexLocalCompactionSummary(msgs);
-            const dshHit = dshLane && (carriesDshLocalCompactionSummary(msgs, knownIdsBeforeLocalCompact) || carriesBiliSnapshotCheckpoint(msgs, knownIdsBeforeLocalCompact));
-            const dshAuthored = dshLane && carriesBiliSnapshotCheckpoint(msgs, knownIdsBeforeLocalCompact);
-            if (localGap && (codexHit || dshHit)) {
-                const missing = localGap.expected - localGap.matched;
-                const minMissing = dshHit ? DSH_LOCAL_COMPACTION_MIN_MISSING : CODEX_LOCAL_COMPACTION_MIN_MISSING;
-                if (missing >= minMissing && missing * 2 >= localGap.expected) {
-                    if (dshHit) {
-                        // #3733: our own <bili-snapshot v1 …/> tag = authored checkpoint.
-                        if (dshAuthored) session.metadata.dshAuthoredCheckpointLanded = true;
-                        recordConflict(session, "native-compaction", `dsh native compaction: ${missing}/${localGap.expected} covered id(s) replaced by the compacted history; ACP state rebased (#2432)`);
-                        log(dshAuthored ? "info" : "warn", `[${sessionId}] dsh ${dshAuthored ? "AUTHORED checkpoint landed" : "native compaction detected"} (${localGap.matched}/${localGap.expected} covered id(s) retained, checkpoint framing in resent history) — ${dshAuthored ? "rebasing ACP state onto the authored bili-snapshot checkpoint (#3733)" : "rebasing ACP state onto the compacted history (#2432)"}`);
-                    } else {
-                        recordConflict(session, "native-compaction", `codex local auto-compaction: ${missing}/${localGap.expected} covered id(s) replaced by the compacted history; rebasing ACP state (#2372)`);
-                        log("warn", `[${sessionId}] codex local auto-compaction detected (${localGap.matched}/${localGap.expected} covered ids retained) — rebasing ACP state onto the compacted history (#2372)`);
+            if (localGap) {
+                // #2621: pre-turn ref map for the dsh novelty gate — a freshly-landed
+                // checkpoint is a NEW id; historical quotes/replays hit old ids.
+                // Guarded behind `if (localGap)` so clean steady-state turns never
+                // allocate a 47K-key Set or scan all 38K messages for nothing.
+                const knownIdsBeforeLocalCompact = new Set(Object.keys(session.state.messageRefs.byRaw));
+                const codexHit = codexLane && carriesCodexLocalCompactionSummary(msgs);
+                const dshAuthored = dshLane && carriesBiliSnapshotCheckpoint(msgs, knownIdsBeforeLocalCompact);
+                const dshHit = dshAuthored || (dshLane && carriesDshLocalCompactionSummary(msgs, knownIdsBeforeLocalCompact));
+                if (codexHit || dshHit) {
+                    const missing = localGap.expected - localGap.matched;
+                    const minMissing = dshHit ? DSH_LOCAL_COMPACTION_MIN_MISSING : CODEX_LOCAL_COMPACTION_MIN_MISSING;
+                    if (missing >= minMissing && missing * 2 >= localGap.expected) {
+                        if (dshHit) {
+                            // #3733: our own <bili-snapshot v1 …/> tag = authored checkpoint.
+                            if (dshAuthored) session.metadata.dshAuthoredCheckpointLanded = true;
+                            recordConflict(session, "native-compaction", `dsh native compaction: ${missing}/${localGap.expected} covered id(s) replaced by the compacted history; ACP state rebased (#2432)`);
+                            log(dshAuthored ? "info" : "warn", `[${sessionId}] dsh ${dshAuthored ? "AUTHORED checkpoint landed" : "native compaction detected"} (${localGap.matched}/${localGap.expected} covered id(s) retained, checkpoint framing in resent history) — ${dshAuthored ? "rebasing ACP state onto the authored bili-snapshot checkpoint (#3733)" : "rebasing ACP state onto the compacted history (#2432)"}`);
+                        } else {
+                            recordConflict(session, "native-compaction", `codex local auto-compaction: ${missing}/${localGap.expected} covered id(s) replaced by the compacted history; rebasing ACP state (#2372)`);
+                            log("warn", `[${sessionId}] codex local auto-compaction detected (${localGap.matched}/${localGap.expected} covered ids retained) — rebasing ACP state onto the compacted history (#2372)`);
+                        }
+                        markNativeCompactionBoundary(session);
+                        reconcileNativeCompactionBoundary(session);
                     }
-                    markNativeCompactionBoundary(session);
-                    reconcileNativeCompactionBoundary(session);
                 }
             }
         }
@@ -463,8 +473,8 @@ export async function prepareResponses(
         // [#1921] re-anchor fold coverage onto churned-but-same messages
         // before the #1195 snapshot, so covered ids surviving a client
         // re-serialization stay covered (src/fold-reconcile.ts).
-const foldMode = resolveFoldReconcileMode(process.env, opts.compress.reconcile);
-reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStripped: markerArtifactCount(markerCounts), inboundMessageCount, storedMessages: foldMode === "off" ? undefined : storedMessagesFor(session, sessionId, msgs), storedRowLookup: foldMode === "off" ? undefined : storedRowLookupFor(sessionId) });
+        const foldMode = resolveFoldReconcileMode(process.env, opts.compress.reconcile);
+        reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStripped: markerArtifactCount(markerCounts), inboundMessageCount, storedMessages: foldMode === "off" || pureAppendPrefixClean ? undefined : storedMessagesFor(session, sessionId, msgs), storedRowLookup: foldMode === "off" ? undefined : storedRowLookupFor(sessionId), pureAppendTail });
         if (!isCompactionTrigger) {
             noteSystemPromptFingerprint(session, responsesClientSystem, { sessionId, log });
             // #2867: the mode-independent twin — lets the ledger classify a
@@ -571,7 +581,10 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
         // already consumed. Skipped on a compaction-generation request (trigger/prompt
         // form) so that turn cannot eat an unrelated pending marker.
         if (compactForm === undefined) {
-            applyCompactionArchive(session, activeBefore, new Set(msgs.map((m) => m.id)), log);
+            const pendingBoundary = session.metadata.compactionBoundary;
+            if (pendingBoundary && typeof pendingBoundary === "object" && (pendingBoundary as Record<string, unknown>).pending) {
+                applyCompactionArchive(session, activeBefore, new Set(msgs.map((m) => m.id)), log);
+            }
         }
         reapOrphansLogged(session, msgs, log, sessionId);
         rebuiltInput = patchResponsesInput(projection, processedMessages);
