@@ -21,7 +21,7 @@ import { executeProxyToolAsync } from "./loop/core.js";
 import { hasDecompressImageRef } from "./decompress-shared.js";
 import type { ProxyToolResult } from "./proxy-tool-result.js";
 import { normalizeSseLineEndings, finalizeSseLineEndings } from "./sse-util.js";
-import { composeStreamFilters, containsBiliInternalText, containsEchoResidue, containsMarkerLineText, containsRenderTagText, containsToolCallEmissionText, containsToolCallXmlFragment, createBiliArtifactFilter, createIdentityStreamFilter, createMarkerLineFilter, createTagEchoFilter, isOrphanMarkupText, mayStartBiliInternal, mayStartDegenerateRenderTag, mayStartMarkerLine, mayStartRenderTag, mayStartToolCallEmission, stripAcpTags, stripAnthropicText, stripOpenaiChatText, stripResponsesText, type TagEchoFilter } from "./loop/tag-echo-filter.js";
+import { composeStreamFilters, containsBiliInternalText, containsDsmlLeakText, containsEchoResidue, containsMarkerLineText, containsRenderTagText, containsToolCallEmissionText, containsToolCallXmlFragment, createBiliArtifactFilter, createDsmlLeakFilter, createIdentityStreamFilter, createLeadingNewlineFilter, createMarkerLineFilter, createTagEchoFilter, isOrphanMarkupText, mayStartBiliInternal, mayStartDegenerateRenderTag, mayStartDsmlLeak, mayStartMarkerLine, mayStartRenderTag, mayStartToolCallEmission, stripAcpTags, stripAnthropicText, stripOpenaiChatText, stripResponsesText, type TagEchoFilter } from "./loop/tag-echo-filter.js";
 import { log as loggerLog } from "./logger.js";
 import { scanModelOutputForPhantomAttachments } from "./phantom-attachment.js";
 import { ccrEnabled, ccrLoopConfig, contentStoreOf, retrieveToolName } from "./store.js";
@@ -2890,6 +2890,10 @@ export async function pipePluginChatWithStrip(
         sawStrippedEcho = true;
         loggerLog("warn", `${who}[bili-artifact] stripped model-emitted internal artifact (plugin passthrough): ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
     };
+    const onDsmlDrop = (snippet: string) => {
+        sawStrippedEcho = true;
+        loggerLog("warn", `${who}[dsml-leak] stripped malformed DSML tag (plugin passthrough): ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
+    };
     // One state machine per (field, block/choice index) — interleaved choices
     // or content blocks must not share partial-tag state. Tool-call arguments
     // never flow through a stream (#1039): they are forwarded verbatim.
@@ -2899,6 +2903,7 @@ export async function pipePluginChatWithStrip(
         index: number;
     }
     const streams = new Map<string, PipeStream>();
+    const seenNonNewlineByKey = new Set<string>();
     const filterFor = (field: string, index: number) => {
         const key = `${field}:${index}`;
         let s = streams.get(key);
@@ -2911,7 +2916,25 @@ export async function pipePluginChatWithStrip(
             // openai reasoning fields — the thinking channel is NEVER
             // rewritten, only the visible text channel is.
             const signedThinking = field === "thinking" || (protocol === "openai" && (field === "reasoning_content" || field === "reasoning"));
-            s = { filter: signedThinking ? createIdentityStreamFilter() : composeStreamFilters(composeStreamFilters(createTagEchoFilter(onTagDrop, onResidueWarn, absorbInstructed, requestText), createMarkerLineFilter(onMarkerDrop)), createBiliArtifactFilter(onBiliDrop)), field, index };
+            s = {
+                filter: signedThinking
+                    ? createIdentityStreamFilter()
+                    : composeStreamFilters(
+                        composeStreamFilters(
+                            composeStreamFilters(
+                                composeStreamFilters(
+                                    createTagEchoFilter(onTagDrop, onResidueWarn, absorbInstructed, requestText),
+                                    createMarkerLineFilter(onMarkerDrop),
+                                ),
+                                createBiliArtifactFilter(onBiliDrop),
+                            ),
+                            createDsmlLeakFilter(onDsmlDrop),
+                        ),
+                        createLeadingNewlineFilter(() => seenNonNewlineByKey.has(key)),
+                    ),
+                field,
+                index,
+            };
             streams.set(key, s);
         }
         return s;
@@ -3113,6 +3136,7 @@ export async function pipePluginChatWithStrip(
         // saw (an emptying tag echo): the retry's content is filtered from
         // scratch, so a partial tag there cannot swallow its opening characters.
         streams.clear();
+        seenNonNewlineByKey.clear();
         // The first attempt is terminal and its body is drained; close the
         // reader we are abandoning rather than leaving the socket held.
         try {
@@ -3159,6 +3183,7 @@ export async function pipePluginChatWithStrip(
         sawTerminal = false;
         finalFinishReason = undefined;
         streams.clear();
+        seenNonNewlineByKey.clear();
         try {
             await reader.cancel();
         } catch {
@@ -3217,6 +3242,7 @@ export async function pipePluginChatWithStrip(
         retryIndexOffset = blocksForwarded;
         inRetry = true;
         streams.clear();
+        seenNonNewlineByKey.clear();
         try {
             await reader.cancel();
         } catch {
@@ -3507,10 +3533,14 @@ export async function pipePluginChatWithStrip(
                 // tool-call emission: route it to the filter so the
                 // whole-field decision runs (m00885). Degenerate-close
                 // residue (#2190) rides the same routing.
-                if (!mayStartRenderTag(v) && !mayStartMarkerLine(v) && !mayStartBiliInternal(v) && !mayStartDegenerateRenderTag(v) && !(absorbInstructed === true && mayStartToolCallEmission(v)) && !anyPending()) {
+                const index = typeof ch?.["index"] === "number" ? ch["index"] : ci;
+                const key = `${field}:${index}`;
+                const leadingNlPending = field === "content" && !seenNonNewlineByKey.has(key) && (v.startsWith("\n") || v.startsWith("\r"));
+                if (!leadingNlPending && !mayStartRenderTag(v) && !mayStartMarkerLine(v) && !mayStartBiliInternal(v) && !mayStartDsmlLeak(v) && !mayStartDegenerateRenderTag(v) && !(absorbInstructed === true && mayStartToolCallEmission(v)) && !anyPending()) {
                     if (v.length > 0) {
+                        if (field === "content") seenNonNewlineByKey.add(key);
                         keptText = true;
-                        appendReply(field, typeof ch?.["index"] === "number" ? ch["index"] as number : ci, v);
+                        appendReply(field, index, v);
                         proseAcc += v;
                         // #2190: residue audit — bytes that bypassed the state
                         // machine must be observable, not silent.
@@ -3522,8 +3552,8 @@ export async function pipePluginChatWithStrip(
                     }
                     continue;
                 }
-                const index = typeof ch?.["index"] === "number" ? ch["index"] : ci;
                 const [released, pushedChanged] = pushField(field, index, v);
+                if (field === "content" && released.length > 0) seenNonNewlineByKey.add(key);
                 let clean = released;
                 let changed = pushedChanged;
                 if (isTerminal) {
@@ -3688,8 +3718,11 @@ export async function pipePluginChatWithStrip(
         // Whole-field tool-call emission on an absorb-instructed request
         // (m00885): the filter's field-start hold decides on the complete
         // field, so the fast path must not pre-empt it.
-        if (!mayStartRenderTag(raw) && !mayStartMarkerLine(raw) && !mayStartBiliInternal(raw) && !mayStartDegenerateRenderTag(raw) && !(absorbInstructed === true && mayStartToolCallEmission(raw)) && !anyPending()) {
+        const key = `${field}:${index}`;
+        const leadingNlPending = field === "text" && !seenNonNewlineByKey.has(key) && (raw.startsWith("\n") || raw.startsWith("\r"));
+        if (!leadingNlPending && !mayStartRenderTag(raw) && !mayStartMarkerLine(raw) && !mayStartBiliInternal(raw) && !mayStartDsmlLeak(raw) && !mayStartDegenerateRenderTag(raw) && !(absorbInstructed === true && mayStartToolCallEmission(raw)) && !anyPending()) {
             if (raw.length > 0) {
+                if (field === "text") seenNonNewlineByKey.add(key);
                 appendReply(field, index, raw);
                 proseAcc += raw;
                 // #2190: residue audit — see the twin above.
@@ -3702,6 +3735,7 @@ export async function pipePluginChatWithStrip(
             return rawEvent + "\n\n";
         }
         const [clean, changed] = pushField(field, index, raw);
+        if (field === "text" && clean.length > 0) seenNonNewlineByKey.add(key);
         appendReply(field, index, clean);
         if (!changed) {
             if (field === "text" && raw.length > 0) {
@@ -3801,8 +3835,11 @@ export async function pipePluginChatWithStrip(
                 // Whole-field tool-call emission on an absorb-instructed
                 // request (m00885) — see processOpenai. Degenerate-close
                 // residue (#2190) rides the same routing.
-                if (signed || (!mayStartRenderTag(raw) && !mayStartMarkerLine(raw) && !mayStartBiliInternal(raw) && !mayStartDegenerateRenderTag(raw) && !(absorbInstructed === true && mayStartToolCallEmission(raw)) && !anyPending())) {
+                const key = `${field}:${index}`;
+                const leadingNlPending = !signed && field === "text" && !seenNonNewlineByKey.has(key) && (raw.startsWith("\n") || raw.startsWith("\r"));
+                if (signed || (!leadingNlPending && !mayStartRenderTag(raw) && !mayStartMarkerLine(raw) && !mayStartBiliInternal(raw) && !mayStartDsmlLeak(raw) && !mayStartDegenerateRenderTag(raw) && !(absorbInstructed === true && mayStartToolCallEmission(raw)) && !anyPending())) {
                     if (raw.length > 0) {
+                        if (!signed && field === "text") seenNonNewlineByKey.add(key);
                         keptText = true;
                         appendReply(field, index, raw);
                         proseAcc += raw;
@@ -3818,6 +3855,7 @@ export async function pipePluginChatWithStrip(
                     continue;
                 }
                 const [released, pushedChanged] = pushField(field, index, raw);
+                if (field === "text" && released.length > 0) seenNonNewlineByKey.add(key);
                 let clean = released;
                 let changed = pushedChanged;
                 if (isTerminal) {
@@ -4465,17 +4503,31 @@ export async function pipePluginResponsesWithStrip(
         loggerLog("warn", `${who}[tag-echo] filter released echo-residue-shaped bytes (#2190): ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
     };
     const onBiliDrop = (snippet: string) => {
+        sawStrippedEcho = true;
         loggerLog("warn", `${who}[bili-artifact] stripped model-emitted internal artifact (plugin passthrough): ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
     };
-    const tagFilter = composeStreamFilters(
+    const onDsmlDrop = (snippet: string) => {
+        sawStrippedEcho = true;
+        loggerLog("warn", `${who}[dsml-leak] stripped malformed DSML tag (plugin passthrough): ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
+    };
+    const buildTagFilter = () => composeStreamFilters(
         composeStreamFilters(
-            createTagEchoFilter(onTagDrop, onResidueWarn, absorbInstructed, requestText),
-            createMarkerLineFilter((snippet) => {
-                loggerLog("warn", `${who}[marker-echo] stripped model-emitted ACP confirmation marker (plugin passthrough): ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
-            }),
+            composeStreamFilters(
+                composeStreamFilters(
+                    createTagEchoFilter(onTagDrop, onResidueWarn, absorbInstructed, requestText),
+                    createMarkerLineFilter((snippet) => {
+                        sawStrippedEcho = true;
+                        loggerLog("warn", `${who}[marker-echo] stripped model-emitted ACP confirmation marker (plugin passthrough): ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
+                    }),
+                ),
+                createBiliArtifactFilter(onBiliDrop),
+            ),
+            createDsmlLeakFilter(onDsmlDrop),
         ),
-        createBiliArtifactFilter(onBiliDrop),
+        createLeadingNewlineFilter(() => sawNonNewlineText),
     );
+    let tagFilter = buildTagFilter();
+    let sawNonNewlineText = false;
     // #673: turn-level observability for degenerate terminal turns.
     let sawFunctionCall = false;
     // #1685 witness feed: function_call items carry their name at
@@ -4572,6 +4624,8 @@ export async function pipePluginResponsesWithStrip(
         heldOutputIndex = undefined;
         heldResponseId = undefined;
         tagFilter.flush();
+        tagFilter = buildTagFilter();
+        sawNonNewlineText = false;
         try {
             await reader.cancel();
         } catch {
@@ -4841,6 +4895,8 @@ export async function pipePluginResponsesWithStrip(
         // saw (an emptying tag echo): the retry's content is filtered from
         // scratch, so a partial tag there cannot swallow its opening characters.
         tagFilter.flush();
+        tagFilter = buildTagFilter();
+        sawNonNewlineText = false;
         // The first attempt is terminal and its body is drained; close the
         // reader we are abandoning rather than leaving the socket held.
         try {
@@ -5002,11 +5058,14 @@ export async function pipePluginResponsesWithStrip(
                         // Whole-field tool-call emission (m00885) — an absorb-instructed
                         // turn may answer as prose; drop the span, not just the tags.
                         const dropEmission = absorbInstructed === true && containsToolCallEmissionText(jsonStr);
-                        const hadEchoText = containsRenderTagText(jsonStr) || containsMarkerLineText(jsonStr) || containsBiliInternalText(jsonStr) || containsEchoResidue(jsonStr) || dropEmission;
+                        const hadDsml = containsDsmlLeakText(jsonStr);
+                        const hadEchoText = containsRenderTagText(jsonStr) || containsMarkerLineText(jsonStr) || containsBiliInternalText(jsonStr) || containsEchoResidue(jsonStr) || hadDsml || dropEmission;
                         if (hadEchoText) sawStrippedEcho = true;
+                        const rawAnswer = responsesEventText(ev, true);
+                        const hadLeadingNl = rawAnswer.startsWith("\n") || rawAnswer.startsWith("\r");
                         let evOut = ev;
-                        let rebuild = hadEchoText || retryRewritePending();
-                        if (rebuild) evOut = stripResponsesText(ev, dropEmission, requestText);
+                        let rebuild = hadEchoText || hadLeadingNl || retryRewritePending();
+                        if (rebuild) evOut = stripResponsesText(ev, dropEmission, requestText, { stripDsml: true, trimLeadingNewlines: true });
                         rewriteRetryIds(evOut);
                         if (reply && type === "response.output_item.done" && evOut["item"] && typeof evOut["item"] === "object") replyItems.set(Number(evOut["output_index"] ?? 0), evOut["item"] as Record<string, unknown>);
                         const doneText = responsesEventText(evOut, true);
@@ -5059,11 +5118,19 @@ export async function pipePluginResponsesWithStrip(
                         // Whole-field tool-call emission (m00885) — an absorb-instructed
                         // turn may answer as prose; drop the span, not just the tags.
                         const dropEmission = absorbInstructed === true && containsToolCallEmissionText(jsonStr);
-                        const hadEchoText = containsRenderTagText(jsonStr) || containsMarkerLineText(jsonStr) || containsBiliInternalText(jsonStr) || containsEchoResidue(jsonStr) || dropEmission;
+                        const hadDsml = containsDsmlLeakText(jsonStr);
+                        const hadEchoText = containsRenderTagText(jsonStr) || containsMarkerLineText(jsonStr) || containsBiliInternalText(jsonStr) || containsEchoResidue(jsonStr) || hadDsml || dropEmission;
                         if (hadEchoText) sawStrippedEcho = true;
+                        const respOut = (ev["response"] as Record<string, unknown> | undefined)?.["output"];
+                        const hadLeadingNl = Array.isArray(respOut) && respOut.some((it) => {
+                            if (!it || typeof it !== "object") return false;
+                            const io = it as Record<string, unknown>;
+                            if (io["type"] === "reasoning" || !Array.isArray(io["content"])) return false;
+                            return (io["content"] as unknown[]).some((p) => p && typeof p === "object" && !isReasoningPart(p as Record<string, unknown>) && typeof (p as Record<string, unknown>)["text"] === "string" && (((p as Record<string, unknown>)["text"] as string).startsWith("\n") || ((p as Record<string, unknown>)["text"] as string).startsWith("\r")));
+                        });
                         let evOut = ev;
-                        let rebuild = hadEchoText || retryRewritePending();
-                        if (rebuild) evOut = stripResponsesText(ev, dropEmission, requestText);
+                        let rebuild = hadEchoText || hadLeadingNl || retryRewritePending();
+                        if (rebuild) evOut = stripResponsesText(ev, dropEmission, requestText, { stripDsml: true, trimLeadingNewlines: true });
                         rewriteRetryIds(evOut);
                         if (type === "response.completed") {
                             const response = evOut["response"] as Record<string, unknown> | undefined;
@@ -5088,7 +5155,9 @@ export async function pipePluginResponsesWithStrip(
                         // Whole-field emission head (m00885): the filter's
                         // field-start hold must see the first bytes. Degenerate
                         // close (#2190) rides the same routing.
-                        if (!retryRewritePending() && !mayStartRenderTag(delta) && !mayStartMarkerLine(delta) && !mayStartBiliInternal(delta) && !mayStartDegenerateRenderTag(delta) && !(absorbInstructed === true && mayStartToolCallEmission(delta)) && !tagFilter.pending()) {
+                        const leadingNlPending = !sawNonNewlineText && (delta.startsWith("\n") || delta.startsWith("\r"));
+                        if (!leadingNlPending && !retryRewritePending() && !mayStartRenderTag(delta) && !mayStartMarkerLine(delta) && !mayStartBiliInternal(delta) && !mayStartDsmlLeak(delta) && !mayStartDegenerateRenderTag(delta) && !(absorbInstructed === true && mayStartToolCallEmission(delta)) && !tagFilter.pending()) {
+                            sawNonNewlineText = true;
                             proseAcc += delta;
                             visibleTextChars += delta.length;
                             fastPathChars += delta.length;
@@ -5106,9 +5175,10 @@ export async function pipePluginResponsesWithStrip(
                             heldOutputIndex = ev["output_index"];
                         }
                         if (clean.length === 0) {
-                            sawStrippedEcho = true;
+                            if (tagFilter.stats().dropCount > 0) sawStrippedEcho = true;
                             continue;
                         }
+                        sawNonNewlineText = true;
                         visibleTextChars += clean.length;
                         proseAcc += clean;
                         answerProse += clean;
@@ -5354,16 +5424,18 @@ export async function pipePluginJson(
         // tool-call emission written as prose — the raw-body probe is
         // escape-tolerant so it fires on the serialized JSON too.
         const dropEmission = absorbInstructed === true && containsToolCallEmissionText(text);
-        if (json && (dropEmission || containsRenderTagText(text) || containsMarkerLineText(text) || containsBiliInternalText(text) || containsEchoResidue(text))) {
+        const stripOpts = { stripDsml: true, trimLeadingNewlines: true };
+        const jsonHasLeadingNl = text.includes("\"\\n") || text.includes("\"\\r");
+        if (json && (dropEmission || jsonHasLeadingNl || containsRenderTagText(text) || containsMarkerLineText(text) || containsBiliInternalText(text) || containsDsmlLeakText(text) || containsEchoResidue(text))) {
         // #206 parity for the non-streaming plugin path: the compress loop's
         // JSON branch strips render tags from every round; a verbatim plugin
         // JSON response would re-feed the model's tag echoes. Strips mutate in
         // place, so this composes with the #408 usage backfill above — one
         // parse, one reserialize.
-        json = protocol === "responses" ? stripResponsesText(json, dropEmission, requestText)
-            : protocol === "anthropic" ? stripAnthropicText(json, dropEmission, requestText)
+        json = protocol === "responses" ? stripResponsesText(json, dropEmission, requestText, stripOpts)
+            : protocol === "anthropic" ? stripAnthropicText(json, dropEmission, requestText, stripOpts)
             : protocol === "google" ? stripGoogleText(json, dropEmission, requestText)
-            : stripOpenaiChatText(json, dropEmission, requestText);
+            : stripOpenaiChatText(json, dropEmission, requestText, stripOpts);
         mutated = true;
     }
     if (json && !res.destroyed) {

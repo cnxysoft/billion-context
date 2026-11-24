@@ -18,7 +18,7 @@
 // streaming-vs-settled disagreement.
 import test from "node:test";
 import assert from "node:assert/strict";
-import { createTagEchoFilter, createMarkerLineFilter, stripAcpTags, createBiliArtifactFilter } from "../src/loop/tag-echo-filter.ts";
+import { composeStreamFilters, createBiliArtifactFilter, createDsmlLeakFilter, createLeadingNewlineFilter, createMarkerLineFilter, createTagEchoFilter, stripAcpTags, stripDsmlLeaks, stripResponsesText, trimLeadingNewlines } from "../src/loop/tag-echo-filter.ts";
 
 function mulberry32(seed: number): () => number {
     let a = seed >>> 0;
@@ -191,4 +191,113 @@ test("bili-artifact filter: chunk-boundary determinism (chain carrier)", () => {
         assert.equal(run(splits), reference, `artifact filter chunk size ${size} differs`);
     }
     for (let seed = 0; seed < 20; seed++) assert.equal(run(randomSplits(text, seed)), reference, `artifact filter seed ${seed} differs`);
+});
+
+test("dsml-leak filter: strips malformed fullwidth DSML tags with 100% chunk determinism and whole-text parity", () => {
+    const cases: Array<{ name: string; input: string; expected: string }> = [
+        {
+            name: "trailing orphan close stack",
+            input: "做成可编程接口。\x3c/\uFF5C\uFF5CDSML\uFF5C\uFF5C parameter\x3e\n\x3c/\uFF5C\uFF5CDSML\uFF5C\uFF5C invoke\x3e\n\x3c/\uFF5C\uFF5CDSML\uFF5C\uFF5C calls\x3e",
+            expected: "做成可编程接口。",
+        },
+        {
+            name: "orphan DSML-only turn empties cleanly",
+            input: "\n\x3c/\uFF5C\uFF5CDSML\uFF5C\uFF5C invoke\x3e\n\x3c/\uFF5C\uFF5CDSML\uFF5C\uFF5C calls\x3e",
+            expected: "\n",
+        },
+        {
+            name: "malformed open calls and nameless invoke",
+            input: "检查一下：\x3c\uFF5CDSML\uFF5C calls\x3e \x3c\uFF5CDSML\uFF5C invoke \x3e\n继续正文。",
+            expected: "检查一下：继续正文。",
+        },
+        {
+            name: "standalone space-separated DSML pair empties cleanly",
+            input: "\x3c\uFF5CDSML\uFF5C calls\x3e \x3c\uFF5CDSML\uFF5C invoke \x3e",
+            expected: "",
+        },
+        {
+            name: "DSML tag followed by space and non-DSML markup keeps the space",
+            input: "\x3c\uFF5CDSML\uFF5C calls\x3e \x3chello\x3e",
+            expected: " \x3chello\x3e",
+        },
+        {
+            name: "DSML tag followed by space and unterminated parameter prefix releases both at EOF",
+            input: "\x3c\uFF5CDSML\uFF5C calls\x3e \x3cparameter",
+            expected: " \x3cparameter",
+        },
+        {
+            name: "DSML tag followed by trailing spaces at EOF drops spaces cleanly",
+            input: "正文\x3c\uFF5CDSML\uFF5C calls\x3e   ",
+            expected: "正文",
+        },
+        {
+            name: "DSML tag followed by space and lone CR preserves both",
+            input: "\x3c\uFF5CDSML\uFF5C calls\x3e \r",
+            expected: " \r",
+        },
+        {
+            name: "bc ref fused into parameter tag + DSML close",
+            input: "\n\x3cparameter name=\"m98078\"\x3em98078\x3c/\uFF5C\uFF5CDSML\uFF5C\uFF5C parameter\x3e\n\x3c/\uFF5C\uFF5CDSML\uFF5C\uFF5C invoke\x3e\n\x3c/\uFF5C\uFF5CDSML\uFF5C\uFF5C calls\x3e",
+            expected: "\n",
+        },
+        {
+            name: "backtick-quoted DSML mention in prose is preserved",
+            input: "结果输出了半截乱码（`\x3c/\uFF5C\uFF5CDSML\uFF5C\uFF5C invoke\x3e`）。",
+            expected: "结果输出了半截乱码（`\x3c/\uFF5C\uFF5CDSML\uFF5C\uFF5C invoke\x3e`）。",
+        },
+        {
+            name: "normal HTML and ASCII pipes are untouched",
+            input: "\x3cdiv\x3ea | b\x3c/div\x3e\n\x3c|not-fullwidth|\x3e",
+            expected: "\x3cdiv\x3ea | b\x3c/div\x3e\n\x3c|not-fullwidth|\x3e",
+        },
+    ];
+
+    for (const c of cases) {
+        assert.equal(stripDsmlLeaks(c.input), c.expected, `whole-text mismatch for ${c.name}`);
+        const run = (splits: number[]): string => {
+            const f = createDsmlLeakFilter();
+            let out = "";
+            let pos = 0;
+            for (const len of splits) {
+                out += f.push(c.input.slice(pos, pos + len));
+                pos += len;
+            }
+            if (pos < c.input.length) out += f.push(c.input.slice(pos));
+            return out + f.flush();
+        };
+        assert.equal(run([c.input.length]), c.expected, `whole-buffer stream mismatch for ${c.name}`);
+        for (const size of [1, 2, 3, 5, 8, 13]) {
+            const splits: number[] = [];
+            for (let left = c.input.length; left > 0; left -= size) splits.push(Math.min(size, left));
+            assert.equal(run(splits), c.expected, `chunk size ${size} mismatch for ${c.name}`);
+        }
+        for (let seed = 0; seed < 20; seed++) {
+            assert.equal(run(randomSplits(c.input, seed)), c.expected, `random seed ${seed} mismatch for ${c.name}`);
+        }
+    }
+});
+
+test("leading-newline trimmer composes after tag-echo + DSML filters with 100% chunk determinism and whole-text parity", () => {
+    const cases: Array<{ input: string; expected: string }> = [
+        { input: "\n\n\n\n\n先给结论：\n\n第二段", expected: "先给结论：\n\n第二段" },
+        { input: "\r\n\r\n  indented code\n  line 2", expected: "  indented code\n  line 2" },
+        { input: "\x3cacp tokens=\"240\" type=\"text\"\x3em01234\x3c/acp\x3e\n\n\n正文开始", expected: "正文开始" },
+        { input: "\n\x3c/\uFF5C\uFF5CDSML\uFF5C\uFF5C invoke\x3e\n\x3c/\uFF5C\uFF5CDSML\uFF5C\uFF5C calls\x3e", expected: "" },
+    ];
+    for (const c of cases) {
+        const whole = trimLeadingNewlines(stripDsmlLeaks(stripAcpTags(c.input)));
+        assert.equal(whole, c.expected);
+        const respEv = stripResponsesText({ type: "response.output_text.done", text: c.input }, false, undefined, { stripDsml: true, trimLeadingNewlines: true });
+        assert.equal(respEv.text, c.expected);
+
+        const run = (size: number): string => {
+            const f = composeStreamFilters(composeStreamFilters(createTagEchoFilter(), createDsmlLeakFilter()), createLeadingNewlineFilter());
+            let out = "";
+            for (let i = 0; i < c.input.length; i += size) out += f.push(c.input.slice(i, i + size));
+            return out + f.flush();
+        };
+        for (const size of [1, 2, 3, 7, c.input.length]) {
+            assert.equal(run(size), c.expected, `composed chunk size ${size} mismatch`);
+        }
+    }
 });

@@ -249,3 +249,134 @@ test("plugin JSON passthrough stays verbatim for tag-free bodies", async () => {
         assert.equal(out.join(""), body, "tag-free responses body byte-identical");
     }
 });
+
+test("plugin passthrough trims leading blank lines across delta/done/completed while keeping reasoning verbatim", async () => {
+    const out: string[] = [];
+    const res = makeRes(out);
+    const session = makeSession();
+    const rawFull = "\n\n\n\n\n先给结论：\n\n第二段";
+    const reasoningRaw = "\n\nthinking stays verbatim";
+    const events = [
+        sse({ type: "response.output_item.added", output_index: 0, item: { type: "reasoning", id: "rs_1" } }),
+        sse({ type: "response.reasoning_summary_text.delta", item_id: "rs_1", output_index: 0, delta: reasoningRaw }),
+        sse({ type: "response.output_item.added", output_index: 1, item: { type: "message", id: "msg_1" } }),
+        sse({ type: "response.output_text.delta", item_id: "msg_1", output_index: 1, delta: "\n\n" }),
+        sse({ type: "response.output_text.delta", item_id: "msg_1", output_index: 1, delta: "\n\n\n先给结论：\n\n" }),
+        sse({ type: "response.output_text.delta", item_id: "msg_1", output_index: 1, delta: "第二段" }),
+        sse({ type: "response.output_text.done", item_id: "msg_1", output_index: 1, text: rawFull }),
+        sse({ type: "response.content_part.done", item_id: "msg_1", output_index: 1, part: { type: "output_text", text: rawFull } }),
+        sse({ type: "response.output_item.done", output_index: 1, item: { type: "message", id: "msg_1", content: [{ type: "output_text", text: rawFull }] } }),
+        sse({
+            type: "response.completed",
+            response: {
+                status: "completed",
+                output: [
+                    { type: "reasoning", id: "rs_1", summary: [{ type: "summary_text", text: reasoningRaw }] },
+                    { type: "message", id: "msg_1", content: [{ type: "output_text", text: rawFull }] },
+                ],
+                usage: { input_tokens: 12, output_tokens: 8 },
+            },
+        }),
+    ];
+    await pipePluginResponsesWithStrip(streamOf(events), res, session);
+    const parsed = out.join("")
+        .split("\n")
+        .filter((l) => l.startsWith("data:"))
+        .map((l) => JSON.parse(l.slice(5).trim()) as Record<string, unknown>);
+    const deltas = parsed
+        .filter((ev) => ev.type === "response.output_text.delta")
+        .map((ev) => ev.delta as string)
+        .join("");
+    assert.equal(deltas, "先给结论：\n\n第二段", "leading blank lines trimmed from deltas; inner paragraph break preserved");
+    const rDelta = parsed.find((ev) => ev.type === "response.reasoning_summary_text.delta");
+    assert.equal(rDelta?.delta, reasoningRaw, "reasoning delta stays byte-verbatim (KDD #10)");
+    const textDone = parsed.find((ev) => ev.type === "response.output_text.done");
+    assert.equal(textDone?.text, "先给结论：\n\n第二段");
+    const partDone = parsed.find((ev) => ev.type === "response.content_part.done");
+    assert.equal((partDone?.part as { text?: string })?.text, "先给结论：\n\n第二段");
+    const itemDone = parsed.find((ev) => ev.type === "response.output_item.done");
+    assert.equal(((itemDone?.item as { content?: Array<{ text?: string }> })?.content?.[0])?.text, "先给结论：\n\n第二段");
+    const completed = parsed.find((ev) => ev.type === "response.completed");
+    const compOut = (completed?.response as { output?: Array<Record<string, unknown>> })?.output ?? [];
+    assert.equal(((compOut[0]?.summary as Array<{ text?: string }>)?.[0])?.text, reasoningRaw, "reasoning in completed stays verbatim");
+    assert.equal(((compOut[1]?.content as Array<{ text?: string }>)?.[0])?.text, "先给结论：\n\n第二段");
+});
+
+test("plugin passthrough keeps internal newlines when fast-path prose precedes a later DSML tag", async () => {
+    const out: string[] = [];
+    const res = makeRes(out);
+    const session = makeSession();
+    const events = [
+        sse({ type: "response.output_text.delta", item_id: "msg_1", output_index: 0, delta: "第一段" }),
+        sse({ type: "response.output_text.delta", item_id: "msg_1", output_index: 0, delta: "\n\x3c\uFF5CDSML\uFF5C calls\x3e \x3c\uFF5CDSML\uFF5C invoke \x3e\n第二段" }),
+        sse({ type: "response.completed", response: { status: "completed", usage: { input_tokens: 5 } } }),
+    ];
+    await pipePluginResponsesWithStrip(streamOf(events), res, session);
+    const joined = out.join("")
+        .split("\n")
+        .filter((l) => l.startsWith("data:"))
+        .map((l) => JSON.parse(l.slice(5).trim()) as { type?: string; delta?: string })
+        .filter((ev) => ev.type === "response.output_text.delta" && typeof ev.delta === "string")
+        .map((ev) => ev.delta as string)
+        .join("");
+    assert.equal(joined, "第一段\n第二段", "newline after fast-path prose must survive when filter activates mid-stream");
+});
+
+test("plugin passthrough rescues a DSML-only dead turn via one-shot empty-turn retry", async () => {
+    const out: string[] = [];
+    const res = makeRes(out);
+    const session = makeSession();
+    const dsmlOnly = "\n\x3c/\uFF5C\uFF5CDSML\uFF5C\uFF5C invoke\x3e\n\x3c/\uFF5C\uFF5CDSML\uFF5C\uFF5C calls\x3e";
+    const attempt1 = [
+        sse({ type: "response.created", response: { id: "resp_1", status: "in_progress" } }),
+        sse({ type: "response.output_item.added", output_index: 0, item: { type: "message", id: "msg_1" } }),
+        sse({ type: "response.output_text.delta", item_id: "msg_1", output_index: 0, delta: dsmlOnly.slice(0, 12) }),
+        sse({ type: "response.output_text.delta", item_id: "msg_1", output_index: 0, delta: dsmlOnly.slice(12) }),
+        sse({ type: "response.output_text.done", item_id: "msg_1", output_index: 0, text: dsmlOnly }),
+        sse({ type: "response.completed", response: { id: "resp_1", status: "completed", output: [{ type: "message", id: "msg_1", content: [{ type: "output_text", text: dsmlOnly }] }] } }),
+    ];
+    let refetches = 0;
+    const refetch = async () => {
+        refetches++;
+        return streamOf([
+            sse({ type: "response.created", response: { id: "resp_2", status: "in_progress" } }),
+            sse({ type: "response.output_item.added", output_index: 0, item: { type: "message", id: "msg_2" } }),
+            sse({ type: "response.output_text.delta", item_id: "msg_2", output_index: 0, delta: "\n\n重试后的正常回复。" }),
+            sse({ type: "response.output_text.done", item_id: "msg_2", output_index: 0, text: "\n\n重试后的正常回复。" }),
+            sse({ type: "response.completed", response: { id: "resp_2", status: "completed", output: [{ type: "message", id: "msg_2", content: [{ type: "output_text", text: "\n\n重试后的正常回复。" }] }] } }),
+        ]);
+    };
+    await pipePluginResponsesWithStrip(streamOf(attempt1), res, session, undefined, refetch);
+    assert.equal(refetches, 1, "DSML-only dead turn must trigger empty-turn auto-retry");
+    const joined = out.join("")
+        .split("\n")
+        .filter((l) => l.startsWith("data:"))
+        .map((l) => JSON.parse(l.slice(5).trim()) as { type?: string; delta?: string })
+        .filter((ev) => ev.type === "response.output_text.delta" && typeof ev.delta === "string")
+        .map((ev) => ev.delta as string)
+        .join("");
+    assert.equal(joined, "重试后的正常回复。");
+    assert.ok(!out.join("").includes("DSML"), "no DSML tag leaks into the retried stream");
+});
+
+test("plugin JSON passthrough trims leading blank lines and strips DSML leaks while preserving backtick quotes", async () => {
+    const { pipePluginJson } = await import("../src/plugin.ts");
+    const raw = "\n\n\n正文引用 `\x3c/\uFF5C\uFF5CDSML\uFF5C\uFF5C invoke\x3e` 保留。\x3c/\uFF5C\uFF5CDSML\uFF5C\uFF5C parameter\x3e\n\x3c/\uFF5C\uFF5CDSML\uFF5C\uFF5C calls\x3e";
+    const expected = "正文引用 `\x3c/\uFF5C\uFF5CDSML\uFF5C\uFF5C invoke\x3e` 保留。";
+    {
+        const out: string[] = [];
+        const res = makeRes(out);
+        const body = JSON.stringify({ output: [{ type: "message", content: [{ type: "output_text", text: raw }] }] });
+        await pipePluginJson(streamOf([body]), res, makeSession(), "responses");
+        const parsed = JSON.parse(out.join("")) as { output: Array<{ content: Array<{ text: string }> }> };
+        assert.equal(parsed.output[0]?.content[0]?.text, expected);
+    }
+    {
+        const out: string[] = [];
+        const res = makeRes(out);
+        const body = JSON.stringify({ choices: [{ message: { content: raw } }] });
+        await pipePluginJson(streamOf([body]), res, makeSession(), "openai");
+        const parsed = JSON.parse(out.join("")) as { choices: Array<{ message: { content: string } }> };
+        assert.equal(parsed.choices[0]?.message?.content, expected);
+    }
+});

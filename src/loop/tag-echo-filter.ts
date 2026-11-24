@@ -1705,17 +1705,29 @@ export function createTagEchoFilter(onDrop?: (snippet: string, duringDrain?: boo
     };
 }
 
-function stripParts(content: unknown, drop: boolean, requestText?: string): unknown {
+export interface TextStripOptions {
+    stripDsml?: boolean;
+    trimLeadingNewlines?: boolean;
+}
+
+function stripTextWithOptions(text: string, drop: boolean, requestText?: string, opts?: TextStripOptions): string {
+    let out = stripAcpTags(text, drop, requestText);
+    if (opts?.stripDsml) out = stripDsmlLeaks(out);
+    if (opts?.trimLeadingNewlines) out = trimLeadingNewlines(out);
+    return out;
+}
+
+function stripParts(content: unknown, drop: boolean, requestText?: string, opts?: TextStripOptions): unknown {
     if (!Array.isArray(content)) return content;
     return content.map((part) => {
         if (part && typeof part === "object" && typeof (part as Record<string, unknown>).text === "string") {
-            return { ...(part as Record<string, unknown>), text: stripAcpTags((part as Record<string, unknown>).text as string, drop, requestText) };
+            return { ...(part as Record<string, unknown>), text: stripTextWithOptions((part as Record<string, unknown>).text as string, drop, requestText, opts) };
         }
         return part;
     });
 }
 
-function stripItemContent(it: unknown, drop: boolean, requestText?: string): unknown {
+function stripItemContent(it: unknown, drop: boolean, requestText?: string, opts?: TextStripOptions): unknown {
     if (!it || typeof it !== "object") return it;
     const io = it as Record<string, unknown>;
     let out: Record<string, unknown> | undefined;
@@ -1723,7 +1735,7 @@ function stripItemContent(it: unknown, drop: boolean, requestText?: string): unk
         out ??= { ...io };
         out[k] = v;
     };
-    if (Array.isArray(io.content)) set("content", stripParts(io.content, drop, requestText));
+    if (Array.isArray(io.content)) set("content", stripParts(io.content, drop, requestText, opts));
     // Unified ACP invariant: reasoning summaries are the thinking channel —
     // byte-verbatim, never rewritten (matches stripOpenaiChatText leaving
     // reasoning_content alone and the adapters' identity filters).
@@ -1731,8 +1743,8 @@ function stripItemContent(it: unknown, drop: boolean, requestText?: string): unk
     return out ?? it;
 }
 
-function stripIfString(v: unknown, drop: boolean, requestText?: string): unknown {
-    return typeof v === "string" ? stripAcpTags(v, drop, requestText) : v;
+function stripIfString(v: unknown, drop: boolean, requestText?: string, opts?: TextStripOptions): unknown {
+    return typeof v === "string" ? stripTextWithOptions(v, drop, requestText, opts) : v;
 }
 
 // Plugin-passthrough parity for the OpenAI chat-completions wire (issue #14:
@@ -1744,7 +1756,7 @@ function stripIfString(v: unknown, drop: boolean, requestText?: string): unknown
 // execute/persist, so a shape-based false positive would silently corrupt
 // data — only model prose is stripped. Mutates in place, mirroring
 // stripResponsesText.
-export function stripOpenaiChatText<T>(obj: T, drop: boolean = false, requestText?: string): T {
+export function stripOpenaiChatText<T>(obj: T, drop: boolean = false, requestText?: string, opts?: TextStripOptions): T {
     if (!obj || typeof obj !== "object") return obj;
     const o = obj as Record<string, unknown>;
     if (!Array.isArray(o["choices"])) return obj;
@@ -1755,7 +1767,7 @@ export function stripOpenaiChatText<T>(obj: T, drop: boolean = false, requestTex
             const h = ch[holder];
             if (h && typeof h === "object") {
                 const hh = { ...(h as Record<string, unknown>) };
-                hh["content"] = stripIfString(hh["content"], drop, requestText);
+                hh["content"] = stripIfString(hh["content"], drop, requestText, opts);
                 // Unified ACP invariant (owner directive, #2229): the
                 // thinking/reasoning channel is byte-verbatim — it is the
                 // model's private channel, not prose, and reasoning replay
@@ -1775,13 +1787,13 @@ export function stripOpenaiChatText<T>(obj: T, drop: boolean = false, requestTex
 // (#1960/KDD#10): they are verified against their signature on replay, so any
 // rewrite desyncs them and bricks the session — matching the loop adapters'
 // "prose filters never touch thinking" treatment. Mutates in place.
-export function stripAnthropicText<T>(obj: T, drop: boolean = false, requestText?: string): T {
+export function stripAnthropicText<T>(obj: T, drop: boolean = false, requestText?: string, opts?: TextStripOptions): T {
     if (!obj || typeof obj !== "object") return obj;
     const o = obj as Record<string, unknown>;
     const d = o["delta"];
     if (d && typeof d === "object") {
         const dd = { ...(d as Record<string, unknown>) };
-        dd["text"] = stripIfString(dd["text"], drop, requestText);
+        dd["text"] = stripIfString(dd["text"], drop, requestText, opts);
         o["delta"] = dd;
     }
     if (Array.isArray(o["content"])) {
@@ -1789,7 +1801,7 @@ export function stripAnthropicText<T>(obj: T, drop: boolean = false, requestText
             if (!c || typeof c !== "object") return c;
             const cc = c as Record<string, unknown>;
             if (typeof cc["text"] !== "string") return c;
-            return { ...cc, text: stripIfString(cc["text"], drop, requestText) };
+            return { ...cc, text: stripIfString(cc["text"], drop, requestText, opts) };
         });
     }
     return obj;
@@ -1803,25 +1815,25 @@ export function stripAnthropicText<T>(obj: T, drop: boolean = false, requestText
 // fragment carriers) are deliberately untouched (#1039): they carry user
 // intent that hosts execute/persist, so a shape-based false positive would
 // silently corrupt data — only model prose is stripped.
-export function stripResponsesText<T>(obj: T, drop: boolean = false, requestText?: string): T {
+export function stripResponsesText<T>(obj: T, drop: boolean = false, requestText?: string, opts?: TextStripOptions): T {
     if (!obj || typeof obj !== "object") return obj;
     const o = obj as Record<string, unknown>;
-    if (typeof o.text === "string") o.text = stripAcpTags(o.text, drop, requestText);
+    if (typeof o.text === "string") o.text = stripTextWithOptions(o.text, drop, requestText, opts);
     if (o.part && typeof o.part === "object" && typeof (o.part as Record<string, unknown>).text === "string") {
-        o.part = { ...(o.part as Record<string, unknown>), text: stripAcpTags((o.part as Record<string, unknown>).text as string, drop, requestText) };
+        o.part = { ...(o.part as Record<string, unknown>), text: stripTextWithOptions((o.part as Record<string, unknown>).text as string, drop, requestText, opts) };
     }
     if (o.item && typeof o.item === "object") {
-        o.item = stripItemContent(o.item, drop, requestText);
+        o.item = stripItemContent(o.item, drop, requestText, opts);
     }
     if (o.response && typeof o.response === "object") {
         const resp = { ...(o.response as Record<string, unknown>) };
         if (Array.isArray(resp.output)) {
-            resp.output = (resp.output as unknown[]).map((it) => stripItemContent(it, drop, requestText));
+            resp.output = (resp.output as unknown[]).map((it) => stripItemContent(it, drop, requestText, opts));
         }
         o.response = resp;
     }
     if (Array.isArray(o.output)) {
-        o.output = (o.output as unknown[]).map((it) => stripItemContent(it, drop, requestText));
+        o.output = (o.output as unknown[]).map((it) => stripItemContent(it, drop, requestText, opts));
     }
     return obj;
 }
@@ -1913,6 +1925,281 @@ export function createMarkerLineFilter(onDrop?: (snippet: string) => void): TagE
         dropped: () => droppedAny,
         pending: () => buf.length > 0,
         stats: () => ({ inputChars, outputChars, dropped: droppedAny, dropCount }),
+    };
+}
+
+// ─── Fullwidth-pipe DSML leak stripper + leading blank-line trimmer ─────────
+// DeepSeek models under long XML-tagged (<acp>) contexts occasionally emit
+// malformed native fullwidth-pipe DSML tags (`<｜DSML｜ calls>`, `<｜DSML｜ invoke >`,
+// `</｜｜DSML｜｜ parameter>`, `</｜｜DSML｜｜ invoke>`, `</｜｜DSML｜｜ calls>`) that
+// upstream tool-call parsers fail to claim and dump into visible prose.
+// Anchored strictly on Unicode FULLWIDTH VERTICAL LINE (\uFF5C) so ordinary
+// ASCII/HTML/code prose is untouched; backtick-quoted mentions stay verbatim.
+const DSML_LEAK_SRC =
+    "(?:\\x3cparameter\\s+name=[\"']m\\d{4,}[\"']\\x3e\\s*m\\d{4,}\\s*)?" +
+    "\\x3c/?\\s*\\uFF5C+\\s*DSML\\s*\\uFF5C+[^\\x3c\\x3e]{0,80}\\x3e";
+const DSML_LEAK_RE = new RegExp(DSML_LEAK_SRC, "g");
+const DSML_LEAK_STICKY_RE = new RegExp(DSML_LEAK_SRC, "y");
+
+const DSML_TAG_PREFIX_SRC =
+    "(?:" +
+    "\\x3c/?\\s*" +
+    "|\\x3c/?\\s*\\uFF5C+\\s*(?:" + prefixAlts("DSML", 1).join("|") + ")?" +
+    "|\\x3c/?\\s*\\uFF5C+\\s*DSML\\s*(?:\\uFF5C+[^\\x3c\\x3e]{0,80})?" +
+    ")";
+const DSML_PARTIAL_ALTS_SRC = [
+    "\\x3cparameter\\s+name=[\"']m\\d{4,}[\"']\\x3e\\s*m\\d{4,}\\s*" + DSML_TAG_PREFIX_SRC,
+    "\\x3cparameter\\s+name=[\"']m\\d{4,}[\"']\\x3e\\s*(?:m\\d*\\s*)?",
+    "\\x3cparameter\\s+name=[\"']m\\d{4,}[\"']",
+    "\\x3cparameter\\s+name=[\"'](?:m\\d*)?",
+    "\\x3cparameter\\s+name=?",
+    "\\x3cparameter\\s+(?:" + prefixAlts("name", 1).join("|") + ")",
+    "\\x3cparameter\\s*",
+    ...prefixAlts("\x3cparameter", 2),
+    DSML_TAG_PREFIX_SRC,
+].join("|");
+const DSML_PARTIAL_TAIL_RE = new RegExp("(?:" + DSML_PARTIAL_ALTS_SRC + ")$");
+const DSML_PARTIAL_HEAD_RE = new RegExp("^(?:" + DSML_PARTIAL_ALTS_SRC + ")$");
+
+export function containsDsmlLeakText(s: string): boolean {
+    if (!s.includes("DSML")) return false;
+    return s.includes("\uFF5C") || s.includes("\\uff5c") || s.includes("\\uFF5C");
+}
+
+export function mayStartDsmlLeak(s: string): boolean {
+    return containsDsmlLeakText(s) || DSML_PARTIAL_TAIL_RE.test(s);
+}
+
+/** Whole-text stripper for malformed fullwidth-pipe DSML tags leaked into
+ *  visible prose. Consumes optional horizontal whitespace and one trailing
+ *  newline immediately after a stripped tag (plus separating horizontal
+ *  whitespace before another immediately following DSML tag) so stacked or
+ *  space-separated orphan tags leave no blank-line or stray-space residue.
+ *  Backtick-quoted mentions (`` `</｜｜DSML｜｜ invoke>` ``) stay verbatim. */
+export function stripDsmlLeaks(text: string): string {
+    if (!text.includes("\uFF5C") || !text.includes("DSML")) return text;
+    let out = "";
+    let cursor = 0;
+    DSML_LEAK_RE.lastIndex = 0;
+    let m: RegExpExecArray | null;
+    while ((m = DSML_LEAK_RE.exec(text)) !== null) {
+        const start = m.index;
+        const end = start + m[0].length;
+        // Preserve inline-code prose mentions like `</｜｜DSML｜｜ invoke>`.
+        if (start > 0 && text[start - 1] === "`") {
+            out += text.slice(cursor, end);
+            cursor = end;
+            continue;
+        }
+        out += text.slice(cursor, start);
+        let wsEnd = end;
+        while (wsEnd < text.length && (text[wsEnd] === " " || text[wsEnd] === "\t")) wsEnd++;
+        let next = end;
+        if (wsEnd === text.length) {
+            next = wsEnd;
+        } else if (text[wsEnd] === "\r" && text[wsEnd + 1] === "\n") {
+            next = wsEnd + 2;
+        } else if (text[wsEnd] === "\n") {
+            next = wsEnd + 1;
+        } else if (wsEnd > end) {
+            DSML_LEAK_STICKY_RE.lastIndex = wsEnd;
+            if (DSML_LEAK_STICKY_RE.test(text)) next = wsEnd;
+        }
+        cursor = next;
+        DSML_LEAK_RE.lastIndex = next;
+    }
+    return cursor === 0 ? text : out + text.slice(cursor);
+}
+
+/** Streaming twin of stripDsmlLeaks: byte-identical across arbitrary chunk
+ *  boundaries. Releases any unterminated prefix untouched at flush(). */
+export function createDsmlLeakFilter(onDrop?: (snippet: string) => void): TagEchoFilter {
+    let buf = "";
+    let postDropNl = false;
+    let postDropWs = "";
+    let lastEmittedChar = "";
+    let droppedAny = false;
+    let notified = false;
+    let inputChars = 0;
+    let outputChars = 0;
+    let dropCount = 0;
+
+    const noteDrop = (snippet: string) => {
+        droppedAny = true;
+        dropCount++;
+        if (!notified) {
+            notified = true;
+            onDrop?.(snippet);
+        }
+    };
+
+    const emit = (s: string): string => {
+        if (s.length > 0) lastEmittedChar = s[s.length - 1]!;
+        return s;
+    };
+
+    const process = (delta: string): string => {
+        inputChars += delta.length;
+        buf += delta;
+        let out = "";
+
+        while (buf.length > 0) {
+            if (postDropNl) {
+                let i = 0;
+                while (i < buf.length && (buf[i] === " " || buf[i] === "\t")) i++;
+                if (i > 0) {
+                    postDropWs += buf.slice(0, i);
+                    buf = buf.slice(i);
+                }
+                if (buf.length === 0) break;
+                if (buf[0] === "\r") {
+                    if (buf.length === 1) break; // wait for potential \n
+                    if (buf[1] === "\n") {
+                        buf = buf.slice(2);
+                        postDropNl = false;
+                        postDropWs = "";
+                        continue;
+                    }
+                    // lone \r — not CRLF; release buffered horizontal ws and exit postDropNl
+                    out += emit(postDropWs);
+                    postDropWs = "";
+                    postDropNl = false;
+                    continue;
+                }
+                if (buf[0] === "\n") {
+                    buf = buf.slice(1);
+                    postDropNl = false;
+                    postDropWs = "";
+                    continue;
+                }
+                if (postDropWs.length > 0 && buf[0] === "\x3c") {
+                    DSML_LEAK_STICKY_RE.lastIndex = 0;
+                    const nextM = DSML_LEAK_STICKY_RE.exec(buf);
+                    if (nextM !== null) {
+                        noteDrop(nextM[0]);
+                        buf = buf.slice(nextM[0].length);
+                        postDropWs = "";
+                        continue;
+                    }
+                    if (DSML_PARTIAL_HEAD_RE.test(buf)) break;
+                }
+                // Next char is neither newline nor another DSML tag: release buffered ws.
+                out += emit(postDropWs);
+                postDropWs = "";
+                postDropNl = false;
+                continue;
+            }
+
+            DSML_LEAK_RE.lastIndex = 0;
+            const m = DSML_LEAK_RE.exec(buf);
+            if (m !== null) {
+                const start = m.index;
+                const end = start + m[0].length;
+                const prevChar = start > 0 ? buf[start - 1] : lastEmittedChar;
+                if (prevChar === "`") {
+                    out += emit(buf.slice(0, end));
+                    buf = buf.slice(end);
+                    continue;
+                }
+                if (start > 0) out += emit(buf.slice(0, start));
+                noteDrop(m[0]);
+                buf = buf.slice(end);
+                postDropNl = true;
+                postDropWs = "";
+                continue;
+            }
+
+            const tail = DSML_PARTIAL_TAIL_RE.exec(buf);
+            if (tail !== null) {
+                const holdAt = tail.index;
+                if (holdAt > 0) {
+                    out += emit(buf.slice(0, holdAt));
+                    buf = buf.slice(holdAt);
+                }
+                break;
+            }
+
+            out += emit(buf);
+            buf = "";
+        }
+
+        outputChars += out.length;
+        return out;
+    };
+
+    return {
+        push(delta: string): string {
+            return process(delta);
+        },
+        flush(): string {
+            let out = "";
+            if (postDropNl) {
+                // At EOF, horizontal whitespace after a dropped tag followed by
+                // nothing (or lone \r) is dropped only if nothing follows; to
+                // match stripDsmlLeaks verbatim, drop trailing [ \t]* at EOF too
+                // only when nothing else remains, else release.
+                if (buf.length > 0) {
+                    out += emit(postDropWs + buf);
+                }
+                postDropWs = "";
+                postDropNl = false;
+                buf = "";
+            } else if (buf.length > 0) {
+                out += emit(buf);
+                buf = "";
+            }
+            outputChars += out.length;
+            return out;
+        },
+        dropped: () => droppedAny,
+        pending: () => buf.length > 0 || postDropNl,
+        stats: () => ({ inputChars, outputChars, dropped: droppedAny, dropCount }),
+    };
+}
+
+/** Trim leading blank lines (\r / \n) at the start of an assistant text field
+ *  while leaving leading spaces/tabs and all subsequent newlines intact.
+ *  Breaks the long-session feedback loop where render-tag stripping leaves
+ *  leading newlines that the model then imitates and amplifies across turns. */
+export function trimLeadingNewlines(text: string): string {
+    let i = 0;
+    while (i < text.length && (text[i] === "\n" || text[i] === "\r")) i++;
+    return i === 0 ? text : text.slice(i);
+}
+
+export function createLeadingNewlineFilter(alreadyStarted?: () => boolean): TagEchoFilter {
+    let started = false;
+    let inputChars = 0;
+    let outputChars = 0;
+    let droppedAny = false;
+    return {
+        push(delta: string): string {
+            inputChars += delta.length;
+            if (started || delta.length === 0) {
+                outputChars += delta.length;
+                return delta;
+            }
+            if (alreadyStarted?.()) {
+                started = true;
+                outputChars += delta.length;
+                return delta;
+            }
+            let i = 0;
+            while (i < delta.length && (delta[i] === "\n" || delta[i] === "\r")) i++;
+            if (i === delta.length) {
+                if (i > 0) droppedAny = true;
+                return "";
+            }
+            started = true;
+            if (i > 0) droppedAny = true;
+            const out = i === 0 ? delta : delta.slice(i);
+            outputChars += out.length;
+            return out;
+        },
+        flush: () => "",
+        dropped: () => droppedAny,
+        pending: () => false,
+        stats: () => ({ inputChars, outputChars, dropped: droppedAny, dropCount: 0 }),
     };
 }
 
