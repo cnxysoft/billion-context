@@ -6,6 +6,7 @@ import * as path from "node:path";
 import { SessionStore } from "../src/persist.ts";
 import { getCacheLedger } from "../src/cache-ledger.ts";
 import { buildRefRows, planIngest, serializeSessionMetadata, type LegacySessionLike } from "../src/storage/ingest.ts";
+import { slimCcrEnvelope } from "../src/storage/slim.ts";
 import { snapshotMessages, type Session } from "../src/session.ts";
 import type { CoreMessage } from "acp-kernel";
 
@@ -343,7 +344,7 @@ test("planIngest cached contentStore (ccrJson/ccrEntries) and orphansJson stay e
     };
 
     const p1 = planIngest(legacy);
-    assert.equal(p1.session.ccrJson, JSON.stringify(contentStore));
+    assert.equal(p1.session.ccrJson, JSON.stringify(slimCcrEnvelope(contentStore)));
     assert.equal(p1.ccrEntries.length, 1);
     assert.equal(p1.session.orphansJson, JSON.stringify({ orphan_1: { one: { text: "one-1", count: 1 }, full: { text: "full-1", count: 1 } } }));
 
@@ -358,7 +359,7 @@ test("planIngest cached contentStore (ccrJson/ccrEntries) and orphansJson stay e
     contentStore.byHash.h2 = "r2";
     blockContents.set("orphan_2", { one: null, full: { text: "full-2", count: 2 } });
     const p3 = planIngest(legacy);
-    assert.equal(p3.session.ccrJson, JSON.stringify(contentStore));
+    assert.equal(p3.session.ccrJson, JSON.stringify(slimCcrEnvelope(contentStore)));
     assert.equal(p3.ccrEntries.length, 2);
     assert.equal(p3.session.orphansJson, JSON.stringify({
         orphan_1: { one: { text: "one-1", count: 1 }, full: { text: "full-1", count: 1 } },
