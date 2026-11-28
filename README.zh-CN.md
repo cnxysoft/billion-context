@@ -2,6 +2,9 @@
 
 <p align="center"><a href="./README.md">English</a> | <a href="./README.zh-CN.md">中文</a> | <a href="./README.ja.md">日本語</a> | <a href="./README.ko.md">한국어</a></p>
 
+> **Fork 说明（`cnxysoft/billion-context` · 默认分支 `fork`）**
+> 本分支基于上游 [`ranxianglei/billion-context`](https://github.com/ranxianglei/billion-context)（`master` 分支纯净跟进上游，当前基线 `v0.1.217` + `#7891`）维护，面向 Android / DSH 超长会话场景新增 Responses 字节级 SHA-256 前缀缓存、`O(tail)` 折叠对账与 steady-state 快路径、预转发落盘与上游 RTT 重叠、SQLite 与内置压缩内核热路径加速、DSH 原生预热与长会话恢复加固、插件前导空行/全角 DSML 泄漏净化，以及独立 Fork CI 基线构建。完整改动清单与变更日志见 [**FORK_CHANGELOG.md**](FORK_CHANGELOG.md)。
+
 <p align="center"><strong>上下文压缩插件</strong> — <em>billion-context is all you need。</em></p>
 
 <p align="center"><sub>小窗口（100k 上下文足矣）· <em>省 5 倍 token</em> · 超长会话（十亿级别单会话）· 高压缩质量</sub></p>

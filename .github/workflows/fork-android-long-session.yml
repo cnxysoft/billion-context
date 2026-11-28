@@ -1,8 +1,9 @@
 name: Android long-session baseline
 
 on:
+  workflow_dispatch:
   push:
-    branches: [2026-11-23_android-long-session, 2026-11-23_dsh-focused-prewarm, 2026-11-23_dsh-p0-ttft]
+    branches: [fork]
     paths:
       - '.github/workflows/fork-android-long-session.yml'
       - 'src/**'
@@ -78,17 +79,21 @@ jobs:
             tests/issue5140-cold-raw-tail-fork.test.ts \
             tests/issue5756-lazy-sweep.test.ts \
             tests/issue5795-early-hold-fastpath.test.ts \
+            tests/issue6780-pre-forward-dedup.test.ts \
             tests/issue6947-turn-final-writeback.test.ts \
             tests/issue7190-dsh-runtime-preset-coverage.test.ts \
             tests/media-cas.test.ts \
             tests/opencode-rolling-cache-marks.test.ts \
             tests/plugin-fork.test.ts \
+            tests/plugin-passthrough-tag-strip.test.ts \
             tests/plugin-status-provenance.test.ts \
             tests/plugin-terminal-usage.test.ts \
+            tests/responses-prefix-cache.test.ts \
             tests/storage-batched-verification.test.ts \
             tests/storage-ingest-watermark.test.ts \
             tests/storage-message-content-join.test.ts \
             tests/storage-null-identity.test.ts \
+            tests/tag-echo-chunking-determinism.test.ts \
             tests/unified-remap-collision.test.ts \
             tests/verif-subset-guard.test.ts \
             tests/web-storage-fallback.test.ts

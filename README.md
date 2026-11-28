@@ -2,6 +2,9 @@
 
 <p align="center"><a href="./README.md">English</a> | <a href="./README.zh-CN.md">中文</a> | <a href="./README.ja.md">日本語</a> | <a href="./README.ko.md">한국어</a></p>
 
+> **Fork Notice (`cnxysoft/billion-context` · default branch `fork`)**
+> This branch is maintained on top of upstream [`ranxianglei/billion-context`](https://github.com/ranxianglei/billion-context) (`master` cleanly mirrors upstream, currently based on `v0.1.217` + `#7891`), adding byte-exact Responses SHA-256 prefix caching, `O(tail)` fold-reconcile & steady-state fastpaths, TTFT/RTT-overlapped durability ingest, SQLite/kernel hotpath optimizations, DSH native prewarm & Android long-session recovery hardening, plugin leading-newline / malformed fullwidth DSML leak filtering, and a dedicated Fork CI baseline workflow. See [**FORK_CHANGELOG.md**](FORK_CHANGELOG.md) for the full feature summary and changelog.
+
 <p align="center"><strong>Context-compression plugin</strong> — <em>billion-context is all you need.</em></p>
 
 <p align="center"><sub>small context windows (100K is enough) · <em>5× fewer tokens</em> · month-long single sessions (billions of tokens) · high compression quality</sub></p>
